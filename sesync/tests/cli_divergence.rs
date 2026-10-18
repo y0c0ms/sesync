@@ -57,27 +57,31 @@ fn pi_mirror(sb: &Path) -> PathBuf {
     found.remove(0)
 }
 
+fn count_files(dir: &Path) -> usize {
+    fs::read_dir(dir).map(|rd| rd.flatten()
+        .map(|bucket| fs::read_dir(bucket.path()).map(|f| f.flatten().count()).unwrap_or(0))
+        .sum()).unwrap_or(0)
+}
+
 #[test]
-fn a_mirror_continued_by_a_harness_is_not_overwritten() {
+fn a_harness_turn_in_its_own_store_is_never_overwritten() {
     let sb = sandbox("freeze");
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
     let id = "aaaaaaaa-1111-2222-3333-444444444444";
-    let src = session_file(&sb, id, &"first ".repeat(120));
-    assert!(run(&sb).status.success());
-    let mirror = pi_mirror(&sb);
-
-    // A harness continues the conversation inside the pi mirror.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    session_file(&sb, id, &"first ".repeat(120));
+    // A harness keeps working in its own session file in the pi store.
+    let own_dir = sb.join("pi").join("sessions").join("-tmp-proj");
+    fs::create_dir_all(&own_dir).unwrap();
+    let own = own_dir.join("2026-10-01T10-00-00-000Z_harness.jsonl");
     let harness_text = "HARNESS WROTE THIS TURN";
-    fs::write(&mirror, format!("{}\n{harness_text}\n", fs::read_to_string(&mirror).unwrap())).unwrap();
-
-    // The source changes too, so the next pass wants to refresh the mirror.
+    fs::write(&own, format!("first\n{harness_text}\n")).unwrap();
+    // The omp source changes, so the next pass has work to do.
     std::thread::sleep(std::time::Duration::from_millis(20));
     session_file(&sb, id, &"second ".repeat(120));
-    let _ = &src;
     assert!(run(&sb).status.success());
-
-    let after = fs::read_to_string(&mirror).unwrap();
-    assert!(after.contains(harness_text), "the harness's turn must survive; the mirror was overwritten");
+    let after = fs::read_to_string(&own).unwrap();
+    assert!(after.contains(harness_text), "the harness's turn must survive");
+    assert_eq!(count_files(&sb.join("pi").join("sessions")), 1, "a pass adds no file to the pi store");
 }
+

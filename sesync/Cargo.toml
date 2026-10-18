@@ -18,6 +18,8 @@ crossterm = "0.29"
 sha2 = "0.10"
 zstd = "0.13"
 ureq = { version = "2", features = ["json"] }
+qrcodegen = "1"
 
 [dev-dependencies]
 proptest = "1"
+postgres = "0.19"

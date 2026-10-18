@@ -53,7 +53,7 @@ fn a_path_outside_the_roots_is_refused() {
 }
 
 #[test]
-fn deleting_removes_mirrors_before_the_source() {
+fn deleting_removes_only_the_picked_session_and_keeps_its_mirror() {
     let sb = sandbox("order");
     let r = roots(&sb);
     let dir = r.omp.join("-tmp");
@@ -66,8 +66,9 @@ fn deleting_removes_mirrors_before_the_source() {
     let mut g = Group::file("omp", src.display().to_string(), "t");
     g.add_mirror("pi", mirror.display().to_string());
     let log = delete_group(&r, &g, &sb.join("locks"), &sb.join("no-sesync_lock")).unwrap();
-    assert!(!mirror.exists() && !src.exists(), "both must be removed");
-    assert!(log[0].contains("mirror"), "the log must list the mirror first: {log:?}");
+    assert!(!src.exists(), "the picked session is removed");
+    assert!(mirror.exists(), "its copy in another harness is not touched by delete");
+    assert_eq!(log.len(), 1, "only the source is in the log: {log:?}");
 }
 
 #[test]

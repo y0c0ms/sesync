@@ -56,20 +56,20 @@ fn a_subagent_is_recorded_under_its_parent_and_is_not_a_conversation() {
     assert_eq!(recorded.len(), 1);
     assert!(recorded[0].as_str().unwrap().ends_with("agent-a1.jsonl"));
 
-    // The subagent must not be mirrored as a conversation: only the parent gets a pi mirror.
+    // Nothing is copied into pi: neither the parent nor the subagent.
     let mut mirrors = 0;
     if let Ok(rd) = fs::read_dir(sb.join("pi").join("sessions")) {
         for b in rd.flatten() {
             if let Ok(files) = fs::read_dir(b.path()) { mirrors += files.flatten().count(); }
         }
     }
-    assert_eq!(mirrors, 1, "one mirror for the parent, none for the subagent");
+    assert_eq!(mirrors, 0, "no copy is written into pi, for the parent or the subagent");
 }
 
 #[test]
-fn a_claude_session_is_synced_as_a_source() {
-    // Regression: the Rust port had no Claude source at all, so a Claude session was
-    // never mirrored into pi or omp. A plain Claude session must produce a mirror.
+fn a_claude_session_is_recorded_as_a_source() {
+    // Regression: the Rust port once had no Claude source at all. A plain Claude session must be
+    // seen and recorded as a source, and nothing is copied into pi.
     let sb = sandbox("claude-source");
     let dir = sb.join("claude").join("projects").join("-proj");
     fs::create_dir_all(&dir).unwrap();
@@ -87,7 +87,9 @@ fn a_claude_session_is_synced_as_a_source() {
             if let Ok(files) = fs::read_dir(b.path()) { mirrors += files.flatten().count(); }
         }
     }
-    assert_eq!(mirrors, 1, "a Claude session must be mirrored into pi");
+    assert_eq!(mirrors, 0, "nothing is copied into pi");
+    let state = fs::read_to_string(sb.join("state").join("state.json")).unwrap();
+    assert!(state.contains(PARENT), "the Claude session is recorded as a source");
 }
 
 #[test]

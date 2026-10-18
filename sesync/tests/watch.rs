@@ -42,7 +42,7 @@ fn pi_mirrors(sb: &Path) -> usize {
 }
 
 #[test]
-fn watch_picks_up_a_session_that_appears_after_the_first_pass() {
+fn watch_records_a_session_that_appears_after_the_first_pass() {
     let sb = sandbox("late");
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
@@ -80,5 +80,8 @@ fn watch_picks_up_a_session_that_appears_after_the_first_pass() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(pi_mirrors(&sb), 2, "both sessions must be mirrored: one before and one after startup");
+    assert_eq!(pi_mirrors(&sb), 0, "watch writes nothing into pi");
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sb.join("state").join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["sources"].as_object().unwrap().len(), 2, "both sessions are recorded: one before and one after startup");
 }

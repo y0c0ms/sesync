@@ -2,8 +2,12 @@
 //! write new records that others accept. Records written before the revocation stay readable to
 //! it, as the operator approved: revocation is forward-only.
 use sesync_team::membership::{device_entry, Device, MemberList, Verifier};
-use sesync_team::session_keys::{open_session, seal_session, unwrap_for, wrap_for, DataKey};
-use sesync_team::signed_records::{open_record, seal_record, RecordError};
+use sesync_team::session_keys::{open_session_bound, seal_session_bound, session_aad, unwrap_for, wrap_for, DataKey};
+use sesync_team::signed_records::{open_record, seal_record, Binding, RecordError};
+
+fn expect() -> Binding {
+    Binding { space: "personal".into(), conversation: "ses_r".into(), min_sequence: 0 }
+}
 
 #[test]
 fn a_revoked_device_cannot_write_records_accepted_after_revocation() {
@@ -16,10 +20,10 @@ fn a_revoked_device_cannot_write_records_accepted_after_revocation() {
     // Revoke: a newer list without the revoked device.
     v.accept(&MemberList::new(2, vec![device_entry(&kept)]).sign(&admin)).unwrap();
 
-    let after = seal_record(&revoked, 2, b"sneaky write").unwrap();
-    assert_eq!(open_record(&v, &after), Err(RecordError::UnknownAuthor));
-    let fine = seal_record(&kept, 2, b"normal write").unwrap();
-    assert_eq!(open_record(&v, &fine).unwrap(), b"normal write", "others keep writing");
+    let after = seal_record(&revoked, 2, 2, "personal", "ses_r", b"sneaky write").unwrap();
+    assert_eq!(open_record(&v, &expect(), &after), Err(RecordError::UnknownAuthor));
+    let fine = seal_record(&kept, 2, 2, "personal", "ses_r", b"normal write").unwrap();
+    assert_eq!(open_record(&v, &expect(), &fine).unwrap().content, b"normal write", "others keep writing");
 }
 
 #[test]
@@ -33,13 +37,14 @@ fn a_revoked_device_still_reads_what_it_had_before_revocation() {
     // A session written before revocation is wrapped to the device that was active then.
     let key = DataKey::random();
     let wraps = wrap_for(&key, &[kept.box_public(), revoked.box_public()]).unwrap();
-    let sealed = seal_session(&key, b"written before revocation").unwrap();
+    let aad = session_aad("personal", "ses_r", 1);
+    let sealed = seal_session_bound(&key, &aad, b"written before revocation").unwrap();
 
     // Revoke.
     v.accept(&MemberList::new(2, vec![device_entry(&kept)]).sign(&admin)).unwrap();
 
     let k = unwrap_for(&revoked, &wraps).expect("the old wrap still opens for the revoked device");
-    assert_eq!(open_session(&k, &sealed).unwrap(), b"written before revocation",
+    assert_eq!(open_session_bound(&k, &aad, &sealed).unwrap(), b"written before revocation",
         "forward-only: the past stays readable, as approved");
 }
 

@@ -23,6 +23,22 @@ fn invite_takes_exactly_a_team_and_a_member() {
 }
 
 #[test]
+fn publish_takes_exactly_a_team() {
+    assert_eq!(parse(&a(&["publish", "personal"])).unwrap(),
+               Command::Publish { name: "personal".into() });
+    assert!(parse(&a(&["publish"])).is_err(), "name is required");
+    assert!(parse(&a(&["publish", "personal", "extra"])).is_err(), "extra argument refused");
+}
+
+#[test]
+fn forget_takes_a_team_and_a_machine() {
+    assert_eq!(parse(&a(&["forget", "personal", "box-2"])).unwrap(),
+               Command::Forget { name: "personal".into(), machine: "box-2".into() });
+    assert!(parse(&a(&["forget", "personal"])).is_err(), "machine is required");
+    assert!(parse(&a(&["forget", "personal", "box-2", "extra"])).is_err(), "extra argument refused");
+}
+
+#[test]
 fn mistakes_return_the_usage_line() {
     assert!(parse(&a(&[])).unwrap_err().starts_with("usage:"));
     assert!(parse(&a(&["create"])).is_err(), "name is required");

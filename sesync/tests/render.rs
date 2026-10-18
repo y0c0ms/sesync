@@ -60,7 +60,12 @@ fn the_key_help_is_drawn() {
     let sb = sandbox("help");
     let app = app_with_one_session(&sb, "x");
     let s = screen(&app, 100, 12);
-    assert!(s.contains("ctrl+d") && s.contains("rename"), "the footer must show the keys:\n{s}");
+    assert!(s.contains("ctrl+p") && s.contains("quit"), "the footer must point at the command list:\n{s}");
+    // The keys themselves live in the command list the footer points at.
+    let mut list = app_with_one_session(&sb, "x");
+    list.handle(Ev::Enter, Instant::now());
+    let p = screen(&list, 100, 12);
+    assert!(p.contains("Rename") && p.contains("Delete"), "the command list must show the actions:\n{p}");
 }
 
 #[test]

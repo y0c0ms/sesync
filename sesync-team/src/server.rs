@@ -230,6 +230,69 @@ async fn sessions<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers
     run(s, move |svc, now| http::list_sessions(svc, auth.as_deref(), &body.space, &body.machine, now)).await
 }
 
+/// Fetch the current admin-signed member list. Members only; the client re-verifies the
+/// admin signature against the key it pinned at join.
+async fn list_trust<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+    let body: ListBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let auth = auth_header(&headers);
+    run(s, move |svc, now| http::fetch_trust_list(svc, auth.as_deref(), &body.space, &body.machine, now)).await
+}
+
+/// Publish a newer admin-signed member list. Admin only. The server enforces a strictly
+/// increasing version and an admin signature over the pinned key, so revocation cannot be
+/// rolled back. The admin key itself never reaches the server.
+#[derive(Deserialize)]
+struct AdminListBody { space: String, signed_list: String }
+
+async fn admin_list<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+    let auth = auth_header(&headers);
+    if !is_admin(&s, auth.as_deref()) {
+        return counted(&s, "admin", respond((403, json!({"error": "admin only"}))));
+    }
+    let body: AdminListBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let Some(bytes) = from_hex(&body.signed_list) else {
+        return counted(&s, "admin", respond((400, json!({"error": "signed list is not hex"}))));
+    };
+    let r = run(s.clone(), move |svc, _| match svc.publish_trust_list(&body.space, &bytes) {
+        Ok(version) => (200, json!({"space": body.space, "version": version})),
+        Err(e) => crate::http::error_response(&e),
+    }).await;
+    counted(&s, "admin", r)
+}
+
+/// The enrolled devices and current list version, for the admin to build the next list.
+#[derive(Deserialize)]
+struct AdminDevicesBody { space: String }
+
+async fn admin_devices<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+    let auth = auth_header(&headers);
+    if !is_admin(&s, auth.as_deref()) {
+        return counted(&s, "admin", respond((403, json!({"error": "admin only"}))));
+    }
+    let body: AdminDevicesBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let r = run(s.clone(), move |svc, _| http::list_devices(svc, &body.space)).await;
+    counted(&s, "admin", r)
+}
+
+/// Forget a machine's device. Its token dies at once, and the next published list no longer
+/// names it: forget, then publish, is how a device is revoked.
+#[derive(Deserialize)]
+struct AdminForgetBody { space: String, machine: String }
+
+async fn admin_forget<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+    let auth = auth_header(&headers);
+    if !is_admin(&s, auth.as_deref()) {
+        return counted(&s, "admin", respond((403, json!({"error": "admin only"}))));
+    }
+    let body: AdminForgetBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let r = run(s.clone(), move |svc, _| {
+        svc.forget_device(&body.space, &body.machine);
+        (200, json!({"space": body.space, "machine": body.machine, "forgotten": true,
+                     "note": "the device is out at once; run publish to sign it out of the list"}))
+    }).await;
+    counted(&s, "admin", r)
+}
+
 /// Write one session. The caller must hold the live lease on the conversation, with the
 /// version it was granted. The body is the session bytes, raw.
 #[derive(Deserialize)]
@@ -335,6 +398,10 @@ pub fn router<S: Store + Send + 'static>(state: Shared<S>) -> Router {
         .route("/lease/acquire", post(acquire::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/lease/release", post(release::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/sessions", post(sessions::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/list", post(list_trust::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/admin/list", post(admin_list::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/admin/devices", post(admin_devices::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/admin/forget", post(admin_forget::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/record/read", post(read_record::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/record", post(write_record::<S>).layer(DefaultBodyLimit::max(MAX_SESSION_BODY)))
         .route("/record/sealed/read", post(read_sealed::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))

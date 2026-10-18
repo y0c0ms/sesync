@@ -55,7 +55,7 @@ fn pi_mirror_count(sb: &Path) -> usize {
 }
 
 #[test]
-fn two_daemons_on_the_same_stores_mirror_each_session_once() {
+fn two_daemons_on_the_same_stores_record_each_session_once() {
     let sb = sandbox("two-daemons");
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
@@ -77,13 +77,14 @@ fn two_daemons_on_the_same_stores_mirror_each_session_once() {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    // Two sessions, one pi mirror each: concurrent passes must not duplicate or drop.
-    assert_eq!(pi_mirror_count(&sb), 2, "each session must have exactly one pi mirror");
+    // Concurrent passes write nothing into pi, and must not duplicate or drop a record.
+    assert_eq!(pi_mirror_count(&sb), 0, "concurrent passes write nothing into pi");
 
     // The state file must be valid JSON after concurrent saves.
     let state = fs::read_to_string(sb.join("state").join("state.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&state).expect("state.json must stay valid JSON");
     assert!(v.get("sources").is_some());
+    assert_eq!(v["sources"].as_object().unwrap().len(), 2, "each session is recorded exactly once");
 }
 
 #[test]

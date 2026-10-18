@@ -1,6 +1,6 @@
 //! Session management: list, delete and rename. Ported from daemon/hs_manage.py.
 //! Every file operation is limited to the session roots, every operation holds
-//! the conversation lock, and mirrors are removed before their source.
+//! the conversation lock, and deleting removes only the picked session.
 
 use crate::lock::{with_claim, ClaimOutcome};
 use crate::state::State;
@@ -100,7 +100,9 @@ pub fn list_groups(roots: &Roots, state: &State) -> Vec<Group> {
             continue;
         }
         let g = by_key.entry(key.clone()).or_insert_with(|| {
-            let mut g = Group::file(&src.fmt, key.clone(), &file_name(key));
+            // Prefer the name the daemon recorded (O-penCode sessions have no file name to show).
+            let name = if src.title.is_empty() { file_name(key) } else { src.title.clone() };
+            let mut g = Group::file(&src.fmt, key.clone(), &name);
             // Not found among the files on disk: keep it, flagged as an orphan.
             g.orphan = true;
             g
@@ -155,20 +157,11 @@ pub fn delete_group(roots: &Roots, g: &Group, lock_dir: &Path, sesync_lock: &Pat
     if !roots.contains(&src) {
         return Err(format!("source outside session roots, not deleting: {}", src.display()));
     }
-    for (_, m) in &g.mirrors {
-        if !roots.contains(Path::new(m)) {
-            return Err(format!("mirror outside session roots, not deleting: {m}"));
-        }
-    }
+    // Only the picked session is removed. Mirror copies in other harnesses are never touched here;
+    // `sesync mirrors` handles those, and only when that loses nothing.
     let conv = conversation_id(&g.key);
     let outcome = with_claim(sesync_lock, Some(lock_dir), &conv, "tui", std::process::id(), &g.key, || {
         let mut log = Vec::new();
-        for (target, m) in &g.mirrors {
-            if Path::new(m).exists() {
-                fs::remove_file(m).map_err(|e| e.to_string())?;
-            }
-            log.push(format!("mirror {target}: {m}"));
-        }
         if src.exists() {
             fs::remove_file(&src).map_err(|e| e.to_string())?;
         }
@@ -254,7 +247,7 @@ fn rewrite_title(text: &str, fmt: &str, title: &str, session_id: &str) -> String
     out
 }
 
-fn conversation_id(key: &str) -> String {
+pub fn conversation_id(key: &str) -> String {
     let name = file_name(key);
     let stem = name.strip_suffix(".jsonl").unwrap_or(&name);
     stem.rsplit('_').next().unwrap_or(stem).to_string()

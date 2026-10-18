@@ -7,7 +7,7 @@ use sesync_team::membership::{device_entry, Device, MemberList};
 use sesync_team::server::{self, AppState, Clock};
 use sesync_team::service::{MemoryStore, Service};
 use sesync_team::signed_records::seal_record;
-use sesync_team::session_keys::{seal_session, DataKey};
+use sesync_team::session_keys::{seal_session_bound, session_aad, DataKey};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
@@ -23,8 +23,11 @@ async fn a_member_reads_back_the_exact_record_bytes() {
     svc.store_trust_list("personal", &MemberList::new(1, vec![device_entry(&admin), device_entry(&writer)]).sign(&admin).to_bytes()).unwrap();
     let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
     let token = svc.enrol("personal", "writer", "box-w", &code, T0).unwrap();
+    svc.bind_device("personal", "box-w", device_entry(&writer));
     let lease = svc.acquire("personal", "ses_r", "box-w", T0).unwrap();
-    let record = seal_record(&writer, 1, &seal_session(&DataKey::random(), b"x").unwrap()).unwrap();
+    let key = DataKey::random();
+    let body = seal_session_bound(&key, &session_aad("personal", "ses_r", lease.version), b"x").unwrap();
+    let record = seal_record(&writer, 1, lease.version, "personal", "ses_r", &body).unwrap();
     svc.put_sealed_leased("personal", "ses_r", "box-w", lease.version, record.clone()).unwrap();
 
     let clock: Clock = Arc::new(|| T0 + 1);

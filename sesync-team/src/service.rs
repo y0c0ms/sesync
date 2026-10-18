@@ -6,7 +6,7 @@ use crate::backup::{BackupPolicy, Retention};
 use crate::lease::{Lease, LeaseError, LeaseTable};
 use crate::spaces::{Space, SpaceError};
 use crate::totp::{JoinError, JoinGate};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServiceError {
@@ -61,6 +61,16 @@ pub trait Store {
     /// When this machine's enrolment was confirmed by the code. Set once; never moved forward.
     fn load_enrolled_at(&self, space: &str, machine: &str) -> Option<u64>;
     fn save_enrolled_at(&mut self, space: &str, machine: &str, at: u64);
+    /// The device entry (signing and box keys) this machine enrolled with. Set at enrolment;
+    /// the machine's authority comes from the entry being named by the current signed list.
+    fn load_device(&self, space: &str, machine: &str) -> Option<Vec<u8>>;
+    fn save_device(&mut self, space: &str, machine: &str, entry: Vec<u8>);
+    /// Every device entry enrolled for a space, as (machine, entry), sorted by machine. The
+    /// admin reads this to build the next member list.
+    fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)>;
+    /// Forget a machine's enrolled device. Its token dies at once (the bound device is gone),
+    /// and the next published list no longer names it.
+    fn remove_device(&mut self, space: &str, machine: &str);
 }
 
 #[derive(Default)]
@@ -73,6 +83,7 @@ pub struct MemoryStore {
     trust: HashMap<String, Vec<u8>>,
     admin_keys: HashMap<String, Vec<u8>>,
     enrolled_at: HashMap<(String, String), u64>,
+    devices: HashMap<(String, String), Vec<u8>>,
 }
 
 impl Store for MemoryStore {
@@ -118,6 +129,23 @@ impl Store for MemoryStore {
     }
     fn save_owner(&mut self, space: &str, machine: &str, member: &str) {
         self.owners.insert((space.to_string(), machine.to_string()), member.to_string());
+    }
+    fn load_device(&self, space: &str, machine: &str) -> Option<Vec<u8>> {
+        self.devices.get(&(space.to_string(), machine.to_string())).cloned()
+    }
+    fn save_device(&mut self, space: &str, machine: &str, entry: Vec<u8>) {
+        self.devices.insert((space.to_string(), machine.to_string()), entry);
+    }
+    fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = self.devices.iter()
+            .filter(|((s, _), _)| s == space)
+            .map(|((_, m), e)| (m.clone(), e.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+    fn remove_device(&mut self, space: &str, machine: &str) {
+        self.devices.remove(&(space.to_string(), machine.to_string()));
     }
     fn save_backup(&mut self, space: &str, policy: BackupPolicy) {
         self.backups.insert(space.to_string(), policy);
@@ -223,6 +251,7 @@ impl<S: Store> Service<S> {
             .map_err(|e| ServiceError::Auth(format!("{e:?}")))?;
         let enrolled = self.store.load_enrolled_at(space, machine)
             .ok_or_else(|| ServiceError::Auth("not enrolled on this machine".into()))?;
+        self.device_listed(space, machine)?;
         let window_end = enrolled + RENEW_WINDOW_SECS;
         if now >= window_end {
             return Err(ServiceError::Auth("enrolment window passed; the authenticator code is needed".into()));
@@ -231,18 +260,63 @@ impl<S: Store> Service<S> {
         Ok(crate::auth::issue_token(&key, &member, machine, expires))
     }
 
-    /// Check a token from a machine and return the member it was issued to.
+    /// Check a token from a machine and return the member it was issued to. When the team has a
+    /// trust root, the machine must also hold a device key the current admin-signed list names:
+    /// a revoked device stops here, however long its token would have run.
     pub fn authenticate(&self, space: &str, token: &str, machine: &str, now: u64) -> Result<String, ServiceError> {
         self.check_store()?;
         let key = self.store.load_token_key(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
-        crate::auth::check_token(&key, token, machine, now)
-            .map_err(|e| ServiceError::Auth(format!("{e:?}")))
+        let member = crate::auth::check_token(&key, token, machine, now)
+            .map_err(|e| ServiceError::Auth(format!("{e:?}")))?;
+        self.device_listed(space, machine)?;
+        Ok(member)
+    }
+
+    /// Record the device entry a machine enrolled with. The entry is a claimed public key: it
+    /// carries no authority until the admin's signed list names it.
+    pub fn bind_device(&mut self, space: &str, machine: &str, entry: Vec<u8>) {
+        self.store.save_device(space, machine, entry);
+    }
+
+    /// Every device entry enrolled for a space, sorted by machine. The admin reads this to build
+    /// the next signed list; the server never invents entries of its own.
+    pub fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)> {
+        self.store.devices(space)
+    }
+
+    /// Forget a machine's enrolled device. Live access ends at once, and the next published
+    /// list no longer names it: forget, then publish, is how a device is revoked.
+    pub fn forget_device(&mut self, space: &str, machine: &str) {
+        self.store.remove_device(space, machine);
+    }
+
+    /// When the team has a trust root, the machine's bound device must be in the current list.
+    /// No trust root (a legacy team) keeps the old behaviour.
+    fn device_listed(&self, space: &str, machine: &str) -> Result<(), ServiceError> {
+        let Some(list) = self.store.load_trust_list(space) else { return Ok(()) };
+        let entry = self.store.load_device(space, machine)
+            .ok_or_else(|| ServiceError::NotMember(machine.into()))?;
+        let signed = crate::membership::SignedList::from_bytes(&list)
+            .map_err(|_| ServiceError::Crypto("trust root unreadable".into()))?;
+        if signed.list.devices.iter().any(|e| e == &entry) {
+            Ok(())
+        } else {
+            Err(ServiceError::NotMember(machine.into()))
+        }
     }
 
     pub fn acquire(&mut self, space: &str, conv: &str, machine: &str, now: u64) -> Result<Lease, ServiceError> {
         self.check_store()?;
         self.store.load_space(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
-        Ok(self.leases.acquire(&format!("{space}/{conv}"), machine, now)?)
+        let key = format!("{space}/{conv}");
+        // After a restart this table has no grants. Continue from the sequence of the record
+        // already stored, so the next version is above every sequence a reader may have accepted.
+        if !self.leases.has_grant(&key) {
+            if let Some(seq) = self.store.record(space, conv).and_then(|r| crate::signed_records::sequence_of(&r)) {
+                self.leases.seed(&key, seq);
+            }
+        }
+        Ok(self.leases.acquire(&key, machine, now)?)
     }
 
     pub fn release(&mut self, space: &str, conv: &str, machine: &str) -> Result<(), ServiceError> {
@@ -296,6 +370,35 @@ impl<S: Store> Service<S> {
         self.store.load_trust_list(space)
     }
 
+    /// The space's current admin-signed member list, exactly as stored, for members to fetch.
+    /// The server does not interpret it here; a fetching client re-verifies the admin signature.
+    pub fn trust_list(&self, space: &str) -> Option<Vec<u8>> {
+        self.store.load_trust_list(space)
+    }
+
+    /// Publish a newer admin-signed member list. The list must be signed by the pinned admin key
+    /// and its version must be strictly newer than the stored one, so revocation is monotone:
+    /// an older or equal list can never be replayed over a newer one. Returns the new version.
+    pub fn publish_trust_list(&mut self, space: &str, bytes: &[u8]) -> Result<u64, ServiceError> {
+        self.check_store()?;
+        let admin = self.store.load_admin_key(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
+        let signed = crate::membership::SignedList::from_bytes(bytes)
+            .map_err(|_| ServiceError::Crypto("signed list is malformed".into()))?;
+        let mut verifier = crate::membership::Verifier::new(admin);
+        verifier.accept(&signed)
+            .map_err(|_| ServiceError::Crypto("signed list is not signed by the admin key".into()))?;
+        if let Some(current) = self.store.load_trust_list(space) {
+            let have = crate::membership::SignedList::from_bytes(&current).map(|l| l.list.version).unwrap_or(0);
+            if signed.list.version <= have {
+                return Err(ServiceError::Conflict(format!(
+                    "list version {} is not newer than the stored {have}", signed.list.version)));
+            }
+        }
+        let version = signed.list.version;
+        self.store.save_trust_list(space, bytes.to_vec());
+        Ok(version)
+    }
+
     /// Pin the admin's public key for a space. Done once, when the team is created.
     pub fn pin_admin_key(&mut self, space: &str, admin_public: &[u8]) -> Result<(), ServiceError> {
         self.store.save_admin_key(space, admin_public.to_vec());
@@ -306,6 +409,14 @@ impl<S: Store> Service<S> {
     /// does not decrypt it: it verifies the author's signature and the list version, then stores
     /// the bytes exactly as sent.
     pub fn put_client_sealed(&mut self, space: &str, conv: &str, record: Vec<u8>) -> Result<(), ServiceError> {
+        self.check_client_sealed(space, conv, &record)?;
+        self.store.put_record(space, conv, record);
+        Ok(())
+    }
+
+    /// The trust-root and binding checks for a client-sealed record, without storing it. Returns the
+    /// record's sequence. Shared by the plain and the leased write, so both check the same things.
+    fn check_client_sealed(&self, space: &str, conv: &str, record: &[u8]) -> Result<u64, ServiceError> {
         self.check_store()?;
         let list_bytes = self.store.load_trust_list(space).ok_or(ServiceError::NotMember(space.into()))?;
         let admin = self.store.load_admin_key(space).ok_or(ServiceError::NotMember(space.into()))?;
@@ -315,15 +426,23 @@ impl<S: Store> Service<S> {
         // list itself names: anyone who can write a list must not be able to choose the admin.
         let mut verifier = crate::membership::Verifier::new(admin);
         verifier.accept(&signed).map_err(|_| ServiceError::Crypto("trust root not admin-signed".into()))?;
-        crate::signed_records::open_record(&verifier, &record)
+        // The record must be bound to this space and conversation: a record sealed for another
+        // one is refused here, so it cannot be moved into this conversation.
+        let expect = crate::signed_records::Binding {
+            space: space.to_string(),
+            conversation: conv.to_string(),
+            min_sequence: 0,
+        };
+        let opened = crate::signed_records::open_record(&verifier, &expect, record)
             .map_err(|e| ServiceError::NotMember(format!("{e:?}")))?;
-        self.store.put_record(space, conv, record);
-        Ok(())
+        Ok(opened.sequence)
     }
 
     /// Store a client-sealed record for the conversation, but only from the machine holding its
     /// lease, under the version the lease granted. The lease is checked first, then the record's
-    /// author against the trust root; nothing is stored unless both pass.
+    /// author against the trust root, and its sequence must be exactly the granted version: the
+    /// writer cannot pick a sequence, so no one can raise a reader's floor past what was granted.
+    /// Nothing is stored unless all of it passes.
     pub fn put_sealed_leased(&mut self, space: &str, conv: &str, machine: &str, version: u64,
                              record: Vec<u8>) -> Result<(), ServiceError> {
         let key = format!("{space}/{conv}");
@@ -333,7 +452,12 @@ impl<S: Store> Service<S> {
         if current != Some(version) {
             return Err(ServiceError::Lease(format!("version {version} was not granted")));
         }
-        self.put_client_sealed(space, conv, record)
+        let sequence = self.check_client_sealed(space, conv, &record)?;
+        if sequence != version {
+            return Err(ServiceError::Lease(format!("record sequence {sequence} is not the granted version {version}")));
+        }
+        self.store.put_record(space, conv, record);
+        Ok(())
     }
 
     /// Whether the store is reachable. The health check reports this, nothing else.
@@ -346,6 +470,25 @@ impl<S: Store> Service<S> {
         self.check_store()?;
         self.member(space, who)?;
         Ok(self.store.list_conversations(space))
+    }
+
+    /// The conversation ids in a space, and for each one whose stored record is a signed record, the
+    /// sequence it carries. Only a member may ask. The sequence is read from the stored bytes without
+    /// checking the signature, so it is numbering for the caller's choice of what to fetch. A client
+    /// never accepts a record on the strength of it.
+    pub fn list_with_sequences(&self, space: &str, who: &str)
+        -> Result<(Vec<String>, BTreeMap<String, u64>), ServiceError>
+    {
+        self.check_store()?;
+        self.member(space, who)?;
+        let ids = self.store.list_conversations(space);
+        let sequences = ids.iter()
+            .filter_map(|conv| {
+                let seq = self.store.record(space, conv).and_then(|r| crate::signed_records::sequence_of(&r))?;
+                Some((conv.clone(), seq))
+            })
+            .collect();
+        Ok((ids, sequences))
     }
 
     /// The stored bytes, for checks that the store never holds plaintext.

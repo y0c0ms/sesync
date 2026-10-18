@@ -2,8 +2,14 @@
 //! sync_source. The daemon uses the `sesync_lock` binary; it never blocks on the lock
 //! layer itself.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Where claims and their sweep live. `SESYNC_LOCK_DIR` wins; otherwise the stored directory that
+/// sesync-lock uses by default. The daemon, the TUI and the sweep all call this, so they agree.
+pub fn lock_dir_for(home: &Path, override_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.unwrap_or_else(|| home.join(".local").join("share").join("harness-sync").join("locks"))
+}
 
 #[derive(Debug, PartialEq)]
 pub enum ClaimOutcome<T> {

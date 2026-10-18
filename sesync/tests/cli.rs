@@ -88,41 +88,40 @@ fn status_lists_sources_from_the_state_file() {
 }
 
 #[test]
-fn once_mirrors_an_omp_session_into_pi_and_records_it() {
-    let sb = sandbox("once-mirror");
+fn once_records_an_omp_session_and_writes_no_copy_into_pi() {
+    let sb = sandbox("once-record");
     omp_session(&sb);
     fs::create_dir_all(sb.join("pi")).unwrap();
     let o = run(&sb, &["--once"], &sesync_conv());
     assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
-    assert!(stdout(&o).contains("one pass done, 1 source(s) synced"), "{}", stdout(&o));
-    let mirrors = pi_mirrors(&sb);
-    assert_eq!(mirrors.len(), 1, "exactly one pi mirror must be written");
+    assert!(stdout(&o).contains("one pass done, 1 source(s) changed"), "{}", stdout(&o));
+    assert!(pi_mirrors(&sb).is_empty(), "a pass writes no copy into the pi store");
     let state = fs::read_to_string(sb.join("state").join("state.json")).unwrap();
-    assert!(state.contains(&mirrors[0].display().to_string().replace('\\', "\\\\")),
-            "the mirror must be recorded in state so it is never treated as a source");
+    assert!(state.contains("aaaaaaaa-1111-2222-3333-444444444444"), "the session is recorded as a source");
 }
 
 #[test]
-fn a_second_pass_with_no_changes_syncs_nothing() {
+fn a_second_pass_with_no_changes_reports_nothing_changed() {
     let sb = sandbox("once-idle");
     omp_session(&sb);
     fs::create_dir_all(sb.join("pi")).unwrap();
     assert!(run(&sb, &["--once"], &sesync_conv()).status.success());
     let o = run(&sb, &["--once"], &sesync_conv());
-    assert!(stdout(&o).contains("one pass done, 0 source(s) synced"), "{}", stdout(&o));
-    assert_eq!(pi_mirrors(&sb).len(), 1, "an unchanged session must not be re-mirrored");
+    assert!(stdout(&o).contains("one pass done, 0 source(s) changed"), "{}", stdout(&o));
+    assert!(pi_mirrors(&sb).is_empty(), "an unchanged session writes nothing");
 }
 
 #[test]
-fn a_failing_converter_counts_a_failure_and_writes_nothing() {
-    let sb = sandbox("once-fail");
+fn a_pass_never_runs_the_converter() {
+    let sb = sandbox("once-no-converter");
     omp_session(&sb);
     fs::create_dir_all(sb.join("pi")).unwrap();
+    // A converter that always fails would count failures if the pass ran it.
     let o = run(&sb, &["--once"], Path::new("/bin/false"));
-    assert!(o.status.success(), "a failed source must not crash the pass: {o:?}");
-    assert!(pi_mirrors(&sb).is_empty(), "a failed conversion must write no mirror");
+    assert!(o.status.success(), "a pass has no converter to fail: {o:?}");
+    assert!(pi_mirrors(&sb).is_empty(), "no copy is written, so no conversion runs");
     let st = run(&sb, &["--status"], &sesync_conv());
-    assert!(stdout(&st).contains("failures: 1"), "{}", stdout(&st));
+    assert!(!stdout(&st).contains("failures:"), "{}", stdout(&st));
 }
 
 #[test]

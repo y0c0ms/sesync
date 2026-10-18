@@ -135,3 +135,48 @@ fn q_quits() {
     a.handle(Ev::Char('q'), Instant::now());
     assert!(a.should_quit());
 }
+
+/// A second session in the same folder, so the list has two rows.
+fn two_sessions(sb: &PathBuf) -> (Roots, PathBuf, PathBuf) {
+    let (roots, first) = fixture(sb);
+    let id2 = "bbbbbbbb-1111-2222-3333-444444444444";
+    let second = roots.omp.join("-tmp").join(format!("2026-10-02T10-00-00-000Z_{id2}.jsonl"));
+    fs::write(&second, format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id2}\",\"cwd\":\"/tmp\",\"title\":\"Second\"}}\n")).unwrap();
+    (roots, first, second)
+}
+
+#[test]
+fn arrow_keys_move_the_cursor_and_stop_at_the_ends() {
+    let sb = sandbox("cursor");
+    let (roots, _, _) = two_sessions(&sb);
+    let mut a = app(&sb, roots);
+    let now = Instant::now();
+    assert_eq!(a.rows().len(), 2);
+    assert_eq!(a.selected_index(), 0);
+    a.handle(Ev::Down, now);
+    assert_eq!(a.selected_index(), 1);
+    a.handle(Ev::Down, now);
+    assert_eq!(a.selected_index(), 1, "down on the last row stays there");
+    a.handle(Ev::Up, now);
+    assert_eq!(a.selected_index(), 0);
+    a.handle(Ev::Up, now);
+    assert_eq!(a.selected_index(), 0, "up on the first row stays there");
+    a.handle(Ev::End, now);
+    assert_eq!(a.selected_index(), 1);
+    a.handle(Ev::Home, now);
+    assert_eq!(a.selected_index(), 0);
+}
+
+#[test]
+fn moving_the_cursor_cancels_an_armed_delete() {
+    let sb = sandbox("cursor-cancel");
+    let (roots, first, _) = two_sessions(&sb);
+    let mut a = app(&sb, roots);
+    let now = Instant::now();
+    a.handle(Ev::CtrlD, now); // arms row 0
+    a.handle(Ev::Down, now);  // moving cancels the arm
+    a.handle(Ev::Up, now);    // back on row 0
+    a.handle(Ev::CtrlD, now); // a fresh first press only re-arms
+    assert!(first.exists(), "a delete must need two presses with no cursor move between them");
+    assert!(a.status().contains("Press ctrl+d again"), "{}", a.status());
+}

@@ -32,6 +32,7 @@ fn app_with_team_session(root: &PathBuf) -> App {
 fn i_asks_for_confirmation_before_anything_is_written() {
     let root = sandbox("ask");
     let mut a = app_with_team_session(&root);
+    a.handle(Ev::Tab, Instant::now());
     a.handle(Ev::Char('i'), Instant::now());
     assert_eq!(a.mode(), Mode::Confirm, "i enters confirmation");
     assert!(a.status().contains("import"), "the question is shown: {}", a.status());
@@ -42,6 +43,7 @@ fn i_asks_for_confirmation_before_anything_is_written() {
 fn only_y_imports_anything_else_cancels() {
     let root = sandbox("yn");
     let mut a = app_with_team_session(&root);
+    a.handle(Ev::Tab, Instant::now());
     a.handle(Ev::Char('i'), Instant::now());
     a.handle(Ev::Char('n'), Instant::now());
     assert_eq!(a.mode(), Mode::Browse, "n cancels");
@@ -53,6 +55,7 @@ fn only_y_imports_anything_else_cancels() {
 fn y_imports_the_confirmed_session() {
     let root = sandbox("yes");
     let mut a = app_with_team_session(&root);
+    a.handle(Ev::Tab, Instant::now());
     a.handle(Ev::Char('i'), Instant::now());
     a.handle(Ev::Char('y'), Instant::now());
     assert_eq!(a.mode(), Mode::Browse);
@@ -68,6 +71,7 @@ fn i_with_no_team_session_does_nothing() {
     let root = sandbox("none");
     let roots = Roots { omp: root.join("omp"), pi: root.join("pi"), claude: root.join("claude") };
     let mut a = App::new(roots, State::default(), root.join("locks"), root.join("hs.lock"));
+    a.handle(Ev::Tab, Instant::now());
     a.handle(Ev::Char('i'), Instant::now());
     assert_eq!(a.mode(), Mode::Browse, "no team session, no confirmation");
     let _ = std::fs::remove_dir_all(&root);
@@ -80,6 +84,7 @@ fn a_team_id_the_harness_cannot_list_is_refused() {
                         claude: root.join("claude").join("projects") };
     let mut a = App::new(roots, State::default(), root.join("locks"), root.join("hs.lock"));
     a.set_team_sessions(vec![("ses_not_a_uuid".into(), b"x".to_vec())]);
+    a.handle(Ev::Tab, Instant::now());
     a.handle(Ev::Char('i'), Instant::now());
     a.handle(Ev::Char('y'), Instant::now());
     assert!(a.imported().is_empty(), "an id the harness cannot list is not imported");

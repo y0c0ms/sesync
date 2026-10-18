@@ -114,3 +114,28 @@ fn a_state_file_written_before_subagents_existed_still_loads() {
     assert!(s.subagents.is_empty());
     assert!(s.sources.contains_key("omp:/x/a.jsonl"));
 }
+
+#[test]
+fn the_team_sequence_floors_round_trip_and_default_to_empty() {
+    // The highest team record sequence accepted per conversation survives a restart, so an old
+    // record cannot be replayed after the daemon has been restarted.
+    let d = tmp("team-seen");
+    let f = d.join("state.json");
+    let mut s = State::default();
+    s.team_seen.insert("ses_a".into(), 7);
+    s.team_seen.insert("ses_b".into(), 1);
+    s.save(&f).unwrap();
+    let back = State::load(&f).unwrap();
+    assert_eq!(back.team_seen.get("ses_a"), Some(&7));
+    assert_eq!(back.team_seen.get("ses_b"), Some(&1));
+    assert_eq!(back.team_seen.len(), 2);
+}
+
+#[test]
+fn a_state_file_written_before_team_floors_existed_has_none() {
+    let d = tmp("no-team-seen");
+    let f = d.join("state.json");
+    fs::write(&f, PY_STATE).unwrap();
+    let s = State::load(&f).unwrap();
+    assert!(s.team_seen.is_empty(), "the optional key defaults to empty");
+}

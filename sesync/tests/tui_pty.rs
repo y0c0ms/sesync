@@ -73,6 +73,156 @@ fn tui_draws_the_session_and_quits_on_q() {
     assert!(status.unwrap().success(), "a clean quit must exit 0");
 }
 
+/// Enter and ctrl+p open the command list; tab shows the Team pane; ctrl+c still quits.
+/// This checks the raw-mode key map end to end, not just the app model.
+#[test]
+fn tui_opens_the_command_list_and_the_team_tab() {
+    let sb = sandbox("palette");
+    let sid = "aaaaaaaa-1111-2222-3333-444444444444";
+    let dir = sb.join("omp").join("sessions").join("-tmp");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
+    fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
+        format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyPaletteTitle\"}}\n")).unwrap();
+
+    let (mut master, slave) = {
+        let mut m: libc_fd::Pair = libc_fd::open_pty();
+        let _ = &mut m;
+        (m.master, m.slave)
+    };
+    let mut child = std::process::Command::new(BIN)
+        .arg("--tui")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("TERM", "xterm-256color")
+        .stdin(unsafe_stdio(slave))
+        .stdout(unsafe_stdio(slave))
+        .stderr(unsafe_stdio(slave))
+        .spawn()
+        .expect("spawn --tui");
+    set_winsize(master, 30, 110);
+
+    let wait_for = |needle: &str, master: i32, seen: &mut Vec<u8>| -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            if let Ok(n) = read_nonblocking(master, &mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let text = strip_ansi(seen);
+            if text.contains(needle) {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        strip_ansi(seen)
+    };
+
+    let text = wait_for("PtyPaletteTitle", master, &mut Vec::new());
+    assert!(text.contains("PtyPaletteTitle"), "the list must be drawn:\n{text}");
+
+    let checked: &mut Vec<u8> = &mut Vec::new();
+    let mut m = unsafe_file(master);
+    m.write_all(b"\x10").unwrap(); // ctrl+p opens the command list (Enter opens the session menu)
+    let text = wait_for("Rename session", master, checked);
+    assert!(text.contains("command:"), "the command list must show its input line:\n{text}");
+    m.write_all(b"\x10").unwrap(); // ctrl+p closes it again
+    let text = wait_for("PtyPaletteTitle", master, checked);
+
+    m.write_all(b"\t").unwrap(); // tab moves to the Team pane
+    let text = wait_for("No team server configured", master, checked);
+    assert!(text.contains("SESYNC_TEAM_URL"), "the Team pane must say what is missing:\n{text}");
+
+    m.write_all(b"\x03").unwrap(); // ctrl+c copies the path and reminds that q quits
+    let text = wait_for("press q to quit", master, checked);
+    assert!(text.contains("copied"), "ctrl+c must say what was copied:\n{text}");
+    m.write_all(b"q").unwrap();
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert!(status.is_some(), "the TUI must exit on q after a copy");
+    assert!(status.unwrap().success(), "a clean quit must exit 0");
+}
+
+/// Enter on a session opens its menu; the mirror row opens the picker; unticking a harness and
+/// confirming shows the chosen set and returns to the list. This is the new per-session flow end
+/// to end, not just the app model.
+#[test]
+fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
+    let sb = sandbox("menu");
+    let sid = "aaaaaaaa-1111-2222-3333-444444444444";
+    let dir = sb.join("omp").join("sessions").join("-tmp");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
+    fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
+        format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyMenuTitle\"}}\n")).unwrap();
+
+    let (mut master, slave) = {
+        let mut m: libc_fd::Pair = libc_fd::open_pty();
+        let _ = &mut m;
+        (m.master, m.slave)
+    };
+    let mut child = std::process::Command::new(BIN)
+        .arg("--tui")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("TERM", "xterm-256color")
+        .stdin(unsafe_stdio(slave))
+        .stdout(unsafe_stdio(slave))
+        .stderr(unsafe_stdio(slave))
+        .spawn()
+        .expect("spawn --tui");
+    set_winsize(master, 30, 110);
+
+    let wait_for = |needle: &str, master: i32, seen: &mut Vec<u8>| -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            if let Ok(n) = read_nonblocking(master, &mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let text = strip_ansi(seen);
+            if text.contains(needle) {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        strip_ansi(seen)
+    };
+
+    let seen = &mut Vec::new();
+    let text = wait_for("PtyMenuTitle", master, seen);
+    assert!(text.contains("PtyMenuTitle"), "the list must be drawn:\n{text}");
+
+    let mut m = unsafe_file(master);
+    m.write_all(b"\r").unwrap(); // Enter opens the selected session's menu
+    let text = wait_for("up/down move", master, seen);
+    assert!(text.contains("Mark / unmark for team"), "the session menu must be drawn:\n{text}");
+
+    m.write_all(b"jj\r").unwrap(); // down two rows to Mirror to harness, then run it
+    let text = wait_for("space tick", master, seen);
+    assert!(text.contains("[x] pi") && text.contains("[x] claude"),
+        "installed harnesses start ticked:\n{text}");
+
+    m.write_all(b" \r").unwrap(); // untick pi, confirm
+    let text = wait_for("sync with: claude", master, seen);
+    assert!(text.contains("sync with: claude"),
+        "confirming must name the chosen harnesses:\n{text}");
+
+    m.write_all(b"q").unwrap();
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert!(status.is_some(), "the TUI must exit on q");
+    assert!(status.unwrap().success(), "a clean quit must exit 0");
+}
+
 // Minimal pty helpers over libc, kept local so no extra crate is needed for tests.
 mod libc_fd {
     extern "C" {

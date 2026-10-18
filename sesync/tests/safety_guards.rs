@@ -49,7 +49,7 @@ fn sesync_lock() -> PathBuf {
 }
 
 #[test]
-fn a_mirror_outside_the_session_roots_is_never_deleted() {
+fn delete_never_touches_a_mirror_even_one_outside_the_roots() {
     let sb = sandbox("mirror-outside");
     let r = roots(&sb);
     let src = r.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
@@ -61,9 +61,9 @@ fn a_mirror_outside_the_session_roots_is_never_deleted() {
     let mut g = Group::file("omp", src.display().to_string(), "t");
     g.add_mirror("pi", outside.display().to_string());
     let res = delete_group(&r, &g, &sb.join("locks"), &sb.join("no-sesync_lock"));
-    assert!(res.is_err(), "a mirror outside the roots must be refused");
-    assert_eq!(fs::read_to_string(&outside).unwrap(), "precious", "the file outside must be untouched");
-    assert!(src.exists(), "a refused delete must not remove the source either");
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "precious", "delete never touches a mirror");
+    assert!(!src.exists(), "the picked session is removed");
 }
 
 #[test]

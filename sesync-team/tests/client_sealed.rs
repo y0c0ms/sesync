@@ -23,10 +23,12 @@ fn app() -> (axum::Router, Arc<AppState<MemoryStore>>) {
 
 
 /// A valid token and lease for `machine`, so a request reaches the check its test is about.
-fn credentials(state: &Arc<AppState<MemoryStore>>, machine: &str, conv: &str) -> (String, u64) {
+fn credentials(state: &Arc<AppState<MemoryStore>>, machine: &str, conv: &str, device: &Device) -> (String, u64) {
     let mut svc = state.service.lock().unwrap();
     let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
     let token = svc.enrol("personal", "writer", machine, &code, T0).unwrap();
+    // Device-bound auth: the machine's device key must be named by the trust list.
+    svc.bind_device("personal", machine, device_entry(device));
     let lease = svc.acquire("personal", conv, machine, T0).unwrap();
     (format!("Bearer {token}"), lease.version)
 }
@@ -50,10 +52,12 @@ async fn the_server_stores_and_returns_the_client_sealed_bytes_unchanged() {
     state.service.lock().unwrap().store_trust_list("personal", &list.to_bytes()).unwrap();
 
     // The writer encrypts the session under its data key first, then signs the ciphertext.
+    // The record's sequence is the lease version it is written under: the first lease is 1.
     let key = sesync_team::session_keys::DataKey::random();
-    let body = sesync_team::session_keys::seal_session(&key, b"session content").unwrap();
-    let record = seal_record(&writer, 1, &body).unwrap();
-    let (auth, v) = credentials(&state, "box-w", "ses_c");
+    let aad = sesync_team::session_keys::session_aad("personal", "ses_c", 1);
+    let body = sesync_team::session_keys::seal_session_bound(&key, &aad, b"session content").unwrap();
+    let record = seal_record(&writer, 1, 1, "personal", "ses_c", &body).unwrap();
+    let (auth, v) = credentials(&state, "box-w", "ses_c", &writer);
     let uri = format!("/record/sealed?space=personal&conversation=ses_c&machine=box-w&version={v}");
     let (st, body) = call(&app, &uri, Some(&auth), record.clone()).await;
     assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
@@ -72,8 +76,8 @@ async fn a_record_from_an_unlisted_device_is_refused() {
     let list = MemberList::new(1, vec![device_entry(&admin), device_entry(&writer)]).sign(&admin);
     state.service.lock().unwrap().pin_admin_key("personal", &admin.public_key()).unwrap();
     state.service.lock().unwrap().store_trust_list("personal", &list.to_bytes()).unwrap();
-    let forged = seal_record(&outsider, 1, b"x").unwrap();
-    let (auth, v) = credentials(&state, "box-w", "ses_c");
+    let forged = seal_record(&outsider, 1, 1, "personal", "ses_c", b"x").unwrap();
+    let (auth, v) = credentials(&state, "box-w", "ses_c", &writer);
     let uri = format!("/record/sealed?space=personal&conversation=ses_c&machine=box-w&version={v}");
     let (st, _) = call(&app, &uri, Some(&auth), forged).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "an unlisted author is refused");
@@ -83,8 +87,8 @@ async fn a_record_from_an_unlisted_device_is_refused() {
 async fn a_record_is_refused_when_no_trust_list_is_set() {
     let (app, state) = app();
     let writer = Device::generate();
-    let record = seal_record(&writer, 1, b"x").unwrap();
-    let (auth, v) = credentials(&state, "box-w", "ses_c");
+    let record = seal_record(&writer, 1, 1, "personal", "ses_c", b"x").unwrap();
+    let (auth, v) = credentials(&state, "box-w", "ses_c", &writer);
     let uri = format!("/record/sealed?space=personal&conversation=ses_c&machine=box-w&version={v}");
     let (st, _) = call(&app, &uri, Some(&auth), record).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "no trust root, no accepted record");
