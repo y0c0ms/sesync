@@ -26,7 +26,7 @@ A refused claim blocks the prompt and names the holder, so two harnesses never w
 
 ```
 sesync-lock/   sesync-lock: claim / release / check / resolve / sweep / list
-sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude
+sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude / to-gemini
 sesync/        the sync daemon and manage TUI
 sesync-team/   team sync core (sealed records, leases, member list) and team-server
 hooks/         per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
@@ -44,7 +44,7 @@ docs/          architecture, status, research notes
 ## Requirements
 
 - Rust (stable) to build `sesync-lock` and `sesync-conv`.
-- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code.
+- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code, Gemini CLI.
 
 ## Build
 

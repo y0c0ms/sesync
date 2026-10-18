@@ -3,11 +3,15 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_sesync");
+
+fn sesync_conv() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-conv/target/release/sesync-conv")
+}
 
 fn sandbox(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("hs-tuipty-{}-{name}", std::process::id()));
@@ -35,12 +39,15 @@ fn tui_draws_the_session_and_quits_on_q() {
     let mut child = std::process::Command::new(BIN)
         .arg("--tui")
         .env("SESYNC_DIR", sb.join("state"))
+        .env("SESYNC_CONFIG_DIR", sb.join("config"))
         .env("OMP_AGENT_DIR", sb.join("omp"))
         .env("PI_AGENT_DIR", sb.join("pi"))
         .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
         // Point O-penCode at an empty sandbox path so the TUI never lists the real store.
         .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_CONV", sesync_conv())
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -71,6 +78,7 @@ fn tui_draws_the_session_and_quits_on_q() {
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
     assert!(status.is_some(), "the TUI must exit on q");
     assert!(status.unwrap().success(), "a clean quit must exit 0");
+
 }
 
 /// Enter and ctrl+p open the command list; tab shows the Team pane; ctrl+c still quits.
@@ -94,11 +102,14 @@ fn tui_opens_the_command_list_and_the_team_tab() {
     let mut child = std::process::Command::new(BIN)
         .arg("--tui")
         .env("SESYNC_DIR", sb.join("state"))
+        .env("SESYNC_CONFIG_DIR", sb.join("config"))
         .env("OMP_AGENT_DIR", sb.join("omp"))
         .env("PI_AGENT_DIR", sb.join("pi"))
         .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
         .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_CONV", sesync_conv())
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -132,7 +143,7 @@ fn tui_opens_the_command_list_and_the_team_tab() {
     let text = wait_for("Rename session", master, checked);
     assert!(text.contains("command:"), "the command list must show its input line:\n{text}");
     m.write_all(b"\x10").unwrap(); // ctrl+p closes it again
-    let text = wait_for("PtyPaletteTitle", master, checked);
+    let _ = wait_for("PtyPaletteTitle", master, checked);
 
     m.write_all(b"\t").unwrap(); // tab moves to the Team pane
     let text = wait_for("No team server configured", master, checked);
@@ -158,8 +169,10 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
     fs::create_dir_all(&dir).unwrap();
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
+    let text = "hello from the tui mirror test ".repeat(30);
     fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
-        format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyMenuTitle\"}}\n")).unwrap();
+        format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyMenuTitle\"}}\n\
+{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")).unwrap();
 
     let (mut master, slave) = {
         let mut m: libc_fd::Pair = libc_fd::open_pty();
@@ -169,11 +182,14 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
     let mut child = std::process::Command::new(BIN)
         .arg("--tui")
         .env("SESYNC_DIR", sb.join("state"))
+        .env("SESYNC_CONFIG_DIR", sb.join("config"))
         .env("OMP_AGENT_DIR", sb.join("omp"))
         .env("PI_AGENT_DIR", sb.join("pi"))
         .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
         .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_CONV", sesync_conv())
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -209,10 +225,10 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
 
     m.write_all(b"jj\r").unwrap(); // down two rows to Mirror to harness, then run it
     let text = wait_for("space tick", master, seen);
-    assert!(text.contains("[x] pi") && text.contains("[x] claude"),
-        "installed harnesses start ticked:\n{text}");
+    assert!(text.contains("[ ] π pi") && text.contains("[ ] ✶ claude"),
+        "a fresh picker starts with nothing ticked, each harness behind its icon:\n{text}");
 
-    m.write_all(b" \r").unwrap(); // untick pi, confirm
+    m.write_all(b"j \r").unwrap(); // tick claude only, confirm
     let text = wait_for("sync with: claude", master, seen);
     assert!(text.contains("sync with: claude"),
         "confirming must name the chosen harnesses:\n{text}");
@@ -221,6 +237,40 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
     assert!(status.is_some(), "the TUI must exit on q");
     assert!(status.unwrap().success(), "a clean quit must exit 0");
+
+    // The choice must have been saved, and the next pass must write only the chosen harness.
+    let pass = std::process::Command::new(BIN)
+        .arg("--once")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("SESYNC_CONFIG_DIR", sb.join("config"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_QUIET", "0")
+        .output()
+        .expect("run --once after the TUI");
+    assert!(pass.status.success(), "{}", String::from_utf8_lossy(&pass.stderr));
+
+    fn jsonl(root: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() { out.extend(jsonl(&p)); }
+                else if p.extension().map_or(false, |x| x == "jsonl") { out.push(p); }
+            }
+        }
+        out
+    }
+    let claude = jsonl(&sb.join("claude").join("projects"));
+    assert_eq!(claude.len(), 1, "the chosen claude mirror must be written");
+    let body = fs::read_to_string(&claude[0]).unwrap();
+    assert!(body.contains("hello from the tui mirror test"), "the conversation must be carried");
+    assert!(jsonl(&sb.join("pi").join("sessions")).is_empty(), "the unticked pi target must not be written");
 }
 
 // Minimal pty helpers over libc, kept local so no extra crate is needed for tests.

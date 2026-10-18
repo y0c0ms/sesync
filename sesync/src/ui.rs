@@ -8,17 +8,20 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::time::Instant;
 
-const KEYS: &str = "tab team  ctrl+p commands  ctrl+t colour  ctrl+c copy  q quit";
 const QR_FG: Color = Color::Rgb(0x10, 0x10, 0x10);
 const QR_BG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     let th = app.theme();
+    // The theme owns the page background, like a text-editor colour scheme: paint it over the
+    // whole frame first; later widgets only set foregrounds, so the fill shows through.
+    f.render_widget(Block::default().style(Style::default().bg(th.bg)), area);
     let chunks = Layout::vertical([
         Constraint::Length(1), // tab bar
         Constraint::Min(1),    // list, team list
@@ -35,12 +38,25 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let status_line = match app.mode() {
         // The status goes beside the input, so a refused rename is visible while the user edits.
-        Mode::Rename => format!("Rename: {}_  {}", app.input(), app.status()),
-        _ => app.status().to_string(),
+        // A rename refusal is an error and does not fade, so the raw status is honest here too.
+        Mode::Rename => Some((format!("Rename: {}_  {}", app.input(), app.status()), app.status_is_error())),
+        _ => app.status_line(Instant::now()).map(|(t, e)| (t.to_string(), e)),
     };
-    let status_col = if is_error(&status_line) { th.error } else { th.text };
-    f.render_widget(Paragraph::new(status_line).style(Style::default().fg(status_col)), chunks[2]);
-    f.render_widget(Paragraph::new(KEYS).style(Style::default().fg(th.dim)), chunks[3]);
+    // Both bottom rows sit on the theme's bar colour, like a statusline, so typed input and
+    // messages are easy to find. While the filter is being typed it gets the foreground colour
+    // and bold: that is the text the user is editing.
+    let (status_col, bold) = match (&status_line, app.mode()) {
+        (Some((_, true)), _) => (th.error, false),
+        (_, Mode::Filter) => (th.text, true),
+        _ => (th.text, false),
+    };
+    let mut status_style = Style::default().fg(status_col).bg(th.bar);
+    if bold {
+        status_style = status_style.add_modifier(Modifier::BOLD);
+    }
+    let status_text = status_line.as_ref().map(|(t, _)| t.as_str()).unwrap_or("");
+    f.render_widget(Paragraph::new(status_text).style(status_style), chunks[2]);
+    f.render_widget(Paragraph::new(app.footer()).style(Style::default().fg(th.dim).bg(th.bar)), chunks[3]);
 
     // Dialogs float over everything.
     match app.mode() {
@@ -50,18 +66,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Theme => draw_theme(f, app, th, area),
         Mode::Form => draw_form(f, app, th, area),
         Mode::Qr => draw_qr(f, app, th, area),
+        Mode::Help => draw_help(f, app, th, area),
+        Mode::Transcript => draw_transcript(f, app, th, area),
+        Mode::DeleteConfirm => draw_delete_confirm(f, app, th, area),
         _ => {}
     }
-}
-
-/// Whether a status message deserves the error colour.
-fn is_error(status: &str) -> bool {
-    status.starts_with("refused")
-        || status.starts_with("not imported")
-        || status.starts_with("cannot")
-        || status.starts_with("server refused")
-        || status.starts_with("the code is")
-        || status.starts_with("fill every field")
 }
 
 fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
@@ -99,7 +108,7 @@ fn draw_sessions(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     }
 
     let items: Vec<ListItem> = app
-        .rows()
+        .visible_rows()
         .iter()
         .map(|g| {
             let mut spans = vec![
@@ -110,11 +119,15 @@ fn draw_sessions(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             ];
             if show_cols {
                 let c = app.session_cols(g);
-                let values = [c.team, c.last_sync, c.next_sync, c.mirrors, c.updated];
-                for ((_, w), v) in COLS.iter().zip(values.iter()) {
+                let values = [c.team, c.last_sync, c.next_sync];
+                for i in 0..3 {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(fit(v, *w), Style::default().fg(th.dim)));
+                    spans.push(Span::styled(fit(&values[i], COLS[i].1), Style::default().fg(th.dim)));
                 }
+                spans.push(Span::raw(" "));
+                spans.extend(mirror_spans(&c.mirror_parts, COLS[3].1, th));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(fit(&c.updated, COLS[4].1), Style::default().fg(th.dim)));
             }
             ListItem::new(Line::from(spans))
         })
@@ -122,27 +135,59 @@ fn draw_sessions(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     // The highlighted row is the cursor; the offset keeps it on screen when the list is longer than the pane.
     let list_area = parts[1];
     let height = list_area.height as usize;
-    let selected = if app.rows().is_empty() { None } else { Some(app.selected_index()) };
+    let selected = if app.visible_rows().is_empty() { None } else { Some(app.selected_index()) };
     let offset = match selected {
         Some(sel) if height > 0 => sel.saturating_sub(height - 1),
         _ => 0,
     };
     let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
+    // Only the background marks the cursor row; the foreground colours (marker states,
+    // dimmed columns) stay readable on the selected row.
     let list = List::new(items)
-        .highlight_style(Style::default().fg(th.text).bg(th.accent))
+        .highlight_style(Style::default().bg(th.accent))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// The MIRRORS cell, one span per target: dim when mirrored, warn while a chosen write is
+/// still pending, error when it failed. The plain text is used when the cell must be cut.
+fn mirror_spans(parts: &[(String, crate::session_cols::MirrorState)], width: usize, th: &Theme) -> Vec<Span<'static>> {
+    use crate::session_cols::{fit, mirror_mark, MirrorState};
+    let plain: String = parts.iter().map(|(t, s)| format!("{t}{}", mirror_mark(*s))).collect::<Vec<_>>().join(",");
+    if plain.chars().count() > width {
+        return vec![Span::styled(fit(&plain, width), Style::default().fg(th.dim))];
+    }
+    let mut spans = Vec::new();
+    for (i, (t, s)) in parts.iter().enumerate() {
+        let color = match s {
+            MirrorState::Mirrored => th.dim,
+            MirrorState::Pending => th.warn,
+            MirrorState::Failing => th.error,
+        };
+        let sep = if i > 0 { "," } else { "" };
+        spans.push(Span::styled(format!("{sep}{t}{}", mirror_mark(*s)), Style::default().fg(color)));
+    }
+    let used = plain.chars().count();
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    spans
 }
 
 /// The Team pane: what a verified pull actually brought over. Without a server configured the
 /// pane says so instead of showing nothing.
 fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let header = Paragraph::new(app.team_header(std::time::Instant::now()))
+        .style(Style::default().fg(th.dim));
+    f.render_widget(header, parts[0]);
+    let area = parts[1];
     let rows = app.team_rows();
     if rows.is_empty() {
         let msg = if app.team_configured() {
             "No verified team sessions yet. Press ctrl+r to pull."
         } else {
-            "No team server configured. Set SESYNC_TEAM_URL, enroll in the command list (ctrl+p, Enroll), then press ctrl+r."
+            "No team server configured. Set SESYNC_TEAM_URL, join from the command list (ctrl+p, Join a team), then press ctrl+r."
         };
         f.render_widget(Paragraph::new(msg).style(Style::default().fg(th.dim)), area);
         return;
@@ -153,7 +198,7 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
     let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();
     let list = List::new(items)
-        .highlight_style(Style::default().fg(th.text).bg(th.accent))
+        .highlight_style(Style::default().bg(th.accent))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut list_state);
 }
@@ -172,9 +217,11 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
     }
 }
 
-/// Clear the area and draw a bordered box; returns the inside of the box.
+/// Fill the area with the page background and draw a bordered box; returns the inside of the box.
 fn dialog(f: &mut Frame, title: &str, th: &Theme, outer: Rect) -> Rect {
-    f.render_widget(Clear, outer);
+    // A dialog floats over rows that were already painted; restamp them with the page
+    // background so no list text shows through, then draw the box.
+    f.render_widget(Block::default().style(Style::default().bg(th.bg)), outer);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th.accent))
@@ -260,7 +307,8 @@ fn draw_session_menu(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 }
 
 /// Pick the harnesses to mirror the selected session into. Installed targets only; the session's
-/// own format is never offered. A ticked row is marked with [x].
+/// own format is never offered. A ticked row is marked with [x], and each row leads with the
+/// harness's glyph so the list reads at a glance.
 fn draw_mirror_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let targets = app.picker_targets();
     let outer = centered(56, targets.len().max(1) as u16 + 4, area);
@@ -274,11 +322,28 @@ fn draw_mirror_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             let mark = if app.pick_is_chosen(t) { "[x]" } else { "[ ]" };
             let on = i == cursor;
             let style = if on { on_accent(th, true) } else { Style::default().fg(th.text) };
-            ListItem::new(Line::from(Span::styled(format!(" {mark} {t}"), style)))
+            let mut spans = vec![Span::styled(format!(" {mark} {} {t}", harness_icon(t)), style)];
+            if let Some(note) = app.pick_row_note(t) {
+                let note_style = if on { style } else { Style::default().fg(th.dim) };
+                spans.push(Span::styled(format!("  {note}"), note_style));
+            }
+            ListItem::new(Line::from(spans))
         }).collect();
         f.render_widget(List::new(lines), parts[0]);
     }
-    hint(f, "up/down move · space tick · enter mirror · esc cancel", th, parts[1]);
+    hint(f, "up/down · space tick · a all · n none · enter mirror · esc cancel", th, parts[1]);
+}
+
+/// The glyph shown before a harness's name in the picker.
+fn harness_icon(fmt: &str) -> &'static str {
+    match fmt {
+        "claude" => "✶",
+        "gemini" => "✦",
+        "omp" => "Ω",
+        "opencode" => "◉",
+        "pi" => "π",
+        _ => "•",
+    }
 }
 
 /// Colour scheme picker: the scheme at the cursor is applied live, so Enter keeps it and
@@ -341,6 +406,57 @@ fn draw_form(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ]);
         f.render_widget(tw, parts[1]);
     }
+}
+
+/// The `?` overlay: the keys of the current tab, one line each.
+fn draw_help(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let lines = app.help_lines();
+    let height = lines.len() as u16 + 4;
+    let inner = dialog(f, if app.view() == View::Team { "Keys — team" } else { "Keys — sessions" }, th,
+        centered(74, height, area));
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let items: Vec<ListItem> = lines.iter().map(|(keys, what)| {
+        ListItem::new(Line::from(vec![
+            Span::styled(format!(" {:<8}", keys), Style::default().fg(th.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {what}"), Style::default().fg(th.text)),
+        ]))
+    }).collect();
+    f.render_widget(List::new(items), parts[0]);
+    hint(f, "esc close", th, parts[1]);
+}
+
+/// The transcript view: the session's own file, scrollable.
+fn draw_transcript(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let Some(t) = app.transcript_view() else { return };
+    let name = t.path.rsplit('/').next().unwrap_or(&t.path).to_string();
+    let inner = dialog(f, format!("Transcript — {name}").as_str(), th, centered(96, 24, area));
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let body = parts[0].height as usize;
+    let start = t.scroll.min(t.lines.len().saturating_sub(1));
+    let shown: Vec<ListItem> = t.lines[start..(start + body).min(t.lines.len())]
+        .iter()
+        .map(|l| ListItem::new(Line::from(Span::styled(l.clone(), Style::default().fg(th.text)))))
+        .collect();
+    f.render_widget(List::new(shown), parts[0]);
+    hint(f, "j/k scroll · esc close", th, parts[1]);
+}
+
+/// The delete confirmation: what will go, and the copies that will not.
+fn draw_delete_confirm(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let Some((title, path)) = app.delete_preview() else { return };
+    let inner = dialog(f, "Delete session", th, centered(76, 7, area));
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let body = Paragraph::new(vec![
+        Line::from(Span::styled(format!(" {title}"), Style::default().fg(th.text).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!(" {path}"), Style::default().fg(th.dim))),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Removes the source file only. Mirrors in other harnesses and the team's sealed copies stay.",
+            Style::default().fg(th.warn),
+        )),
+    ]);
+    f.render_widget(body, parts[0]);
+    hint(f, "ctrl+d delete · any other key cancels", th, parts[1]);
 }
 
 /// The one-time authenticator QR, on a white block so phones scan it.

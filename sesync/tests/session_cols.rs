@@ -1,6 +1,6 @@
 //! The sessions-list columns: team state, last sync, next due, mirror targets, and updated time.
 //! Pure rules, so these run without a terminal.
-use sesync::session_cols::{columns, fit, relative, short_span, Input};
+use sesync::session_cols::{columns, fit, relative, short_span, Input, MirrorState};
 
 fn base() -> Input {
     Input { marked: false, pushed_at: None, last_change: 0.0, now: 10_000.0, quiet_secs: 120.0, mirror_targets: vec![] }
@@ -52,8 +52,31 @@ fn next_sync_reads_next_tick_once_the_quiet_period_has_passed() {
 #[test]
 fn mirror_targets_are_listed_sorted_or_dashed() {
     let mut i = base();
-    i.mirror_targets = vec!["pi".into(), "claude".into()];
-    assert_eq!(columns(&i).mirrors, "claude,pi");
+    i.mirror_targets = vec![("pi".into(), MirrorState::Mirrored), ("claude".into(), MirrorState::Mirrored)];
+    let c = columns(&i);
+    assert_eq!(c.mirrors, "claude,pi");
+    assert_eq!(c.mirror_parts, vec![("claude".to_string(), MirrorState::Mirrored), ("pi".to_string(), MirrorState::Mirrored)]);
+}
+
+#[test]
+fn pending_and_failing_mirrors_carry_their_mark_in_text_and_structurally() {
+    let mut i = base();
+    i.mirror_targets = vec![
+        ("omp".to_string(), MirrorState::Failing),
+        ("claude".to_string(), MirrorState::Pending),
+        ("pi".to_string(), MirrorState::Mirrored),
+    ];
+    let c = columns(&i);
+    assert_eq!(c.mirrors, "claude?,omp!,pi", "the text form keeps the marks for readers without colour");
+    assert_eq!(
+        c.mirror_parts,
+        vec![
+            ("claude".to_string(), MirrorState::Pending),
+            ("omp".to_string(), MirrorState::Failing),
+            ("pi".to_string(), MirrorState::Mirrored),
+        ],
+        "the structured form lets the view colour each target"
+    );
 }
 
 #[test]

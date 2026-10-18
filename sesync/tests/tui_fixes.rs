@@ -28,6 +28,7 @@ fn roots(sb: &Path) -> Roots {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     }
 }
 
@@ -140,18 +141,20 @@ fn the_cursor_stays_on_the_same_row_after_a_delete() {
     a.handle(Ev::Down, Instant::now());
     assert_eq!(a.selected_index(), 1);
     a.handle(Ev::CtrlD, Instant::now());
-    a.handle(Ev::CtrlD, Instant::now());
+    a.handle(Ev::CtrlD, Instant::now()); // opens the confirmation
+    a.handle(Ev::CtrlD, Instant::now()); // confirm
     assert_eq!(a.rows().len(), 2, "one session removed");
     assert_eq!(a.selected_index(), 1, "the cursor stays on its row, not back at row 0");
     let _ = fs::remove_dir_all(&sb);
 }
 
 #[test]
-fn ctrl_r_in_browse_asks_for_a_refresh_once() {
+fn ctrl_r_on_the_team_tab_asks_for_a_refresh_once() {
     let sb = sandbox("refresh-ask");
     let mut a = app(&sb);
+    a.handle(Ev::Tab, Instant::now()); // the local tab refreshes itself; the team tab asks the caller
     a.handle(Ev::CtrlR, Instant::now());
-    assert!(a.take_refresh_request(), "ctrl+r in browse asks for a refresh");
+    assert!(a.take_refresh_request(), "ctrl+r on the team tab asks for a refresh");
     assert!(!a.take_refresh_request(), "the request is consumed once");
     let _ = fs::remove_dir_all(&sb);
 }

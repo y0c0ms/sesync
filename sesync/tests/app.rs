@@ -2,7 +2,7 @@
 //! Covers browse, the two-press delete, and rename. The real stores and the real
 //! lock are never used; the lock is the sesync_lock binary with a private directory.
 
-use sesync::app::{App, Ev, Mode};
+use sesync::app::{App, Ev, Mode, View};
 use sesync::manage::Roots;
 use sesync::state::State;
 use std::fs;
@@ -25,6 +25,7 @@ fn fixture(sb: &PathBuf) -> (Roots, PathBuf) {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     };
     let dir = roots.omp.join("-tmp");
     fs::create_dir_all(&dir).unwrap();
@@ -65,8 +66,10 @@ fn ctrl_d_twice_deletes_the_session_file() {
     let mut a = app(&sb, roots);
     let t = Instant::now();
     a.handle(Ev::CtrlD, t);
-    a.handle(Ev::CtrlD, t + Duration::from_secs(1));
-    assert!(!path.exists(), "two ctrl+d on the same row must delete the source");
+    a.handle(Ev::CtrlD, t + Duration::from_secs(1)); // opens the confirmation
+    assert!(path.exists(), "the confirmation dialog must not delete on its own");
+    a.handle(Ev::CtrlD, t + Duration::from_secs(2)); // confirm
+    assert!(!path.exists(), "a confirmed delete removes the source");
     assert!(a.status().starts_with("deleted"), "{}", a.status());
 }
 
@@ -179,4 +182,182 @@ fn moving_the_cursor_cancels_an_armed_delete() {
     a.handle(Ev::CtrlD, now); // a fresh first press only re-arms
     assert!(first.exists(), "a delete must need two presses with no cursor move between them");
     assert!(a.status().contains("Press ctrl+d again"), "{}", a.status());
+}
+
+const CLAUDE_SID: &str = "dddddddd-1111-2222-3333-444444444444";
+
+fn claude_fixture(sb: &PathBuf) -> (Roots, PathBuf) {
+    let roots = Roots {
+        omp: sb.join("omp").join("sessions"),
+        pi: sb.join("pi").join("sessions"),
+        claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
+    };
+    let dir = roots.claude.join("-tmp");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{CLAUDE_SID}.jsonl"));
+    fs::write(&path, format!(
+        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"the original prompt\"}}}}\n{{\"type\":\"custom-title\",\"customTitle\":\"Old Claude Title\",\"sessionId\":\"{CLAUDE_SID}\"}}\n")).unwrap();
+    (roots, path)
+}
+
+#[test]
+fn ctrl_r_on_the_local_tab_reloads_a_title_renamed_in_claude_code() {
+    let sb = sandbox("ctrl-r-local");
+    let (roots, path) = claude_fixture(&sb);
+    let mut a = app(&sb, roots);
+    assert_eq!(a.rows()[0].title, "Old Claude Title");
+    // Claude Code's /rename appends a custom-title record; the later one wins.
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str(&format!(
+        "{{\"type\":\"custom-title\",\"customTitle\":\"Renamed In Claude\",\"sessionId\":\"{CLAUDE_SID}\"}}\n"));
+    fs::write(&path, text).unwrap();
+    a.handle(Ev::CtrlR, Instant::now());
+    assert_eq!(a.mode(), Mode::Browse);
+    assert_eq!(a.rows()[0].title, "Renamed In Claude", "ctrl+r must re-read the file");
+    assert!(!a.take_refresh_request(), "a local refresh must not ask for a team pull");
+}
+
+#[test]
+fn a_mirror_the_daemon_wrote_shows_after_the_state_is_absorbed() {
+    use sesync::state::{Mirror, Source, State as DState};
+    let sb = sandbox("absorb-mirror");
+    let (roots, src) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    let key = src.display().to_string();
+    let mirror_path = sb.join("pi").join("sessions").join("-tmp").join("m.jsonl");
+    fs::create_dir_all(mirror_path.parent().unwrap()).unwrap();
+    fs::write(&mirror_path, "x").unwrap();
+
+    let mut disk = DState::default();
+    let mut d = Source::new("omp", &key);
+    d.mirrors.insert("pi".into(), Mirror {
+        target: "pi".into(), path: mirror_path.display().to_string(), ..Default::default()
+    });
+    disk.sources.insert(key.clone(), d);
+    disk.mirror_keys.insert(mirror_path.display().to_string());
+    a.absorb_daemon_state(&disk);
+    a.refresh_local();
+
+    let row = a.rows().iter().find(|g| g.key == key).unwrap();
+    assert!(row.mirrors.iter().any(|(t, p)| t == "pi" && p == &mirror_path.display().to_string()),
+        "the daemon-written mirror must be visible in the row: {:?}", row.mirrors);
+}
+
+#[test]
+fn news_fades_but_failures_stay_at_the_status_line() {
+    let sb = sandbox("fade");
+    let (roots, _) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    let now = Instant::now();
+    a.set_status("some news");
+    assert!(a.status_line(now).is_some(), "fresh news is shown");
+    let later = now + sesync::app::STATUS_TTL + Duration::from_secs(1);
+    assert_eq!(a.status_line(later), None, "informational messages fade on their own");
+    a.set_error("something refused");
+    assert_eq!(a.status_line(later), Some(("something refused", true)),
+        "a failure is drawn and does not fade; the view colours it");
+    let fresh = a.status_line(now);
+    assert_eq!(fresh, Some(("something refused", true)), "a replaced message starts fresh");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn the_last_tab_and_theme_come_back_on_the_next_run() {
+    let sb = sandbox("prefs");
+    let (roots, _) = fixture(&sb);
+    let config = sb.join("config");
+    let mut a = app(&sb, roots);
+    assert!(!a.take_prefs_dirty(), "a fresh app changed no taste");
+    a.handle(Ev::Tab, Instant::now());
+    assert!(a.take_prefs_dirty(), "switching the tab is a taste change");
+    assert!(sesync::app::prefs::save(&config, "textual (dark)", a.view()).is_ok(),
+        "the caller persists the taste");
+    a.handle(Ev::Tab, Instant::now()); // back to sessions
+    assert_eq!(a.view(), View::Sessions);
+    a.restore_prefs(None, Some(View::Team));
+    assert_eq!(a.view(), View::Team, "restore brings the last tab back");
+    // Load with the same content: theme and tab come back through the file too.
+    let p = sesync::app::prefs::load(&config);
+    assert_eq!(p.theme.as_deref(), Some("textual (dark)"));
+    assert_eq!(p.view, Some(View::Team));
+    // A file with junk or missing keys yields defaults, never a failure.
+    std::fs::write(config.join("tui.json"), b"not json at all").unwrap();
+    assert_eq!(sesync::app::prefs::load(&config), sesync::app::prefs::Prefs::default(),
+        "a broken preferences file is ignored");
+    // An unknown theme name is ignored on restore, leaving the default in place.
+    a.restore_prefs(Some("no such scheme".to_string()), None);
+    assert_eq!(a.theme_name(), sesync::theme::DEFAULT, "an unknown theme never applies");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn a_second_ctrl_d_asks_and_any_other_key_cancels() {
+    let sb = sandbox("confirm-delete");
+    let (roots, path) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    let now = Instant::now();
+    a.handle(Ev::CtrlD, now); // arm
+    a.handle(Ev::CtrlD, now); // the dialog
+    assert_eq!(a.mode(), Mode::DeleteConfirm, "the second press asks, it does not delete");
+    let (title, src) = a.delete_preview().expect("the dialog names the session");
+    assert_eq!(title, "Old");
+    assert!(src.ends_with(".jsonl"), "the source path is shown: {src}");
+    a.handle(Ev::Char('x'), now); // anything else cancels
+    assert_eq!(a.mode(), Mode::Browse);
+    assert!(path.exists(), "a cancelled delete removes nothing");
+    a.handle(Ev::CtrlD, now); // arm again
+    a.handle(Ev::CtrlD, now); // dialog
+    a.handle(Ev::Enter, now); // confirm with enter
+    assert!(!path.exists(), "enter confirms the delete");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn a_pull_is_looked_at_one_at_a_time() {
+    let sb = sandbox("pulling");
+    let (roots, _) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    let now = Instant::now();
+    assert!(!a.pulling(), "no pull before the first one");
+    assert!(a.begin_pull(), "the first pull starts");
+    assert!(a.pulling(), "it is in flight");
+    assert!(a.status().contains("pulling the team"), "{}", a.status());
+    assert!(!a.begin_pull(), "a second pull waits for the one running");
+    assert!(a.status().contains("already running"), "{}", a.status());
+    a.set_pull_result(vec![], 0);
+    assert!(!a.pulling(), "the finished pull is not in flight");
+    assert!(a.status().contains("team pull"), "{}", a.status());
+    assert!(a.begin_pull(), "another pull can start after it finished");
+    a.pull_failed();
+    assert!(!a.pulling(), "a failed pull is over too");
+    assert!(a.status().contains("did not finish"), "{}", a.status());
+    assert!(a.team_header(now).contains("pulled "), "the earlier successful pull still shows");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn the_tui_adopts_daemon_deletions_and_keeps_only_its_own_choices() {
+    let sb = sandbox("prune");
+    let (roots, _) = fixture(&sb);
+    // A source only in this app's memory, adopted from an older disk state.
+    let mut adopted = sesync::state::Source::new("opencode", "ses_resurrected");
+    adopted.title = "gone elsewhere".into();
+    let key_adopted = "ses_resurrected".to_string();
+    // A choice the TUI itself recorded for a session the daemon has not scanned yet.
+    let mut mine = sesync::state::Source::new("omp", "/new/session.jsonl");
+    mine.chosen_targets.insert("pi".to_string());
+    mine.tui_created = true;
+    let key_mine = "/new/session.jsonl".to_string();
+    let mut st = State::default();
+    st.sources.insert(key_adopted.clone(), adopted);
+    st.sources.insert(key_mine.clone(), mine);
+    let mut a = App::new(roots, st, sb.join("locks"), sb.join("no-sesync_lock"));
+    // The daemon's disk no longer knows either session.
+    a.absorb_daemon_state(&State::default());
+    assert!(a.state().sources.get(&key_adopted).is_none(),
+        "a stale adopted copy cannot resurrect a session the daemon removed");
+    assert!(a.state().sources.contains_key(&key_mine),
+        "a choice the TUI itself recorded is not pruned");
+    let _ = fs::remove_dir_all(&sb);
 }

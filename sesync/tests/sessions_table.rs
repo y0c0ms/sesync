@@ -12,21 +12,52 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 const SID: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 
 fn app(state: State) -> App {
+    let d = dir();
+    app_in(&d, state)
+}
+
+/// A sandbox dir with one omp session in it. The path is the key the app reads state by.
+fn dir() -> std::path::PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let d = std::env::temp_dir().join(format!("sesync-table-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(d.join("omp").join("sessions").join("-tmp")).unwrap();
     std::fs::create_dir_all(d.join("pi")).unwrap();
     std::fs::create_dir_all(d.join("claude")).unwrap();
-    std::fs::write(d.join("omp").join("sessions").join("-tmp")
-        .join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl")),
+    std::fs::write(session_path(&d),
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{SID}\",\"cwd\":\"/tmp\",\"title\":\"Table session\"}}\n")).unwrap();
+    d
+}
+
+fn session_path(d: &std::path::Path) -> std::path::PathBuf {
+    d.join("omp").join("sessions").join("-tmp")
+        .join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"))
+}
+
+fn app_in(d: &std::path::Path, state: State) -> App {
     App::new(
-        Roots { omp: d.join("omp").join("sessions"), pi: d.join("pi"), claude: d.join("claude") },
+        Roots { omp: d.join("omp").join("sessions"), pi: d.join("pi"), claude: d.join("claude"), gemini: d.join("gemini") },
         state,
         d.join("locks"),
         d.join("no-sesync_lock"),
     )
+}
+
+/// The foreground colour of the first cell whose text starts `mark`, on the session row.
+fn mark_colour(a: &App, w: u16, h: u16, mark: &str) -> ratatui::style::Color {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw(f, a)).unwrap();
+    let buf = term.backend().buffer();
+    for y in 0..h {
+        let line: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        if line.contains("Table session") {
+            if let Some(x) = line.find(mark) {
+                return buf[(x as u16, y)].style().fg.unwrap();
+            }
+            panic!("no {mark} on the session row: |{line}|");
+        }
+    }
+    panic!("no session row");
 }
 
 fn screen(a: &App, w: u16, h: u16) -> Vec<String> {
@@ -75,4 +106,29 @@ fn a_narrow_pane_hides_the_columns_and_keeps_the_title() {
     let lines = screen(&a, 50, 12);
     assert!(lines.iter().all(|l| !l.contains("LAST SYNC")), "no columns on a narrow pane");
     assert!(lines.iter().any(|l| l.contains("Table session")), "the title is still shown");
+}
+
+#[test]
+fn a_pending_mirror_mark_is_drawn_in_the_warning_colour() {
+    let d = dir();
+    let path = session_path(&d);
+    let mut state = State::default();
+    let mut src = sesync::state::Source::new("omp", path.to_str().unwrap());
+    src.chosen_targets.insert("claude".to_string());
+    state.sources.insert(path.to_string_lossy().to_string(), src);
+    let a = app_in(&d, state);
+    assert_eq!(mark_colour(&a, 140, 20, "claude?"), ratatui::style::Color::Rgb(0xEC, 0xBE, 0x77), "pending is warning");
+}
+
+#[test]
+fn a_failing_mirror_mark_is_drawn_in_the_error_colour() {
+    let d = dir();
+    let path = session_path(&d);
+    let mut state = State::default();
+    let mut src = sesync::state::Source::new("omp", path.to_str().unwrap());
+    src.chosen_targets.insert("claude".to_string());
+    src.failures = 1;
+    state.sources.insert(path.to_string_lossy().to_string(), src);
+    let a = app_in(&d, state);
+    assert_eq!(mark_colour(&a, 140, 20, "claude!"), ratatui::style::Color::Rgb(0xE1, 0x57, 0x5A), "failing is error");
 }

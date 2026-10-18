@@ -22,6 +22,7 @@ fn app() -> App {
             omp: d.join("omp").join("sessions"),
             pi: d.join("pi"),
             claude: d.join("claude"),
+            gemini: d.join("gemini"),
         },
         sesync::state::State::default(),
         d.join("locks"),
@@ -87,4 +88,38 @@ fn the_picker_is_one_of_the_commands_in_the_list() {
     assert_eq!(a.palette_titles()[0], "Colour scheme");
     a.handle(Ev::Enter, Instant::now()); // run it
     assert_eq!(a.mode(), Mode::Theme, "the command opens the picker");
+}
+
+#[test]
+fn every_theme_paints_its_own_page_background() {
+    let mut a = app();
+    a.handle(Ev::Theme, Instant::now());
+    // Walk the whole list with the cursor; at every stop the painted page background must be
+    // the previewed theme's bg, everywhere no widget drew its own colour.
+    let names = sesync::theme::names_sorted();
+    assert!(names.len() >= 10, "the picker lists the full set, got {}: {:?}", names.len(), names);
+    for _ in names.iter() {
+        a.handle(Ev::Down, Instant::now());
+        let th = a.theme();
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let buf = term.backend().buffer().clone();
+        // Mid-list, right edge: no widget writes here.
+        assert_eq!(buf[(95, 10)].clone().bg, th.bg, "page background follows the previewed theme '{}'", th.name);
+    }
+    a.handle(Ev::Esc, Instant::now());
+}
+
+#[test]
+fn a_dialog_restamps_the_rows_it_covers_with_the_page_background() {
+    let mut a = app();
+    a.handle(Ev::Theme, Instant::now()); // a dialog is open now
+    let th = a.theme();
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw(f, &a)).unwrap();
+    let buf = term.backend().buffer().clone();
+    // Inside the dialog box (centered, 74 wide in a 100-wide pane), right of any text: the
+    // page background, not a leak of what the list drew under it.
+    assert_eq!(buf[(84, 10)].clone().bg, th.bg, "no list text or colour shows through a dialog");
+    let _ = screen(&a, 100, 20);
 }

@@ -23,6 +23,7 @@ fn app() -> App {
             omp: d.join("omp").join("sessions"),
             pi: d.join("pi"),
             claude: d.join("claude"),
+            gemini: d.join("gemini"),
         },
         sesync::state::State::default(),
         d.join("locks"),

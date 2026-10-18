@@ -40,7 +40,7 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::SwitchView, title: "Switch Sessions/Team", key: "tab", event: Ev::Tab },
     Def { action: Action::Quit, title: "Quit", key: "q", event: Ev::Char('q') },
     Def { action: Action::Theme, title: "Colour scheme", key: "ctrl+t", event: Ev::Theme },
-    Def { action: Action::Enroll, title: "Enroll on a team", key: "", event: Ev::OpenEnroll },
+    Def { action: Action::Enroll, title: "Join a team", key: "", event: Ev::OpenEnroll },
     Def { action: Action::Register, title: "Start a team", key: "", event: Ev::OpenRegister },
 ];
 
@@ -90,6 +90,13 @@ fn is_subsequence(hay: &[char], needle: &[char]) -> bool {
     }
     let mut it = hay.iter();
     needle.iter().all(|n| it.any(|h| h == n))
+}
+
+/// Whether `title` matches a typed query the same way the command list filters: the query's
+/// letters must appear in order, case-insensitively. Used for the session filter too, so the
+/// two search boxes behave alike.
+pub fn fuzzy_matches(title: &str, query: &str) -> bool {
+    is_subsequence(&title.to_lowercase().chars().collect::<Vec<_>>(), &query.to_lowercase().chars().collect::<Vec<_>>())
 }
 
 /// Every action whose title contains the query's letters in order. Prefix matches come first;

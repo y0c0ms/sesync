@@ -1,4 +1,4 @@
-//! The team setup dialogs: enroll on a team (join) and start a team (admin create). Same
+//! The team setup dialogs: join a team and start a team (admin create). Same
 //! floating-dialog style as the command list, with input fields; the caller performs the
 //! network step handed over as a request. `Start a team` leads into the authenticator QR
 //! when the server returns its one-time otpauth:// URI.
@@ -23,6 +23,7 @@ fn app() -> App {
             omp: d.join("omp").join("sessions"),
             pi: d.join("pi"),
             claude: d.join("claude"),
+            gemini: d.join("gemini"),
         },
         sesync::state::State::default(),
         d.join("locks"),
@@ -50,10 +51,10 @@ fn type_text(a: &mut App, s: &str) {
     }
 }
 
-fn open_enroll() -> App {
+fn open_join() -> App {
     let mut a = app();
     a.handle(Ev::Enter, Instant::now());
-    type_text(&mut a, "enroll");
+    type_text(&mut a, "join");
     a.handle(Ev::Enter, Instant::now()); // run the command
     assert_eq!(a.mode(), Mode::Form);
     a
@@ -69,8 +70,8 @@ fn open_register() -> App {
 }
 
 #[test]
-fn the_enroll_dialog_has_the_join_fields() {
-    let mut a = open_enroll();
+fn the_join_dialog_has_the_join_fields() {
+    let mut a = open_join();
     let text = screen(&a, 110, 26);
     for field in ["server url", "team", "member", "machine", "code"] {
         assert!(text.contains(field), "the dialog asks for '{field}':\n{text}");
@@ -81,7 +82,7 @@ fn the_enroll_dialog_has_the_join_fields() {
 
 #[test]
 fn typing_edits_the_highlighted_field_and_tab_moves_it() {
-    let mut a = open_enroll();
+    let mut a = open_join();
     type_text(&mut a, "http://10.10.20.6:30500");
     a.handle(Ev::Tab, Instant::now()); // -> team
     type_text(&mut a, "main");
@@ -94,7 +95,7 @@ fn typing_edits_the_highlighted_field_and_tab_moves_it() {
 
 #[test]
 fn submitting_a_complete_dialog_hands_the_request_to_the_caller() {
-    let mut a = open_enroll();
+    let mut a = open_join();
     for (i, v) in ["http://127.0.0.1:30500", "main", "laptop", "laptop-1", "123456"].iter().enumerate() {
         if i > 0 {
             a.handle(Ev::Tab, Instant::now());
@@ -113,7 +114,7 @@ fn submitting_a_complete_dialog_hands_the_request_to_the_caller() {
 
 #[test]
 fn an_incomplete_dialog_refuses_to_submit() {
-    let mut a = open_enroll();
+    let mut a = open_join();
     for (i, v) in ["http://127.0.0.1:30500", "main", "laptop", "laptop-1"].iter().enumerate() {
         // leave the code empty
         if i > 0 {
@@ -129,7 +130,7 @@ fn an_incomplete_dialog_refuses_to_submit() {
 
 #[test]
 fn the_code_must_be_six_digits() {
-    let mut a = open_enroll();
+    let mut a = open_join();
     for (i, v) in ["http://s:1", "main", "laptop", "laptop-1", "12ab56"].iter().enumerate() {
         if i > 0 {
             a.handle(Ev::Tab, Instant::now());
@@ -143,7 +144,7 @@ fn the_code_must_be_six_digits() {
 
 #[test]
 fn esc_closes_the_dialog_without_a_request() {
-    let mut a = open_enroll();
+    let mut a = open_join();
     type_text(&mut a, "http://x");
     a.handle(Ev::Esc, Instant::now());
     assert_eq!(a.mode(), Mode::Browse);

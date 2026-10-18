@@ -5,6 +5,24 @@
 //! "Next" is the earliest time a marked session becomes due (its last change plus the team quiet
 //! period). The daemon has no fixed timer, so this is an honest estimate, not a scheduled time.
 
+/// How a mirror target is doing: an installed mirror on disk, a chosen target still waiting
+/// for its first write, or one whose last write failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorState {
+    Mirrored,
+    Pending,
+    Failing,
+}
+
+/// The one-letter mark a state carries in the plain text form.
+pub fn mirror_mark(state: MirrorState) -> &'static str {
+    match state {
+        MirrorState::Mirrored => "",
+        MirrorState::Pending => "?",
+        MirrorState::Failing => "!",
+    }
+}
+
 /// What the columns need, read from state by the caller.
 pub struct Input {
     pub marked: bool,
@@ -14,8 +32,8 @@ pub struct Input {
     pub last_change: f64,
     pub now: f64,
     pub quiet_secs: f64,
-    /// Harness formats this session is mirrored into.
-    pub mirror_targets: Vec<String>,
+    /// Harness formats this session is mirrored into, with how each one is doing.
+    pub mirror_targets: Vec<(String, MirrorState)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,8 +44,10 @@ pub struct Cols {
     pub last_sync: String,
     /// "-" when not marked, "in 2m" while quiet, "next tick" once due.
     pub next_sync: String,
-    /// Comma-separated harness formats, or "-".
+    /// Comma-separated harness formats with their mark (`pi`, `claude?`, `omp!`), or "-".
     pub mirrors: String,
+    /// The same targets, one entry each, sorted by name, for drawing them in colour.
+    pub mirror_parts: Vec<(String, MirrorState)>,
     /// Relative time since the source last changed, or "-" when unknown.
     pub updated: String,
 }
@@ -52,15 +72,18 @@ pub fn columns(i: &Input) -> Cols {
             "next tick".to_string()
         }
     };
-    let mirrors = if i.mirror_targets.is_empty() {
+    let mut mirror_parts = i.mirror_targets.clone();
+    mirror_parts.sort_by(|a, b| a.0.cmp(&b.0));
+    let mirrors = if mirror_parts.is_empty() {
         "-".to_string()
     } else {
-        let mut t = i.mirror_targets.clone();
-        t.sort();
-        t.join(",")
+        mirror_parts.iter()
+            .map(|(t, s)| format!("{t}{}", mirror_mark(*s)))
+            .collect::<Vec<_>>()
+            .join(",")
     };
     let updated = if i.last_change > 0.0 { relative(i.now, i.last_change) } else { "-".to_string() };
-    Cols { team: team.into(), last_sync, next_sync, mirrors, updated }
+    Cols { team: team.into(), last_sync, next_sync, mirrors, mirror_parts, updated }
 }
 
 /// "5s ago", "3m ago", "2h ago", "4d ago". A time in the future reads as "just now".

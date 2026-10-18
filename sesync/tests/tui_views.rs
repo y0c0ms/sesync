@@ -28,6 +28,7 @@ fn roots(sb: &Path) -> Roots {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     }
 }
 
@@ -282,7 +283,57 @@ fn a_pull_result_shows_how_many_were_refused() {
     let sb = sandbox("pull-result");
     let mut a = app(&sb);
     a.set_pull_result(vec![], 2);
+    let header = a.team_header(Instant::now());
+    assert!(header.contains("2 refused"), "{header}");
+    assert!(header.contains("pulled 0s ago"), "the header says when the pull happened: {header}");
     assert!(a.status().contains("2 refused"), "{}", a.status());
     assert!(a.team_rows().is_empty(), "nothing unverified is listed");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn the_team_header_says_when_nothing_was_pulled_yet() {
+    let sb = sandbox("never-pulled");
+    let a = app(&sb);
+    assert!(a.team_header(Instant::now()).contains("not pulled yet"), "an untouched list says so");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn team_rows_show_a_short_id_next_to_the_title() {
+    let sb = sandbox("short-id");
+    let mut a = app(&sb);
+    a.set_team_sessions(vec![team_session(TEAM_ID, "Deploy runbook")]);
+    let rows = a.team_rows();
+    assert_eq!(rows, vec!["Deploy runbook · 11111111…".to_string()],
+        "the row carries the full title and just enough id to tell sessions apart");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn question_mark_opens_the_help_for_the_current_tab() {
+    let sb = sandbox("help-sessions");
+    write_session(&sb, SID_A, "one");
+    let mut a = app(&sb);
+    a.handle(Ev::Char('?'), Instant::now());
+    assert_eq!(a.mode(), Mode::Help, "? opens the help overlay");
+    let text = screen(&a, 140, 30);
+    assert!(text.contains("Keys — sessions"), "{text}");
+    assert!(text.contains("re-list"), "the local keys are listed:\n{text}");
+    a.handle(Ev::Esc, Instant::now());
+    assert_eq!(a.mode(), Mode::Browse);
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn the_help_overlay_names_the_team_keys_on_the_team_tab() {
+    let sb = sandbox("help-team");
+    let mut a = app(&sb);
+    a.handle(Ev::Tab, Instant::now());
+    a.handle(Ev::Char('?'), Instant::now());
+    assert_eq!(a.mode(), Mode::Help, "? opens the help overlay on the team tab too");
+    let text = screen(&a, 140, 30);
+    assert!(text.contains("Keys — team"), "{text}");
+    assert!(text.contains("pull the team"), "the team keys are listed:\n{text}");
     let _ = fs::remove_dir_all(&sb);
 }

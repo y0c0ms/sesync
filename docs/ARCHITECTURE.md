@@ -31,15 +31,68 @@ harness stores ── scan ──> State ── mirror_write ──> other harne
 
 ## Local sync
 
-- `discovery` finds candidate session files (omp, Pi, Claude transcripts) and OpenCode
-  sessions. `scan` decides whether a source changed and is quiet enough (`SESYNC_QUIET`,
-  default 20 s; `MIN_BYTES`; `SESYNC_MAX_AGE_DAYS`, default 14).
+- `discovery` finds candidate session files (omp, Pi, Claude transcripts, Gemini session
+  logs) and OpenCode sessions. `scan` decides whether a source changed and is quiet enough
+  (`SESYNC_QUIET`, default 20 s; `MIN_BYTES`; `SESYNC_MAX_AGE_DAYS`, default 14).
+- A chosen mirror target with no mirror forces a pass. When a write keeps failing (an empty
+  stub session, a conversion error), retries back off (`scan::mirror_demand`,
+  `scan::mirror_retry_due`): the quiet period after the first failure, doubling to a 10-minute
+  cap; a changed file and a successful pass reset it. The TUI shows a chosen target with no
+  file as `pi?` (pending) or `pi!` (failing) in the MIRRORS column.
+- Mirror **placement** follows the source session's own project directory, not the target
+  store's layout: omp buckets are home-relative (`-SkillsOutlie` for `~/SkillsOutlie`) and are
+  computed from the real home (`Env.home`, not the store's parent); Pi and Claude buckets are
+  separator-replaced absolute paths. The cwd is read from the journal's `session` record head
+  (`buckets::cwd_from_head`). A recorded mirror is stale (`scan::mirror_stale`) when its bucket
+  disagrees with that cwd, the file is gone, or — for OpenCode — the session id is absent from
+  `opencode.db`; the next pass rewrites it, and `mirror_write::record_mirror` replaces the
+  record, deleting the superseded file only when it is unchanged.
 - A source's identity is `(fmt, key)`. omp and Pi both use the journal format; their `key` is
   the session id. OpenCode's `key` is its session id (`ses_...`); its display title is
   recorded in `Source::title` at scan time because the source does not carry one on disk.
-- `mirror_write` is the only writer. It claims the conversation lock (`with_claim`), installs
-  the converted file (`install::install_journal`) and records the created path in
-  `State::mirror_keys` so the daemon never mistakes a mirror for a source.
+- `mirror_write` is the only writer. It claims the conversation lock (`with_claim`), then for
+  omp, Pi, Claude and Gemini installs the converted file (`install::install_journal`,
+  `install::install_gemini`) and records the created path in `State::mirror_keys` so the
+  daemon never mistakes a mirror for a source. Claude and Gemini sources are converted to a
+  journal first (`sesync-conv from-claude`, `from-gemini`): a raw transcript is not a journal
+  and must never be copied through to another harness.
+- The OpenCode target is an import, not a file: `install::install_opencode` converts the same
+  journal to an import bundle (`sesync-conv to-opencode`) and runs `opencode import` with the
+  conversation's directory as the working directory, so the session lands in the right project.
+  `opencode import` conflict-ignores existing message ids, so the writer deletes the previous
+  mirror id first (`opencode session delete`); the deterministic id
+  (`mirror::mirror_opencode_id`) makes that a replace, never a duplicate. The mirror record
+  carries the session id instead of a path, and it is not added to `mirror_keys` (that set
+  names files, and a session id in it could hide a real OpenCode session from the scan).
+- **Mirror ids are minted from the conversation's stable id, not from the moving source key**
+  (`Source::conv`: the uuid/ses id of the store copy that started the conversation). A
+  turn-taking promotion changes the source key; a key-derived id would mint a new copy in
+  every other store and leave the old ones behind. With the stable id, each store's copy has
+  one deterministic path for the conversation's lifetime and every refresh replaces it in
+  place. States written before `conv` existed are re-minted once on the next pass.
+- **Turn-taking** (`turn.rs`): a mirror is a copy, but the user may answer in the copy's
+  harness. Every pass fingerprints each recorded mirror (one stat; a read only when the
+  fingerprint moved, cached in `Mirror::edit_stamp`; OpenCode mirrors compare the store row's
+  `updated` against `Mirror::target_updated`). When a copy's content no longer matches what
+  the daemon installed, that copy is the newest statement of the conversation: the newest
+  write wins (ties break by harness name), the copy becomes the session's source — the main
+  harness moves — and the same pass rewrites every other configured copy from it without the
+  quiet window, so no harness is left showing a stale conversation. The old source's harness
+  becomes a mirror target and its stale record is carried over so the replaced file is
+  deleted (`record_mirror`'s replace rule). One entry per conversation is enforced by
+  component resolution (`turn::component_of`): entries that record each other as mirrors are
+  one conversation; a component with a real edit turns to that edit, one without collapses to
+  its most recently turned entry. Resurrection is closed at the merge points: the TUI prunes
+  sources the daemon removed (`absorb_daemon_state`, keeping runtime-only `tui_created`
+  choices) and the daemon does not re-adopt keys hidden in `mirror_keys`.
+- The Gemini target is a file inside a scanned store: `sesync-conv to-gemini` writes one
+  `session-<stamp>-<short>.jsonl` under `$GEMINI_CLI_HOME/tmp/<slug>/chats`, resolving the
+  project's slug exactly as Gemini does (an existing `projects.json` entry, else the
+  `.project_root` marker, else the slugified directory name with `-1`, `-2` suffixes), and
+  records the project in `projects.json` with a `.project_root` marker so
+  `gemini --list-sessions` finds the session. The file name is deterministic per (source,
+  mirror id), so a refresh atomically replaces the same file; because `discovery` scans the
+  same tree, the mirror path **is** added to `mirror_keys` (unlike OpenCode's session id).
 - **`Source::chosen_targets` is the complete write policy.** Empty (the default) means the
   daemon writes nowhere. The TUI picker sets it per session; it never offers the session's own
   format, and it only offers harnesses installed on the machine.
@@ -75,9 +128,9 @@ must also still be enrolled, and the record must be signed by a device the curre
 2. `team_sync::is_due` requires the source to be quiet for `SESYNC_TEAM_QUIET` (default
    120 s) and the plaintext hash to differ from the last successful push.
 3. `team_sync::canonical_for_source` produces the team copy: the omp/Pi journal as-is for
-   omp/Pi sources, `sesync-conv from-claude` for Claude, and `opencode export` +
-   `sesync-conv from-opencode` for OpenCode. Reasoning is kept only where the converter can
-   carry it as ordinary text; signed Claude thinking is dropped.
+   omp/Pi sources, `sesync-conv from-claude` for Claude, `from-gemini` for Gemini, and
+   `opencode export` + `sesync-conv from-opencode` for OpenCode. Reasoning is kept only where
+   the converter can carry it as ordinary text; signed Claude thinking is dropped.
 4. `team_push` acquires the lease. **The lease version is the record sequence.**
 5. `sealed::seal_for_devices` compresses, encrypts, wraps the key to every listed device,
    and signs a v2 record bound to `(space, conversation, sequence)`.
@@ -165,13 +218,12 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 
 | Key | Meaning |
 |---|---|
-| `sources` | per `(fmt,key)`: `last_seen_change`, `last_hash`, `last_stamp`, `failures`, `mirrors`, `chosen_targets`, `title` |
+| `sources` | per `(fmt,key)`: `conv`, `last_seen_change`, `last_hash`, `last_stamp`, `failures`, `last_failure`, `mirrors`, `chosen_targets`, `title`, `turn_at` |
 | `mirror_keys` | every path/id the daemon created; never treated as a source |
 | `subagents` | parent session → subagent transcript paths |
 | `marked` | sessions eligible for team push |
 | `team` | per session: `{hash, pushed_at}` of the last successful push |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
-| `theme` | TUI colour scheme |
 
 A missing state file is empty state; a corrupt one is an error (silently dropping it would
 forget every mirror and risk duplicate writes).
@@ -228,9 +280,9 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `OMP_AGENT_DIR` | `~/.omp/agent` | omp source |
 | `PI_AGENT_DIR` | `~/.pi/agent` | Pi source |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude source |
-| `GEMINI_CLI_HOME` | `~/.gemini` | Gemini source location (reserved) |
+| `GEMINI_CLI_HOME` | `~/.gemini` | Gemini store: session sources and mirror target |
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | OpenCode source |
-| `OPENCODE_BIN` | `opencode` | OpenCode CLI used for export |
+| `OPENCODE_BIN` | `opencode` | OpenCode CLI used for export (source) and import (mirror target) |
 | `SESYNC_CONV` | beside the binary, else `~/.local/bin/sesync-conv` | converter |
 | `SESYNC_LOCK` | beside the binary, else `~/.local/bin/sesync-lock` | lock binary |
 | `SESYNC_QUIET` | `20` | local quiet seconds before a mirror is rebuilt |
