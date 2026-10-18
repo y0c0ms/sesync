@@ -7,7 +7,8 @@ use sesync::state::{Mirror, Source, State};
 
 fn mirror(target: &str, path: &str) -> Mirror {
     Mirror { target: target.into(), path: path.into(), source_hash: String::new(),
-             installed_hash: String::new(), diverged: false }
+             installed_hash: String::new(), diverged: false, edit_stamp: String::new(),
+             target_updated: 0.0 }
 }
 
 #[test]

@@ -276,7 +276,9 @@ fn an_opencode_export_that_fails_is_reported_and_nothing_is_pushed() {
 #[test]
 fn a_harness_with_no_journal_format_is_refused() {
     let d = sandbox("unknown-fmt");
-    let err = sesync::team_sync::canonical_for_source("gemini", "x", Path::new("/no"), Path::new("/no"), &d).unwrap_err();
+    // "cursor" is not a harness this daemon knows, unlike gemini which gained a
+    // canonical format with the Gemini CLI wiring.
+    let err = sesync::team_sync::canonical_for_source("cursor", "x", Path::new("/no"), Path::new("/no"), &d).unwrap_err();
     assert!(err.contains("no canonical journal"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }

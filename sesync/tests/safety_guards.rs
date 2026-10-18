@@ -22,6 +22,7 @@ fn roots(sb: &PathBuf) -> Roots {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     };
     fs::create_dir_all(&r.omp).unwrap();
     fs::create_dir_all(&r.pi).unwrap();

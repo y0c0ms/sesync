@@ -26,6 +26,8 @@ pub enum Canonical<'a> {
     Journal(&'a Path),
     /// A Claude transcript: converted with `sesync-conv from-claude`.
     Claude(&'a Path),
+    /// A Gemini CLI session log: converted with `sesync-conv from-gemini`.
+    Gemini(&'a Path),
 }
 
 /// Build the canonical journal bytes for a source. Errors name the step that failed, never the
@@ -45,12 +47,24 @@ pub fn canonical_bytes(src: Canonical, sesync_conv: &Path, scratch: &Path) -> Re
             }
             std::fs::read(&out).map_err(|e| format!("converted journal missing: {e}"))
         }
+        Canonical::Gemini(p) => {
+            std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
+            let out = scratch.join("canonical.jsonl");
+            let status = std::process::Command::new(sesync_conv)
+                .arg("from-gemini").arg(p).arg("--out").arg(&out)
+                .status()
+                .map_err(|e| format!("cannot run sesync-conv: {e}"))?;
+            if !status.success() {
+                return Err("sesync-conv could not convert this Gemini session".into());
+            }
+            std::fs::read(&out).map_err(|e| format!("converted journal missing: {e}"))
+        }
     }
 }
 
-/// The canonical journal for a session of any harness. omp and Pi are already journals; Claude is
-/// converted from its transcript; O-penCode is exported with its CLI and converted. Every result is
-/// the same format, so any member can install it into their own harness.
+/// The canonical journal for a session of any harness. omp and Pi are already journals; Claude and
+/// Gemini are converted from their own session logs; O-penCode is exported with its CLI and
+/// converted. Every result is the same format, so any member can install it into their own harness.
 pub fn canonical_for_source(
     fmt: &str,
     key: &str,
@@ -61,6 +75,7 @@ pub fn canonical_for_source(
     match fmt {
         "omp" | "pi" => canonical_bytes(Canonical::Journal(Path::new(key)), sesync_conv, scratch),
         "claude" => canonical_bytes(Canonical::Claude(Path::new(key)), sesync_conv, scratch),
+        "gemini" => canonical_bytes(Canonical::Gemini(Path::new(key)), sesync_conv, scratch),
         "opencode" => {
             // The key of an O-penCode source is its session id. The export is converted into scratch
             // and removed once read, so no copy of the session is left behind.

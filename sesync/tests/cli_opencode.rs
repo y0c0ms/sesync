@@ -1,8 +1,10 @@
 //! The sesync binary syncing an O-penCode session, end to end. A sandbox
-//! O-penCode database holds one live session; one --once pass must mirror it into the
-//! omp store, and a second pass must do nothing. Uses the real sesync_conv and the real
-//! opencode CLI, with XDG_* pointed at the sandbox. Skipped without the CLI.
+//! O-penCode database holds one live session; with the user's choice pre-seeded, one --once
+//! pass must mirror it into the omp store, and a second pass must do nothing. Uses the real
+//! sesync_conv and the real opencode CLI, with XDG_* pointed at the sandbox. Skipped without
+//! the CLI.
 
+use sesync::state::{Source, State};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -94,15 +96,23 @@ fn an_opencode_session_is_mirrored_into_omp_and_not_resynced() {
     ).unwrap();
     drop(c);
 
+    // The user's choice, exactly as the TUI would save it: this session is mirrored into omp.
+    fs::create_dir_all(sb.join("state")).unwrap();
+    let mut state = State::default();
+    let mut src = Source::new("opencode", "ses_cliocs0000000000000000");
+    src.chosen_targets.insert("omp".to_string());
+    state.sources.insert("ses_cliocs0000000000000000".to_string(), src);
+    state.save(&sb.join("state").join("state.json")).unwrap();
+
     let o = run(&sb, &["--once"]);
     assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
     let out = String::from_utf8_lossy(&o.stdout);
-    assert!(out.contains("one pass done, 1 source(s) synced"), "{out}");
+    assert!(out.contains("one pass done, 1 source(s) changed"), "{out}");
     let mirrors = walk(&sb.join("omp").join("sessions"));
     assert_eq!(mirrors.len(), 1, "an opencode session must produce one omp mirror");
 
     let again = run(&sb, &["--once"]);
-    assert!(String::from_utf8_lossy(&again.stdout).contains("0 source(s) synced"),
+    assert!(String::from_utf8_lossy(&again.stdout).contains("0 source(s) changed"),
             "an unchanged opencode session must not be re-synced");
 }
 

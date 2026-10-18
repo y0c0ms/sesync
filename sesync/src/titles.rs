@@ -1,6 +1,45 @@
 //! Title rules. Ported from daemon/sesync.py.
 
 use serde_json::Value;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+/// How much of a large transcript is read for its title, from each end.
+const TITLE_WINDOW: u64 = 64 * 1024;
+/// Files up to this size are read whole; above it only the two windows are.
+const TITLE_FULL_MAX: u64 = 256 * 1024;
+
+/// The text a title is read from. Titles live in the first records (journal headers,
+/// ai-title) or the last ones (Pi/omp renames, Claude custom-title, Gemini summary), so
+/// huge transcripts — Claude sessions reach hundreds of megabytes — are only windowed.
+/// Reading every file whole on each TUI refresh is what made the interface lag.
+pub fn read_title_text(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len <= TITLE_FULL_MAX {
+        let mut text = String::new();
+        f.read_to_string(&mut text).ok()?;
+        return Some(text);
+    }
+    let mut head = vec![0u8; TITLE_WINDOW as usize];
+    let n = f.read(&mut head).ok()?;
+    head.truncate(n);
+    // Keep whole lines: drop the partial last one (its JSON would not parse anyway).
+    match head.iter().rposition(|&b| b == b'\n') {
+        Some(i) => head.truncate(i + 1),
+        None => head.push(b'\n'),
+    }
+    f.seek(SeekFrom::Start(len - TITLE_WINDOW)).ok()?;
+    let mut tail = vec![0u8; TITLE_WINDOW as usize];
+    let n = f.read(&mut tail).ok()?;
+    tail.truncate(n);
+    if let Some(i) = tail.iter().position(|&b| b == b'\n') {
+        tail.drain(..=i);
+    }
+    let mut text = String::from_utf8_lossy(&head).into_owned();
+    text.push_str(&String::from_utf8_lossy(&tail));
+    Some(text)
+}
 
 /// True for O-penCode's untouched default name, "New session - <ISO timestamp>".
 /// Only that exact shape is stripped, so a user title that mentions a date survives.
@@ -76,9 +115,11 @@ pub fn claude_title_from_lines(lines: &[&str]) -> (String, bool) {
     (title, has_user)
 }
 
-/// (title, _) for an omp/Pi journal. The title record (omp's slot, or a rename)
-/// wins over the header, which can hold an older name. Falls back to the first
-/// user message. Never the filename.
+/// (title, _) for an omp/Pi journal. The title record (omp's slot) or the last
+/// `title_change` (a rename made inside omp; omp overlays it over the slot on
+/// read, and the slot can lag behind the rename until omp saves again) wins over
+/// the header, which can hold an older name. Falls back to the first user
+/// message. Never the filename.
 pub fn omp_title_from_lines(lines: &[&str]) -> (String, bool) {
     let (mut header, mut slot, mut fallback) = (String::new(), String::new(), String::new());
     for line in lines {
@@ -89,7 +130,7 @@ pub fn omp_title_from_lines(lines: &[&str]) -> (String, bool) {
                     header = t.to_string();
                 }
             }
-            "title" => {
+            "title" | "title_change" => {
                 if let Some(t) = rec.get("title").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
                     slot = t.to_string();
                 }
@@ -113,4 +154,42 @@ pub fn omp_title_from_lines(lines: &[&str]) -> (String, bool) {
     }
     let title = [slot, header, fallback].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
     (title, true)
+}
+
+/// (title, has_user_turn) for a Gemini CLI session. Gemini stores a generated
+/// `summary` (a `$set` metadata update, or a header field); until it exists the
+/// first user prompt names the session. Gemini content parts are `{"text": …}`
+/// objects without a `type`, unlike the other harnesses.
+pub fn gemini_title_from_lines(lines: &[&str]) -> (String, bool) {
+    let (mut summary, mut first, mut has_user) = (String::new(), String::new(), false);
+    for line in lines {
+        let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
+        let update = rec.get("$set").unwrap_or(&rec);
+        if let Some(s) = update.get("summary").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+            summary = s.to_string();
+        }
+        if rec.get("type").and_then(Value::as_str) == Some("user") {
+            if let Some(text) = gemini_user_text(&rec) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    has_user = true;
+                    if first.is_empty() {
+                        first = text.split('\n').next().unwrap_or("").chars().take(80).collect();
+                    }
+                }
+            }
+        }
+    }
+    let title = [summary, first].into_iter().find(|t| !t.is_empty()).unwrap_or_default();
+    (title, has_user)
+}
+
+/// The first text part of a Gemini user record. `content` is a string or a list of
+/// `{"text": …}` parts; a tool-result record (functionResponse only) has no text.
+fn gemini_user_text(rec: &Value) -> Option<String> {
+    let content = rec.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    content.as_array()?.iter().find_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
 }

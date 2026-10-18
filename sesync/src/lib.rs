@@ -9,6 +9,7 @@ pub mod state;
 // Local pipeline: discovery, change detection, mirrors and locks.
 pub mod archive;
 pub mod archive_store;
+pub mod buckets;
 pub mod claude_source;
 pub mod discovery;
 pub mod divergence;
@@ -22,6 +23,7 @@ pub mod opencode_rename;
 pub mod pass;
 pub mod scan;
 pub mod titles;
+pub mod turn;
 
 // Manage TUI: state, key handling, rendering, dialogs.
 pub mod app;

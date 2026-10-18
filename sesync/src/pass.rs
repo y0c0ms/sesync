@@ -7,6 +7,14 @@ use std::path::Path;
 pub struct PassSource {
     pub key: String,
     pub title: String,
+    /// Set when a turn-taking promotion moved the session here: its mirrors are written in
+    /// the same pass, without the quiet window, so no harness shows a stale copy.
+    pub urgent: bool,
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 /// Run `sync` for every changed source. A failure is counted on that source and
@@ -18,11 +26,22 @@ where
     let mut attempted = 0;
     for s in sources {
         attempted += 1;
-        if let Err(e) = sync(s) {
-            if let Some(src) = state.sources.get_mut(&s.key) {
-                src.failures += 1;
+        match sync(s) {
+            Ok(()) => {
+                // A later pass that succeeds clears the record; the failure count also drives
+                // the retry backoff in scan, so it must not stick around forever.
+                if let Some(src) = state.sources.get_mut(&s.key) {
+                    src.failures = 0;
+                    src.last_failure = 0.0;
+                }
             }
-            eprintln!("prepare {} failed: {e}", s.key);
+            Err(e) => {
+                if let Some(src) = state.sources.get_mut(&s.key) {
+                    src.failures += 1;
+                    src.last_failure = now_secs();
+                }
+                eprintln!("prepare {} failed: {e}", s.key);
+            }
         }
     }
     attempted

@@ -132,3 +132,142 @@ fn a_corrupt_state_file_stops_the_daemon_instead_of_forgetting_mirrors() {
     let o = run(&sb, &["--once"], &sesync_conv());
     assert!(!o.status.success(), "a corrupt state must be an error, not an empty state");
 }
+
+#[test]
+fn a_title_renamed_in_the_harness_reaches_the_mirror_on_the_next_pass() {
+    use sesync::titles;
+    let sb = sandbox("rename-fast");
+    let src = omp_session(&sb);
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    assert!(run(&sb, &["--once"], &sesync_conv()).status.success());
+
+    // The TUI's mirror choice is just this field; set it the way the TUI saves it.
+    let state_path = sb.join("state").join("state.json");
+    let mut st: serde_json::Value = serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+    let key = src.display().to_string();
+    st["sources"][key.as_str()]["chosen_targets"] = serde_json::json!(["pi"]);
+    fs::write(&state_path, st.to_string()).unwrap();
+    assert!(run(&sb, &["--once"], &sesync_conv()).status.success());
+    let mirrors = pi_mirrors(&sb);
+    assert_eq!(mirrors.len(), 1, "the chosen target must be written");
+
+    // omp's own rename appends a title record. The very next pass must see it and update the mirror.
+    let mut text = fs::read_to_string(&src).unwrap();
+    text.push_str("{\"type\":\"title\",\"title\":\"Renamed Fast\"}\n");
+    fs::write(&src, text).unwrap();
+    let o = run(&sb, &["--once"], &sesync_conv());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stdout(&o).contains("1 source(s) changed"), "{}", stdout(&o));
+    let mirror = fs::read_to_string(&mirrors[0]).unwrap();
+    let lines: Vec<&str> = mirror.lines().collect();
+    assert_eq!(titles::omp_title_from_lines(&lines).0, "Renamed Fast",
+               "the mirror must carry the title renamed in the harness");
+}
+
+#[test]
+fn a_choice_saved_while_the_daemon_runs_is_picked_up_on_the_next_pass() {
+    let sb = sandbox("live-choice");
+    let src = omp_session(&sb);
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    let mut child = Command::new(BIN)
+        .arg("--watch")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_LOCK_DIR", sb.join("locks"))
+        .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_QUIET", "0")
+        .env("SESYNC_PASSES", "600")
+        .env("SESYNC_POLL", "0.2")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the daemon");
+    let state_path = sb.join("state").join("state.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !state_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(state_path.exists(), "the running daemon wrote its first state");
+
+    // Exactly what the TUI does now: load, set the choice, save only the user-owned fields.
+    let mut st = sesync::state::State::load(&state_path).unwrap();
+    let key = src.display().to_string();
+    st.sources.entry(key.clone())
+        .or_insert_with(|| sesync::state::Source::new("omp", &key))
+        .chosen_targets.insert("pi".into());
+    st.save_user(&state_path).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pi_mirrors(&sb).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let mirrors = pi_mirrors(&sb);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(mirrors.len(), 1, "the running daemon must pick up the choice and write the mirror");
+    let after = sesync::state::State::load(&state_path).unwrap();
+    assert!(after.sources[&key].chosen_targets.contains("pi"),
+        "the daemon's own saves must not erase the choice");
+}
+
+#[test]
+fn an_opencode_session_mirrors_into_the_chosen_harness() {
+    let sb = sandbox("opencode-mirror");
+    let db = sb.join("opencode.db");
+    let old_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
+        - 30 * 86_400_000;
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(&format!(
+            "create table session (id text primary key, directory text, title text,
+                time_updated integer, time_archived integer);
+             insert into session values ('ses_live', '/tmp/proj', 'OC Mirror Title', {old_ms}, null);"
+        )).unwrap();
+    }
+    // The fake CLI answers `export ses_live` with a real export payload; no harness CLI runs.
+    let json = r#"{"info":{"id":"ses_live","directory":"/tmp/proj","title":"OC Mirror Title","time":{"created":1,"updated":1}},"messages":[{"info":{"id":"m1","role":"user","sessionID":"ses_live","time":{"created":1}},"parts":[{"id":"p1","type":"text","text":"opencode mirror text","messageID":"m1","sessionID":"ses_live"}]}]}"#;
+    let fake = sb.join("fake-opencode");
+    fs::write(&fake, format!("#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+
+    let run = |max_age: &str| {
+        Command::new(BIN)
+            .arg("--once")
+            .env("SESYNC_DIR", sb.join("state"))
+            .env("OMP_AGENT_DIR", sb.join("omp"))
+            .env("PI_AGENT_DIR", sb.join("pi"))
+            .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+            .env("SESYNC_CONV", sesync_conv())
+            .env("OPENCODE_DB", &db)
+            .env("OPENCODE_BIN", &fake)
+            .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+            .env("SESYNC_QUIET", "0")
+            .env("SESYNC_MAX_AGE_DAYS", max_age)
+            .output()
+            .expect("run sesync")
+    };
+
+    // The first pass records the source while the age window is open.
+    let o = run("60");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let state_path = sb.join("state").join("state.json");
+    let mut st = sesync::state::State::load(&state_path).unwrap();
+    assert!(st.sources.contains_key("ses_live"), "the opencode source is recorded");
+    st.sources.get_mut("ses_live").unwrap().chosen_targets.insert("pi".into());
+    st.save_user(&state_path).unwrap();
+
+    // The window is now closed: a pending choice must still be mirrored, like any other source.
+    let o = run("0");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let mirrors = pi_mirrors(&sb);
+    assert_eq!(mirrors.len(), 1, "the opencode session must be mirrored into pi");
+    let body = fs::read_to_string(&mirrors[0]).unwrap();
+    assert!(body.contains("opencode mirror text"), "the conversation must be carried: {body}");
+    assert!(body.contains("OC Mirror Title"), "the title must be carried: {body}");
+}

@@ -17,7 +17,7 @@ fn a_target_must_not_be_the_sources_own_format() {
     let d = sandbox("own");
     let mut state = State::default();
     state.sources.insert("/src/a.jsonl".into(), Source::new("omp", "/src/a.jsonl"));
-    let stores = Stores { omp: &d, pi: &d, claude: &d, sesync_conv: Path::new("/nonexistent"), sesync_lock: Path::new("/nonexistent") };
+    let stores = Stores { home: &d, omp: &d, pi: &d, claude: &d, gemini: &d, opencode_bin: Path::new("/nonexistent"), opencode_db: Path::new("/nonexistent"), sesync_conv: Path::new("/nonexistent"), sesync_lock: Path::new("/nonexistent") };
     let err = write_mirror(&stores, &mut state, "/src/a.jsonl", "omp", "conv", "t", "omp").unwrap_err();
     assert!(err.contains("own format"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
@@ -28,9 +28,23 @@ fn an_unknown_target_is_refused_not_guessed() {
     let d = sandbox("unknown");
     let mut state = State::default();
     state.sources.insert("/src/a.jsonl".into(), Source::new("omp", "/src/a.jsonl"));
-    let stores = Stores { omp: &d, pi: &d, claude: &d, sesync_conv: Path::new("/nonexistent"), sesync_lock: Path::new("/nonexistent") };
-    let err = write_mirror(&stores, &mut state, "/src/a.jsonl", "omp", "conv", "t", "gemini").unwrap_err();
+    let stores = Stores { home: &d, omp: &d, pi: &d, claude: &d, gemini: &d, opencode_bin: Path::new("/nonexistent"), opencode_db: Path::new("/nonexistent"), sesync_conv: Path::new("/nonexistent"), sesync_lock: Path::new("/nonexistent") };
+    // "windsurf" is no target this daemon knows, unlike gemini which is one since the
+    // Gemini CLI wiring (a wrong target must be refused, never guessed into a store).
+    let err = write_mirror(&stores, &mut state, "/src/a.jsonl", "omp", "conv", "t", "windsurf").unwrap_err();
     assert!(err.contains("no file mirror writer"), "{err}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_raw_source_needs_a_journal_before_the_gemini_writer() {
+    let d = sandbox("gemini-raw");
+    let mut state = State::default();
+    state.sources.insert("/src/a.jsonl".into(), Source::new("claude", "/src/a.jsonl"));
+    let stores = Stores { home: &d, omp: &d, pi: &d, claude: &d, gemini: &d, opencode_bin: Path::new("/nonexistent"), opencode_db: Path::new("/nonexistent"), sesync_conv: Path::new("/nonexistent"), sesync_lock: Path::new("/nonexistent") };
+    // The gemini writer takes a journal; a raw Claude transcript must be converted first.
+    let err = write_mirror(&stores, &mut state, "/src/a.jsonl", "claude", "conv", "t", "gemini").unwrap_err();
+    assert!(err.contains("must be converted to a journal"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -49,6 +63,47 @@ fn a_recorded_mirror_points_at_the_installed_file_and_is_tracked() {
     assert_eq!(m.source_hash, "abc", "the mirror remembers the source hash it was built from");
     assert!(!m.diverged);
     assert!(state.mirror_keys.contains(&installed.display().to_string()), "the file is marked as a mirror");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn replacing_a_mirror_at_a_new_path_removes_the_old_file() {
+    // The stale-bucket migration: a rewrite into the right place must take the old copy
+    // with it, but only when it is still exactly what sesync wrote.
+    let d = sandbox("replace-path");
+    let mut state = State::default();
+    state.sources.insert("/src/a.jsonl".into(), Source::new("omp", "/src/a.jsonl"));
+    let old = d.join("sessions/--/mirror.jsonl");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"old copy").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &old).unwrap();
+    let new = d.join("sessions/-proj/mirror.jsonl");
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::write(&new, b"new copy").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &new).unwrap();
+    assert!(!old.exists(), "the old copy must not be left behind");
+    assert!(new.exists(), "the new copy must stay");
+    assert!(!state.mirror_keys.contains(&old.display().to_string()), "the old path stops being a mirror key");
+    assert!(state.mirror_keys.contains(&new.display().to_string()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn replacing_a_mirror_keeps_an_edited_old_file() {
+    let d = sandbox("replace-edited");
+    let mut state = State::default();
+    state.sources.insert("/src/a.jsonl".into(), Source::new("omp", "/src/a.jsonl"));
+    let old = d.join("sessions/--/mirror.jsonl");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"as written").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &old).unwrap();
+    std::fs::write(&old, b"someone edited this").unwrap();
+    let new = d.join("sessions/-proj/mirror.jsonl");
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::write(&new, b"new copy").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &new).unwrap();
+    assert!(old.exists(), "a file changed since sesync wrote it must never be deleted");
+    assert!(state.mirror_keys.contains(&old.display().to_string()), "it must stay a mirror key so it is not read as a source");
     let _ = std::fs::remove_dir_all(&d);
 }
 

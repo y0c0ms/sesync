@@ -38,6 +38,8 @@ fn state_with_mirror(key: &str, mirror: &Path, installed_hash: &str) -> State {
         source_hash: String::new(),
         installed_hash: installed_hash.into(),
         diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
     });
     state.sources.insert(key.into(), src);
     state.mirror_keys.insert(mirror.display().to_string());
@@ -130,6 +132,8 @@ fn an_opencode_mirror_is_never_removed_by_file() {
         source_hash: String::new(),
         installed_hash: String::new(),
         diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
     });
     state.sources.insert(key.clone(), src);
     let planned = plan(&state);
@@ -173,6 +177,7 @@ fn deleting_a_session_removes_only_that_file_and_leaves_its_mirror() {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     };
     let mut group = Group::file("omp", key.clone(), "t");
     group.mirrors.push(("pi".into(), mir.display().to_string()));

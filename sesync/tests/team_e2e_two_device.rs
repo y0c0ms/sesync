@@ -163,6 +163,30 @@ fn two_devices_share_a_session_through_a_real_server() {
     assert_eq!(out.shown[0].conversation, "ses_live");
     assert_eq!(out.shown[0].text, text, "the reader sees exactly what the writer sealed");
 
+    // A rename on the writer is a new record at the next sequence, and the reader's floor moves
+    // up to it: the updated title travels with an incremental fetch, not a full one.
+    let renamed = b"the two-device session, renamed\n".to_vec();
+    let version = team.acquire("personal", "ses_live").unwrap();
+    assert!(version > 1, "the rename is a new sequence, not a rewrite of the old record");
+    let record = seal_for_devices(&writer, &sealed_trust, "personal", "ses_live", version, &renamed).unwrap();
+    team.put_to("/record/sealed", "personal", "ses_live", version, &record).unwrap();
+    team.release("personal", "ses_live").unwrap();
+    let mut floors = BTreeMap::new();
+    floors.insert("ses_live".to_string(), out.accepted["ses_live"].max(1));
+    let watch = TeamWatch {
+        base: base.clone(),
+        token: reader_cred.token.clone(),
+        machine: "reader-box".into(),
+        space: "personal".into(),
+        device: load_or_create(&dir.join("keys/reader")).unwrap(),
+        trust: team_join::trust_of(&reader_cred),
+    };
+    let out = watch.pull(&floors);
+    assert_eq!(out.dropped, 0, "the rename comes from a listed author");
+    assert_eq!(out.shown.len(), 1, "the reader fetches the updated record");
+    assert_eq!(out.shown[0].text, renamed, "the reader sees the renamed session");
+    assert!(out.accepted["ses_live"] > floors["ses_live"], "the floor rises to the new sequence");
+
     // The admin revokes the writer: forget its device, then sign the next list. The reader's
     // pull catches up to the current list on its own, and the writer's stored session is
     // dropped and counted, never shown. A device that pinned the old list cannot be rolled

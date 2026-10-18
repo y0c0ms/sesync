@@ -23,7 +23,7 @@ impl RemoteSessions for Fake {
 
 fn app() -> App {
     let root = std::env::temp_dir().join(format!("refresh-test-{}", std::process::id()));
-    let roots = Roots { omp: root.join("omp"), pi: root.join("pi"), claude: root.join("claude") };
+    let roots = Roots { omp: root.join("omp"), pi: root.join("pi"), claude: root.join("claude"), gemini: root.join("gemini") };
     App::new(roots, State::default(), root.join("locks"), root.join("hs.lock"))
 }
 

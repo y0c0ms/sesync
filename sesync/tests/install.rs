@@ -19,11 +19,16 @@ fn sandbox(name: &str) -> PathBuf {
 
 /// A minimal omp journal: header plus one user message.
 fn journal(dir: &PathBuf) -> PathBuf {
+    journal_at(dir, "/tmp/proj")
+}
+
+/// The same with an explicit cwd, for bucket assertions.
+fn journal_at(dir: &PathBuf, cwd: &str) -> PathBuf {
     let p = dir.join("src.jsonl");
     let id = "aaaaaaaa-1111-2222-3333-444444444444";
     let body = format!(
         "{}\n{}\n",
-        format!(r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-10-01T10:00:00.000Z","cwd":"/tmp/proj"}}"#),
+        format!(r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-10-01T10:00:00.000Z","cwd":"{cwd}"}}"#),
         r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-01T10:00:01.000Z","message":{"role":"user","content":"hello install"}}"#,
     );
     fs::write(&p, body).unwrap();
@@ -99,6 +104,23 @@ fn an_older_mirror_with_a_different_timestamp_is_removed() {
     install_journal(&sesync_conv(), &src, t(), "/tmp/proj", "mirror-id-4", "Second").unwrap();
     assert!(!stale.exists(), "the stale copy with an old timestamp must be removed");
     assert_eq!(walk_jsonl(&store).len(), 1, "exactly one mirror must remain");
+}
+
+#[test]
+fn an_omp_mirror_lands_in_the_home_relative_bucket() {
+    // omp lists a project's sessions from its home-relative bucket. The daemon once passed
+    // the store's parent as `--home`, which put every mirror in a bucket omp never reads.
+    let d = sandbox("omp-bucket");
+    let home = d.join("home");
+    let cwd = home.join("proj");
+    fs::create_dir_all(&cwd).unwrap();
+    let src = journal_at(&d, cwd.to_str().unwrap());
+    let store = d.join("omp-agent");
+    let out = install_journal(&sesync_conv(), &src,
+                              InstallTarget::Omp { agent_dir: store.clone(), home: home.clone() },
+                              "/", "mirror-id-omp", "T").unwrap();
+    assert_eq!(out.parent().unwrap().file_name().unwrap(), "-proj",
+               "the mirror must sit in the bucket omp actually lists: {}", out.display());
 }
 
 #[test]

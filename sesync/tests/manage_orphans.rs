@@ -20,6 +20,7 @@ fn roots(sb: &PathBuf) -> Roots {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     }
 }
 
@@ -35,6 +36,8 @@ fn a_source_in_state_with_no_file_is_listed_as_an_orphan_with_its_mirror() {
     src.mirrors.insert("pi".into(), Mirror {
         target: "pi".into(), path: mirror.display().to_string(),
         source_hash: String::new(), installed_hash: String::new(), diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
     });
     state.sources.insert(gone.display().to_string(), src);
 
