@@ -169,6 +169,25 @@ tests win, and you fix this file. Update it at the end of every work session.
   `sesync.prev-turn3`, `sesync.prev-turn4`), daemon active; the live TestFromOPENCODE
   tangle collapsed to its claude winner within one pass and has stayed quiet since.
 
+## 2026-10-18 (night) — PR #43 (`turn-taking` → `session-keys`), CI green (same branch)
+
+- Branch `turn-taking` holds today's work as three commits (converter title/tool-id, mirror
+  pipeline + turn-taking, TUI QoL + themes) plus the CI debugging; PR
+  https://github.com/y0c0ms/sesync/pull/43 into `session-keys`. All five checks pass:
+  unix (ubuntu + macOS), windows, team-server/Postgres, cargo-audit.
+- The macOS job failed on `tui_pty::tui_draws_the_session_and_quits_on_q` and was a real
+  find: with the full-background themes, one frame is tens of kilobytes (every cell carries
+  its own SGR background run); the test stopped reading the pty after the title appeared,
+  leaving most of the frame unread in macOS's smaller pty buffer, so the child's next small
+  write blocked forever — it never polled again and never saw the `q`. Linux's 64 KB pty
+  buffer hid it. Real terminals always drain, so this was test-harness-only; the fix is
+  `wait_with_timeout_reading`, which keeps draining the master while waiting for exit
+  (all three pty exit waits use it now).
+- Debugging aid, kept: `SESYNC_TRACE=<file>` makes the TUI append its startup and event
+  trace (start, draw/poll timeout, keys, quit); the pty tests set it into their sandbox and
+  print it when a wait fails. That trace is what localized the hang (only "tui start" ever
+  logged; no poll timeout ever fired).
+
 - Deployed 19:51: `~/.local/bin/sesync` (backups `sesync.prev-qol`, then 20:0x
   `sesync.prev-bar` for the bar change), daemon restarted, active.
   `sesync-conv` unchanged by this batch. **Restart any running TUI** to get the new keys.
