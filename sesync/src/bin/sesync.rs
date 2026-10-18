@@ -779,6 +779,18 @@ fn run_tui(
     let _restore = Restore;
     std::io::stdout().execute(EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    // Optional startup/event trace for CI debugging: SESYNC_TRACE names a file this process
+    // appends to. Off in normal use; the pty test prints it when a wait fails.
+    let mut trace: Option<std::fs::File> = std::env::var_os("SESYNC_TRACE").map(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+    }).flatten();
+    let mut tr = |msg: &str, trace: &mut Option<std::fs::File>| {
+        use std::io::Write;
+        if let Some(f) = trace.as_mut() {
+            let _ = writeln!(f, "{} {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), msg);
+        }
+    };
+    tr("tui start", &mut trace);
     // Only harnesses installed on this machine are offered as mirror targets. O-penCode is
     // offered when its CLI can be run: the mirror is an `opencode import`, not a file.
     let mut installed = Vec::new();
@@ -815,12 +827,14 @@ fn run_tui(
                     if let Ok(disk) = State::load(&state_file) {
                         app.absorb_daemon_state(&disk);
                         app.refresh_rows();
+                        tr("absorbed daemon state", &mut trace);
                     }
                 }
             }
             continue;
         }
         let Event::Key(key) = event::read()? else { continue };
+        tr(&format!("key {} {:?}", key.code, key.modifiers), &mut trace);
         if key.kind != crossterm::event::KeyEventKind::Press {
             continue;
         }
@@ -891,6 +905,7 @@ fn run_tui(
             }
         }
         if app.should_quit() {
+            tr("quit", &mut trace);
             return Ok(());
         }
     }

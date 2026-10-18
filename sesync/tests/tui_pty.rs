@@ -48,6 +48,7 @@ fn tui_draws_the_session_and_quits_on_q() {
         .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
         .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_TRACE", sb.join("tui-trace.log"))
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -76,8 +77,10 @@ fn tui_draws_the_session_and_quits_on_q() {
     let mut m = unsafe_file(master);
     m.write_all(b"q").unwrap();
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
     assert!(status.is_some(),
-        "the TUI must exit on q; the last frames the child sent were:\n{}", strip_ansi(&seen));
+        "the TUI must exit on q; the last frames were:\n{}\nthe child's own trace:\n{}",
+        strip_ansi(&seen), trace);
     assert!(status.unwrap().success(), "a clean quit must exit 0");
 
 }
@@ -236,8 +239,10 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
 
     m.write_all(b"q").unwrap();
     let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
     assert!(status.is_some(),
-        "the TUI must exit on q; the last frames the child sent were:\n{}", strip_ansi(&seen));
+        "the TUI must exit on q; the last frames were:\n{}\nthe child's own trace:\n{}",
+        strip_ansi(&seen), trace);
     assert!(status.unwrap().success(), "a clean quit must exit 0");
 
     // The choice must have been saved, and the next pass must write only the chosen harness.
