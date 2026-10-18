@@ -76,7 +76,7 @@ fn tui_draws_the_session_and_quits_on_q() {
 
     let mut m = unsafe_file(master);
     m.write_all(b"q").unwrap();
-    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let status = wait_with_timeout_reading(&mut child, master, &mut seen, Duration::from_secs(10));
     let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
     assert!(status.is_some(),
         "the TUI must exit on q; the last frames were:\n{}\nthe child's own trace:\n{}",
@@ -114,6 +114,7 @@ fn tui_opens_the_command_list_and_the_team_tab() {
         .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
         .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_TRACE", sb.join("tui-trace.log"))
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -157,7 +158,7 @@ fn tui_opens_the_command_list_and_the_team_tab() {
     let text = wait_for("press q to quit", master, checked);
     assert!(text.contains("copied"), "ctrl+c must say what was copied:\n{text}");
     m.write_all(b"q").unwrap();
-    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let status = wait_with_timeout_reading(&mut child, master, checked, Duration::from_secs(10));
     assert!(status.is_some(), "the TUI must exit on q after a copy");
     assert!(status.unwrap().success(), "a clean quit must exit 0");
 }
@@ -194,6 +195,7 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
         .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
         .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_TRACE", sb.join("tui-trace.log"))
         .env("TERM", "xterm-256color")
         .stdin(unsafe_stdio(slave))
         .stdout(unsafe_stdio(slave))
@@ -238,7 +240,7 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
         "confirming must name the chosen harnesses:\n{text}");
 
     m.write_all(b"q").unwrap();
-    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let status = wait_with_timeout_reading(&mut child, master, seen, Duration::from_secs(10));
     let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
     assert!(status.is_some(),
         "the TUI must exit on q; the last frames were:\n{}\nthe child's own trace:\n{}",
@@ -334,6 +336,29 @@ fn wait_with_timeout(child: &mut std::process::Child, d: Duration) -> Option<std
     while Instant::now() < end {
         if let Ok(Some(s)) = child.try_wait() {
             return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    None
+}
+
+/// The same wait, but the master keeps being drained: the TUI paints the theme background on
+/// every cell, so one frame is tens of kilobytes; a test that stops reading leaves most of it
+/// in the pty buffer, and the child's next write then blocks forever — it would never poll
+/// again and never see the `q`. macOS's pty buffer is much smaller than Linux's, where this
+/// used to fit.
+fn wait_with_timeout_reading(
+    child: &mut std::process::Child, fd: i32, seen: &mut Vec<u8>, d: Duration,
+) -> Option<std::process::ExitStatus> {
+    let end = Instant::now() + d;
+    while Instant::now() < end {
+        if let Ok(Some(s)) = child.try_wait() {
+            return Some(s);
+        }
+        let mut buf = [0u8; 4096];
+        if let Ok(n) = read_nonblocking(fd, &mut buf) {
+            seen.extend_from_slice(&buf[..n]);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
