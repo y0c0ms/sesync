@@ -13,6 +13,9 @@
 //!                          content, isError}, placed right after the record it came from
 //!   thinking, attachment, file-history-snapshot, mode, permission-mode, system,
 //!   last-prompt -> not converted; counted
+//!   a line that is not a JSON object (a truncated write) -> skipped and counted;
+//!   real transcripts carry these (killed processes), and Claude itself still
+//!   resumes them, so one bad line must not lose the whole session
 //!
 //! Tool results are paired with calls by id, as Claude requires: a result whose call was
 //! never seen (orphan) or a second result for the same call (duplicate) is dropped and
@@ -34,6 +37,8 @@ pub struct Stats {
     pub images: usize,
     pub skipped_image_blocks: usize,
     pub skipped_records: usize,
+    /// Lines that are not a JSON object at all: a truncated write, or a shape drift.
+    pub skipped_bad_lines: usize,
     pub tool_calls: usize,
     pub tool_results: usize,
     pub orphan_tool_results: usize,
@@ -41,7 +46,8 @@ pub struct Stats {
 }
 
 /// Convert the whole transcript text. Returns the omp journal lines, header
-/// first. Lines that are not JSON are an error, not a silent skip.
+/// first. Lines that are not a JSON object are skipped and counted; the rest of
+/// the transcript still converts.
 pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
     let mut stats = Stats::default();
     let mut session_id = String::new();
@@ -62,14 +68,18 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
     // Results split off a source record, as (id, message) pairs placed after it.
     let mut result_msgs: Vec<(String, Map<String, Value>)>;
 
-    for (n, line) in raw.lines().enumerate() {
+    for line in raw.lines() {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        let rec: Value = serde_json::from_str(t).map_err(|e| format!("line {}: {e}", n + 1))?;
+        let Ok(rec) = serde_json::from_str::<Value>(t) else {
+            stats.skipped_bad_lines += 1;
+            continue;
+        };
         let Value::Object(r) = rec else {
-            return Err(format!("line {}: record is not an object", n + 1));
+            stats.skipped_bad_lines += 1;
+            continue;
         };
         if session_id.is_empty() {
             if let Some(s) = r.get("sessionId").and_then(Value::as_str) {
@@ -542,12 +552,25 @@ mod tests {
     }
 
     #[test]
-    fn garbage_line_is_an_error() {
-        assert!(to_journal_lines("not json\n").is_err());
+    fn unparseable_lines_are_skipped_and_counted() {
+        // Real transcripts carry these: a line truncated by a killed process, or a shape we
+        // do not know. The session must still convert; the bad lines are counted.
+        let raw = concat!(
+            r#"{"type":"user","uuid":"u1","sessionId":"s","timestamp":"2026-10-01T10:00:00.000Z","message":{"role":"user","content":"hello"}}"#, "\n",
+            "{\"type\":\"assis", "\n",
+            "[1,2,3]", "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s","timestamp":"2026-10-01T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#, "\n",
+            "{\"type\":\"user\",\"uuid\":\"u2\"", "\n",
+        );
+        let (lines, stats) = to_journal_lines(raw).unwrap();
+        assert_eq!(lines.len(), 3, "header + two turns");
+        assert_eq!(stats.messages, 2);
+        assert_eq!(stats.skipped_bad_lines, 3, "truncated line, non-object, truncated tail");
+        assert_eq!(stats.skipped_records, 0);
     }
 
     #[test]
-    fn no_turns_is_an_error() {
+    fn a_transcript_with_no_turns_is_still_an_error() {
         let raw = r#"{"type":"attachment","uuid":"x","sessionId":"s"}"#;
         assert!(to_journal_lines(raw).is_err());
     }
