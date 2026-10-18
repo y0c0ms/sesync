@@ -113,9 +113,8 @@ fn a_read_only_store_fails_the_mirror_without_damaging_anything() {
 }
 
 #[test]
-fn an_interrupted_write_leaves_no_temporary_file_behind() {
-    // A stale .tmp from an earlier crashed write must not be mistaken for a mirror, and a
-    // new successful pass must leave no temporary file in the store.
+fn a_stale_temporary_file_is_left_alone_and_a_pass_adds_nothing_beside_it() {
+    // A .tmp from an earlier crashed write is not sesync's to delete, and a pass adds no file.
     let sb = sandbox("tmpfile");
     let pi = sb.join("pi").join("sessions").join("-tmp-proj");
     fs::create_dir_all(&pi).unwrap();
@@ -124,13 +123,9 @@ fn an_interrupted_write_leaves_no_temporary_file_behind() {
     session(&sb);
     let o = run(&sb, &sesync_conv());
     assert!(o.status.success(), "{o:?}");
-    let leftover: Vec<_> = files_under(&sb.join("pi").join("sessions"))
-        .into_iter().filter(|p| p.to_string_lossy().ends_with(".tmp")).collect();
-    assert!(leftover.iter().all(|p| p.to_string_lossy().contains("crashed")),
-        "a successful pass must not add temporary files: {leftover:?}");
-    let mirrors: Vec<_> = files_under(&sb.join("pi").join("sessions"))
-        .into_iter().filter(|p| p.extension().map_or(false, |x| x == "jsonl")).collect();
-    assert_eq!(mirrors.len(), 1, "exactly one mirror is written");
+    let files = files_under(&sb.join("pi").join("sessions"));
+    assert_eq!(files.len(), 1, "the pass adds nothing to the store: {files:?}");
+    assert!(files[0].to_string_lossy().contains("crashed"), "the stale file is untouched");
 }
 
 extern "C" {

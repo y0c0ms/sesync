@@ -1,0 +1,516 @@
+# Status
+
+Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
+tests win, and you fix this file. Update it at the end of every work session.
+
+## 2026-10-18 (late evening) — TUI quality-of-life batch (same branch)
+
+- Operator approved the QoL list from the TUI audit; all items implemented except the mouse
+  wheel (already works) and the two server-side ones left open (below).
+- **Filter and scope** (Sessions tab): `/` opens a fuzzy filter typed at the status line — the
+  list narrows live (subsequence match, same as the command list, `palette::fuzzy_matches`),
+  Enter keeps it, Esc clears it; `f` cycles the scope all → marked → mirrored → failing (a
+  marked row vanishes from the "marked" view the moment it is unmarked); footer and status
+  show the active scope and `N of M` counts. The list cursor follows the session by key on
+  every re-list and keeps its row position after a delete.
+- **Mirror picker** no longer pre-ticks every installed harness (one stray Enter used to
+  mirror a session everywhere); it starts from the session's saved choice plus its existing
+  mirrors, `a`/`n` tick/clear everything, each row shows `mirrored`/`chosen` state, and the
+  footer's `a all · n none` promise is now real.
+- **Status line**: every message now carries its severity set at the source (`say`/`fail` in
+  `app.rs`; no more substring sniffing in `ui.rs`). Informational messages fade after 25 s
+  (`app::STATUS_TTL`); failures stay until replaced and draw in the error colour — this also
+  fixes form errors ("not joined: …") which were never red. Team pulls run on a worker thread
+  (`bin/sesync.rs::request_team_pull` + `apply_pull`), so the terminal stays live; a second
+  ctrl+r while one is running says so, a lost worker says "did not finish", and the app's
+  `team_seen` floors rise to what a pull accepted (in memory only).
+- **Team tab context**: a dim header line — `N session(s) · pulled Xs ago · M refused` — so an
+  empty list is not mistaken for an empty team; rows are `title · first8…` instead of the
+  full `[uuid]`.
+- **Help overlay**: `?` on either tab opens a key list for that tab (`Mode::Help`,
+  `app::help_lines`), Esc/enter/`?` closes.
+- **Session menu**: gained "Show transcript" (`t`) — the session's own file read inside the
+  TUI, scrollable (`j/k`, PgUp/PgDn, Home/End), tail-capped at `TRANSCRIPT_MAX_LINES` (4000)
+  lines with a cut marker — and "Copy its path" (`ctrl+c` behaviour from the menu).
+- **Delete confirmation**: the second ctrl+d now opens a dialog naming the session and its
+  source path, stating that only the source file goes (mirrors and the team's sealed copies
+  stay — as `delete_group` has always done), confirmed with ctrl+d/enter/y, cancelled by any
+  other key. Renaming it "and its mirrors" in the help was wrong and is fixed.
+- **Persistence**: theme + last tab survive runs via `~/.config/sesync/tui.json`
+  (`app::prefs::load/save`, written by the TUI loop only when the taste actually changed;
+  never in the daemon's `state.json`).
+- **Statusline bar** (same evening, operator request): both bottom rows — status and footer —
+  sit on a per-theme `bar` colour (`theme.rs`, a strip distinct from the page background, like
+  neovim's statusline), so a typed filter or a message is easy to find; while the filter is
+  being typed its text is bold foreground. `render.rs` asserts the strip carries the bar
+  background beyond the text and that errors keep their colour on it.
+- Suites: `sesync` **486 passed, 0 failed** (was 465; +21 tests: `session_filter.rs` ×4,
+  `session_menu` +3, `tui_views` +3, `app` +2, `sessions_table` ×2 colour tests,
+  `session_cols` +1 and the restructured mirror-state asserts, `render` +1 bar test),
+  `sesync-conv` 73/0, `sh build-test.sh` green. Known stale line: `tests/tui_form.rs` module
+  doc now corrected.
+
+## 2026-10-18 (late evening) — full-background themes, more schemes (same branch)
+
+- Operator: themes must own the page background like a text-editor scheme, and there should be
+  more of them.
+- `Theme` gained `bg`: `draw` paints it over the whole frame first, and every other widget
+  still only sets foregrounds, so the fill shows through everywhere (rows, tab bar, dialogs —
+  `dialog()` restamps its rectangle with `bg` instead of `Clear`, so no list text leaks
+  under a floating box). The highlighted row and the bottom bar keep their own explicit
+  backgrounds (accent / bar).
+- 6 new schemes, all classic editor palettes with real backgrounds: `solarized (dark)`,
+  `gruvbox (dark)`, `gruvbox (light)`, `nord`, `dracula`, `catppuccin mocha` — 10 themes
+  total; the existing four got matching bg values (textual dark 0x101010, light white,
+  tokyo-night 0x1A1B26, solarized light base3). The picker, theme persistence (`tui.json`)
+  and live preview needed no changes: previewing now shows the whole scheme, background
+  included.
+- Tests +2 (`tui_theme.rs`): walking the full picker asserts each previewed theme's bg is on
+  the page, and a dialog restamps its area; `names_sorted() >= 10`. Suites: `sesync`
+  **488 passed, 0 failed** (was 486), `tui_pty` 3/0, `sh build-test.sh` green.
+- Deployed (backup `sesync.prev-themes`), daemon restarted, active.
+
+## 2026-10-18 (late evening) — stale "failing" counters healed, scope fixed (same branch)
+
+- Operator: 22 sessions showed in the `f` → failing view. Diagnosis (metadata only): all 22
+  have `chosen_targets: []` and `mirrors: {}` — leftovers of the old auto-mirror binary — and
+  only stale `failures` counters (1, 5, one 2770). Nothing is being written for them; a
+  session asked to mirror nothing cannot fail anything. The failing *scope predicate*
+  (`failures > 0` alone) was wrong; the MIRRORS column markers were already intent-aware.
+- Code: `passes`' Failing arm now requires mirror intent too (`failures > 0` AND
+  (`chosen_targets` or `mirrors` non-empty)). New test
+  `a_stale_failure_counter_without_mirror_intent_is_not_failing`.
+- State heal (protocol: stop → backup → patch → start): zeroed `failures` on sources with no
+  chosen targets and no mirrors — exactly the 22. Backups
+  `/tmp/opencode/state-pre-stale-failures.json`, `state-post-stale-failures.json`. After the
+  restart, 0 sources carry failures (the daemon does not re-add them: with no intent there is
+  no attempt to fail).
+- Suites: `sesync` **489 passed, 0 failed**, `sh build-test.sh` green. Deployed (backup
+  `sesync.prev-stalefail`), daemon active.
+
+## 2026-10-18 (night) — turn-taking: an answer in a mirror becomes the source (same branch)
+
+- Reported: a session created on OpenCode ("TestFromOPENCODE") mirrored to claude+omp; the
+  operator answered inside both copies, got responses, and then nothing propagated: last sync
+  stuck at creation, opencode showed no new turns.
+- Cause: the local pass decides entirely from the **source's** hash (`scan` in
+  `bin/sesync.rs`); mirrors are one-way derived data. Writes into a mirror never propagate,
+  and nothing even re-fingerprints mirrors (`divergence::check_mirror` is test-only), so the
+  daemon never noticed the edits.
+- Design decided with the operator: **newest write wins, fully automatic** — when a mirror's
+  content no longer matches what the daemon installed, that copy is the newest statement of
+  the conversation and becomes the session's source; the "main harness" moves; the same pass
+  rewrites every other configured copy from it (including the old source). No quiet window on
+  the promoted source's first push: the point is that no harness ever shows a stale copy.
+  The daemon ticks every 5 s (`SESYNC_POLL`), so an edit is picked up within ~5 s.
+- Implementation: new `sesync/src/turn.rs`. `check` compares a recorded mirror's content
+  against its `installed_hash`, cached by a size:mtime `edit_stamp` (one stat per pass when
+  untouched; two new `#[serde(default)]` fields `edit_stamp`/`target_updated` on `Mirror`).
+  `promote_changed` promotes the newest edit per session and does the state surgery: winner's
+  file becomes the source entry, old source's harness becomes a mirror target (its stale copy
+  is pre-recorded so `record_mirror` deletes it when the winner's copy lands elsewhere),
+  winner removed from `mirror_keys`, loser recorded as a mirror. OpenCode mirror rows are now
+  hidden from the scan (`scan_opencode`) and their id stays stable across turns
+  (`install_into` keeps the recorded mirror id, so a refresh replaces the same conversation).
+  `Stores` gained `opencode_db`; `PassSource` gained `urgent`.
+- Regression found live: the promotion **flip-flopped every pass** — the running TUI held a
+  dead session in memory and its `save_user` resurrected it on disk (with creation-era
+  fingerprints), which turn-taking read as a fresh edit. Fix: `absorb_daemon_state` now
+  prunes in-memory sources the daemon removed, keeping runtime-only `tui_created` entries
+  (a choice recorded before the first scan).
+- Tests: `turn.rs` ×4 (edited mirror wins, touched-with-same-content stays quiet and records
+  the stamp, newest of two wins, missing mirror is not a promotion) + `tests/app.rs` prune
+  test + `tests/turn_live.rs` ×2 (real daemon binary + real sesync-conv end to end: answer in
+  the claude copy promotes it, the omp copy is replaced and holds the answer; two quiet
+  passes mint nothing). Suites: `sesync` **496 passed, 0 failed**, `sh build-test.sh` green.
+- Deployed (backups `sesync.prev-turn`, `sesync.prev-turn2`), daemon restarted, active; the
+  live TestFromOPENCODE session healed itself within one tick (claude copy is the source;
+  omp+opencode mirrors refreshed; zero repeated promotions since). The losing omp copy
+  (with the omp-side answer, 20:32:33) still exists on disk, hidden as a mirror — it is the
+  only place that answer survives; say the word and it can be removed.
+- Note: `tui_pty` tests now pin `SESYNC_CONFIG_DIR` into the sandbox — without it a real
+  `~/.config/sesync/tui.json` (persisted Team view) opened the test TUI on the Team tab and
+  the Sessions-title waits timed out.
+
+## 2026-10-18 (night) — turn-taking hardened after live churn (same branch)
+
+- Operator asked for an efficiency/edge-case review of turn-taking (now the app's most
+  crucial part). Review + live testing found the promotion could **churn indefinitely**:
+  multiple state entries for one conversation (a promotion leaves the old entry behind on
+  disk; the merge re-adopts it) recorded the same copy paths with stale installed-hashes, so
+  every pass re-read the daemon's own rewrites as user edits and turned the session again,
+  minting a new mirror generation each time (mirror ids were derived from the moving source
+  key).
+- Fixes, all in shared code (`turn.rs`, `state.rs`, `mirror_write.rs`, `bin/sesync.rs`):
+  1. **Stable mirror ids**: `Source::conv` — the conversation's origin uuid/ses id, pinned at
+     first scan; `install_into` mints every mirror id from it (falling back to the source
+     key for old states). A turn now replaces each store's copy in place; no re-minting, no
+     dead files, and the fingerprint/installed-hash bookkeeping stays exact.
+  2. **One entry per conversation** (`turn::component_of`): entries that record each other's
+     keys as mirror paths are one conversation. A component with a real edit turns to the
+     newest edit (ties break by harness name, deterministic); one without collapses to its
+     most recently turned entry (`turn_at`). This resolved the live tangle without losing a
+     real turn.
+  3. **`promote` refuses when the destination copy already holds the entry** — a redundant
+     candidate from a leftover can no longer graft stale mirror records onto the live entry.
+  4. **Merge hardening**: the daemon does not re-adopt keys hidden in `mirror_keys`
+     (`State::adoptable`); the TUI already prunes daemon-removed sources.
+  5. Efficiency: `promote_changed` no longer clones the whole sources map per pass (the scan
+     is read-only; writes happen after). Cost per tick: one stat per recorded mirror; a file
+     read only when the fingerprint moved.
+- Tests now cover the crucial loop end to end (`tests/turn_live.rs`, real daemon binary +
+  real sesync-conv): turn omp→claude, then a **second real answer in the rewritten omp copy
+  turns it back** (the exact loop the churn corrupted), losers replaced not duplicated, and
+  two quiet passes mint nothing. Unit tests in `turn.rs` (7): basic turn, quiet touch
+  records the stamp, newest-of-two wins, missing mirror is not a promotion, deterministic
+  tie-break, legacy `target_updated=0` upgrade never promotes, tangle collapses to one entry
+  and stays quiet. `SES_SYNC_TURN_DEBUG` (`SESYNC_TURN_DEBUG`) traces detection decisions.
+- Suites: `sesync` **500 passed, 0 failed**, `sh build-test.sh` green. Deployed (backups
+  `sesync.prev-turn3`, `sesync.prev-turn4`), daemon active; the live TestFromOPENCODE
+  tangle collapsed to its claude winner within one pass and has stayed quiet since.
+
+## 2026-10-18 (night) — PR #43 (`turn-taking` → `session-keys`), CI green (same branch)
+
+- Branch `turn-taking` holds today's work as three commits (converter title/tool-id, mirror
+  pipeline + turn-taking, TUI QoL + themes) plus the CI debugging; PR
+  https://github.com/y0c0ms/sesync/pull/43 into `session-keys`. All five checks pass:
+  unix (ubuntu + macOS), windows, team-server/Postgres, cargo-audit.
+- The macOS job failed on `tui_pty::tui_draws_the_session_and_quits_on_q` and was a real
+  find: with the full-background themes, one frame is tens of kilobytes (every cell carries
+  its own SGR background run); the test stopped reading the pty after the title appeared,
+  leaving most of the frame unread in macOS's smaller pty buffer, so the child's next small
+  write blocked forever — it never polled again and never saw the `q`. Linux's 64 KB pty
+  buffer hid it. Real terminals always drain, so this was test-harness-only; the fix is
+  `wait_with_timeout_reading`, which keeps draining the master while waiting for exit
+  (all three pty exit waits use it now).
+- Debugging aid, kept: `SESYNC_TRACE=<file>` makes the TUI append its startup and event
+  trace (start, draw/poll timeout, keys, quit); the pty tests set it into their sandbox and
+  print it when a wait fails. That trace is what localized the hang (only "tui start" ever
+  logged; no poll timeout ever fired).
+
+- Deployed 19:51: `~/.local/bin/sesync` (backups `sesync.prev-qol`, then 20:0x
+  `sesync.prev-bar` for the bar change), daemon restarted, active.
+  `sesync-conv` unchanged by this batch. **Restart any running TUI** to get the new keys.
+- Still open from the list (server-side, deliberately not started here): removing the legacy
+  plaintext `/record` routes (needs the test rework + the commit split, see below) and the
+  lockstep-client/first-team-space decision.
+
+## 2026-10-18 (evening) — a rename made inside omp reaches the mirrors (same branch)
+
+- Reported: a session renamed **inside omp** mirrored into Claude fine, but Claude still showed
+  the pre-rename name. Three independent gaps:
+  1. omp appends a `title_change` record on /rename and overlays it over the 256-byte title
+     slot when it reads; `titles::omp_title_from_lines` never read `title_change`, so sesync
+     kept the stale slot until omp saved the file again (verified: a 17:01:04 change sat in
+     `title_change` while the slot still held the old name).
+  2. `journal::title_text` returned the slot before looking at `title_change` — the converter
+     lagged the same way.
+  3. `to-claude` wrote no title at all (`install::install_into` never passed `--title` for
+     Claude), and Claude labels a title-less transcript by its first user message — the "old"
+     name the operator saw.
+- Fixes: both readers now take the **last `title_change` > slot > last Pi `session_info` >
+  header > first user line**; `to-claude [--title T]` (default the journal title) writes
+  `{"type":"custom-title","customTitle":…,"sessionId":…}` as the first record — the shape
+  Claude's own /rename writes and prefers over `ai-title`; `install_into` passes
+  `--id --title` to every target.
+- Suites: `sesync` **465 passed, 0 failed** (sandbox; +1 new test
+  `omp_title_change_beats_the_initial_slot`), `sesync-conv` **73 passed, 0 failed** (+2:
+  rename→custom-title head record, nameless session→no record; the tool-id test below is the
+  +1), `sh build-test.sh` green.
+- Deployed 18:25 (backups `sesync.prev-title`, `sesync-conv.prev-title`) and healed live: the
+  `TESTfromOMP` session (omp source `…tileCoder35b/…_01a12695…`) had its claude mirror record
+  cleared, the daemon rewrote it at the same path, and the first record is `custom-title`
+  exactly equal to the source's last `title_change`; the opencode mirror already carried the
+  current name.
+- Same evening, from live testing of the above, two more defects fixed (deployed 18:43,
+  backups `sesync.prev-toolid`, `sesync-conv.prev-toolid`):
+  1. **TUI rename on an omp session now works inside omp too.** `manage::rewrite_title`'s omp
+     arm rewrote only the header title, which omp never overlays onto its slot. It now writes
+     the 256-byte title slot as omp's own serializer does (`type/title/v/source:"user"/
+     updatedAt/pad`, trimmed to fit) **and** appends a `title_change` entry (8-hex id via
+     uuid5, `parentId` = the entry before it, `previousTitle`) — the same two writes omp
+     makes on `/rename`. Test fixture is slot-first and asserts slot length 255, source
+     `user`, ISO-ms `updatedAt`, and the appended `title_change`.
+  2. **omp→claude mirrors lost every tool call.** Claude's session loader drops a `tool_use`
+     whose id is not native (`toolu_` + 24 chars); omp mints 32-char tokens and
+     `to-claude` passed them through, so Claude rendered only the text (opencode, which is
+     laxer, looked fine). `claude.rs` now remaps both call and result deterministically
+     (`toolu_` + first 24 hex of uuid5(raw)) at export time; covered by a new
+     `a_foreign_tool_id_is_mapped_to_a_native_one` plus pairing asserts in the existing
+     round-trip tests.
+- Healed the same mirror again after 2: live file now has 118/118 perfectly paired
+  `toolu_`-shaped calls/results, `custom-title` first. Operator: reopen the session in Claude
+  to re-read the file.
+
+## 2026-10-18 (evening) — legacy mirrors cleared at operator request (same branch)
+
+- Operator: the mirrors the old auto-mirror attempts had created on omp/claude sessions must
+  not stay considered mirrors. With the daemon stopped: `sesync mirrors --apply` removed **67**
+  file mirrors (unchanged copies; every source still on disk) and kept 6 files whose target
+  side has newer content (`--/8b6a5562…` omp + `--/7b598aa6…` pi, claude `7b386d92…`, pi
+  `f08dcf40…`, claude `3ef245ef…`, pi `83f04850…`) — remove those in their harnesses if they
+  are junk. The 34 OpenCode records are kept by design (remove through OpenCode).
+- Still stopped: every `sources.*.mirrors` record was cleared and every `chosen_targets`
+  emptied except the `aac4763c…` Test session (operator's live test: omp+opencode), and the 33
+  imported OpenCode sessions were deleted via `opencode session delete` (77 → 44 rows; the
+  34th id was never in the store). Daemon restarted 15:28; journal quiet; mirror records 0,
+  chosen 1. Backups: `/tmp/opencode/state-pre-legacy-cleanup.json`, `state-post-apply.json`.
+- Correction to the section below: `sesync mirrors --apply` only plans **recorded** mirrors,
+  so superseded `--`-bucket files with no record (4 remain) are not covered by it; they stay
+  hidden via `mirror_keys` (111 → 44 keys).
+- A TUI that was already running before this cleanup holds the old picks in memory; any
+  subsequent keypress would re-save them. Close and reopen the TUI.
+
+## 2026-10-18 (evening) — mirrors land where the harnesses look (same branch)
+
+- Reported: sessions the TUI showed as mirrored never appeared in omp/OpenCode, and a chosen
+  stub showed `omp!`. Three independent causes, all on the mirror path:
+  1. `mirror_write` passed the target store's parent (`~/.omp`) as the converter's `--home`,
+     so a cwd under the real home looked outside-home and omp mirrors landed in
+     `--home-yocoms-…-` — a bucket omp never lists.
+  2. Older claude→omp/Pi mirrors sat in bucket `--` (written before the cwd was carried into
+     the converter); the state still pointed at them, so the daemon saw the session as
+     mirrored and never rewrote it.
+  3. OpenCode 1.19 moved its store to SQLite (`opencode.db`); all 34 recorded OpenCode mirror
+     ids were gone from it.
+- Fixes: `buckets` (`seg_join`, `pi_bucket`, `omp_home_bucket`, `cwd_from_head`; no cwd or a
+  cwd outside home is never called stale), `scan::mirror_stale` feeding the existing
+  `mirror_demand` (wrong bucket, missing file, or an id absent from the store the scan already
+  opened), `mirror_write::Stores::home` (the real `Env.home`), and `record_mirror` now removing
+  a superseded file only when it is unchanged (`installed_hash` + absolute path).
+- Suites: `sesync` **464 passed, 0 failed** (sandbox, then the live team env),
+  `sesync-conv` **70 passed, 0 failed**, `sh build-test.sh` green. New tests: buckets (2),
+  `mirror_stale` (3), mirror replace/keep (2), omp home-relative bucket through the real
+  converter (1).
+- Deployed and verified live: the heal re-imported 33 OpenCode sessions (44 → 77 rows in
+  `opencode.db`) and rewrote every affected omp/Pi mirror into the right bucket (claude
+  `660c446d…` now lives at `~/.omp/agent/sessions/-SkillsOutlie/…` and
+  `~/.pi/agent/sessions/--home-yocoms-SkillsOutlie-/…`).
+- Live-state note: every `chosen_targets` except the empty stub's had vanished from the live
+  state file; the writer could not be identified from the journal, and the current
+  `save_user` + `absorb_user_edits` merge cannot reproduce it. The choices were restored from
+  the surviving mirror records (38 sources) and the heal above is the result. If choices
+  vanish again, copy `~/.local/share/sesync/state.json` before touching anything.
+- Open from this (see the cleanup section above): the `aac4763c…` Test stub has no
+  user/assistant turn and can never convert — it shows `!` and backs off until it gets one;
+  `114272c2…` is no longer chosen. Four superseded files without records remain in the `--`
+  buckets, hidden via `mirror_keys`. Commit split still open.
+
+## 2026-10-18 — branch `session-keys`
+
+- HEAD `5e8b66e`. The tree carries uncommitted local-test work on top: TUI state
+  persistence, Ctrl+R local refresh, newest-first sessions, and the new tests below. Nothing
+  was pushed; do not assume HEAD describes the tree.
+- Suites, last run with the live team environment:
+  - `sesync`: **464 passed, 0 failed** (456 at the time of this section; 464 after the
+    evening mirror-bucket work)
+  - `sesync-team`: **199 passed, 0 failed**
+  - live env used: `TEAM_TEST_PG=postgres://postgres:test@127.0.0.1:55437/postgres`,
+    `TEAM_SERVER_BIN=/tmp/opencode/target-e2e/debug/team-server`, `TEAM_REQUIRE_PG=1`.
+- Orientation layer added: `AGENTS.md` (rules, test commands, invariants, recipes),
+  `docs/ARCHITECTURE.md` (design, wire formats, routes, persistence), this file, grouped
+  module lists in both `lib.rs` files, and an updated README layout.
+- What just landed (all in the working tree):
+  - **One team config dir**: join, renew, the admin commands, the TUI and the daemon all use
+    `SESYNC_CONFIG_DIR` (default `~/.config/sesync`). Before this, `team join` wrote where the
+    daemon did not look.
+  - **Trust**: pinned admin key + signed list stored at join; every seal/open re-verifies;
+    `/admin/devices` and `/admin/forget` added; publish signs the enrolled devices; forget
+    kills the token immediately.
+  - **Record v2 (`SR2`)**: author + list version + sequence + space + conversation are signed;
+    sequence is the lease version; body AEAD is bound to the same `(space, conv, seq)`; v1 is
+    refused. The server requires the record sequence to equal the granted lease version.
+  - **Rollback floors**: `State::team_seen` records the highest accepted sequence per
+    conversation and only rises; a lower record is dropped as rolled back.
+  - **Lease fixes**: versions survive release; after a restart the counter continues from the
+    stored record's sequence.
+  - **Compression**: zstd before encryption with a codec byte, stored when smaller, 64 MiB cap.
+  - **Incremental pull**: `/sessions` advertises record sequences; the client skips a fetch
+    only when its persisted floor already covers it.
+  - **Team loop**: marked sessions, 120 s quiet (`SESYNC_TEAM_QUIET`), canonical omp journal
+    for every harness (OpenCode included), plaintext hash idempotency, poll backoff to 60 s.
+  - **Mirroring**: `chosen_targets` (empty means no writes), one writer (`mirror_write`),
+    per-session menu (Rename / Mark / Mirror / Delete) and a multi-select harness picker.
+  - **Sessions table**: TEAM / LAST SYNC / NEXT / MIRRORS / UPDATED columns; OpenCode titles
+    now come from the scan-recorded title.
+  - **Coverage**: a live test now runs the real `sesync --watch` loop (push, then pull and
+    floor raise), and a PTY test drives Enter → session menu → mirror picker → confirm, then
+    a real `--once` pass that must write only the chosen harness.
+  - **Local correctness (this session)**: the TUI persists its state when a key changes a
+    choice (mirror targets, marks — see the lag fix below; before that it saved after every
+    key); Ctrl+R on the Sessions tab re-lists in place and
+    keeps the cursor (the Team tab still asks for a pull); an explicitly chosen mirror
+    bypasses the 14-day age window; the sessions list sorts newest first.
+  - **OpenCode as a mirror source**: an OpenCode session can now be mirrored into omp, Pi or
+    Claude. The daemon exports it (`opencode export`), converts once (`from-opencode`) and
+    installs the same journal into every chosen target; a pending choice also outranks the
+    age window, like file sources. Covered end to end with a fake CLI (no harness binary is
+    ever run in tests).
+  - **OpenCode as a mirror target** (session-migrate's import-bundle approach, strengthened):
+    `sesync-conv to-opencode` writes the official bundle and `install::install_opencode` runs
+    `opencode import` under the conversation's own directory. Upstream's importer
+    conflict-ignores existing message ids, so the writer deletes the deterministic mirror
+    session id first (`opencode session delete`) — a refresh replaces the session instead of
+    mixing old and new turns. The deterministic id (`mirror::mirror_opencode_id`) and the
+    delete-first rule are this repo's improvement over session-migrate's one-shot, new-id
+    migration. The TUI offers `opencode` only when the CLI is on PATH; the mirror record
+    carries the session id (not a file) and `mirror_cleanup` keeps it (remove through
+    OpenCode).
+  - **Claude-source conversion fix**: a Claude transcript is now converted
+    (`from-claude`) before any target converter sees it. Raw transcripts used to be copied
+    through verbatim, so a Claude session chosen into Pi/omp produced a file in the other
+    harness's store that was never a journal. Covered by
+    `opencode_target::a_claude_source_is_converted_to_a_real_journal_for_the_pi_mirror`.
+  - **State ownership**: the daemon and the TUI now share state.json safely. The daemon
+    adopts user-owned fields (marks, chosen targets) before every pass and again before
+    saving; the TUI saves only those fields over the file the daemon wrote, and absorbs the
+    daemon's mirrors/floors about once a second. Before this, a running daemon overwrote a
+    TUI choice within one pass — the reported "configured it, nothing happened" bug. A live
+    test starts a real `--watch` daemon, saves a choice from outside, and requires the mirror;
+    removing the merge makes it fail.
+  - **New tests**: harness-side renames are read and TUI renames are written for omp, Pi and
+    Claude (manage); Ctrl+R picks up a Claude-side rename (app); an omp rename reaches the
+    Pi mirror on the very next pass (cli); the live two-device team test now proves a
+    rename reaches the other device at the next sequence and raises its floor; the OpenCode
+    target delete/import/refresh order is driven by a fake CLI (`opencode_target`); the real
+    CLI path (gated on `HS_E2E=1`) re-imports under the same id and asserts the old turns are
+    gone (`opencode_install`).
+
+## 2026-10-18 — Gemini CLI wiring (same branch)
+
+- `session-migrate` has no Gemini CLI adapter (its Google support is Antigravity only); the
+  converters were already ours (`from_gemini`/`to_gemini`, validated against Gemini CLI
+  0.64.0). This session wired them into the daemon.
+- Converter: `to-gemini` resolves the project slug exactly as Gemini does — registry reuse
+  (`projects.json`), else the `.project_root` marker, else slugify-with-suffixes — and
+  `--project` is now optional (journal header `cwd` fallback). The file name is deterministic
+  (`session-<stamp>-<short>.jsonl`), older files for the same mirror id are removed, and the
+  write is tmp+rename. New unit tests for `normalize_root`/`slugify`/`resolve_slug`.
+- Daemon: Gemini is a source (`discovery::gemini_sessions` in `scan`, `gemini_title_from_lines`)
+  and a mirror target (`install::install_gemini`, `Stores.gemini`, the raw-source guard now
+  covers gemini, picker probe `GEMINI_CLI_HOME`). The mirror path **is** recorded in
+  `mirror_keys` because the Gemini store is also scanned for sources (unlike OpenCode's id).
+  Manage lists, titles and rename (`$set.summary`) handle gemini. A Gemini source converted to
+  the team copy via `Canonical::Gemini` (`from-gemini`).
+- Tests: `gemini_target` (install + registry + marker + mirror_keys + refresh-in-place;
+  source→pi round trip), gemini title cases, picker case, raw-source guard case. Two tests that
+  used `gemini` as the *unknown* harness/target now use `cursor`/`windsurf` (gemini became
+  known); assertions unchanged.
+- Suites: `sesync` **448 passed, 0 failed** (live team env), `sesync-conv` **70 passed,
+  0 failed**.
+- Deployed locally: `~/.local/bin/sesync` and `~/.local/bin/sesync-conv` reinstalled from this
+  tree, `sesync.service` restarted (backups: `sesync.prev-gemini`, `sesync-conv.prev-gemini`).
+- TUI mirror picker now shows a glyph before each harness name (`ui.rs::harness_icon`):
+  ✶ claude · ✦ gemini · Ω omp · ◉ opencode · π pi. The PTY test asserts `[x] π pi` and
+  `[x] ✶ claude` on screen. Note: one full-suite run showed a one-off flake in
+  `team_sync::an_opencode_session_becomes_a_journal_the_team_can_install` (unreproduced in
+  15 retries and two further full runs; the panic message was not captured).
+
+## 2026-10-18 — TUI lag fix (same branch)
+
+- Reported: the TUI felt laggy; Down took time to move to the next session. Cause: the list
+  refresh read every session file **whole** (`manage::session_title` →
+  `fs::read_to_string`) — Claude transcripts reach hundreds of megabytes — and the TUI ran
+  that refresh once a second while idle. Each keypress also loaded, absorbed and re-saved the
+  whole state file, so even an idle keystroke paid a JSON round-trip.
+- Fixes:
+  - `titles::read_title_text`: files over 256 KiB are titled from a 64 KiB head + 64 KiB
+    tail window, cut at whole lines (titles live in the first records — headers, ai-title —
+    or the last — Pi/omp renames, Claude custom-title, Gemini summary). Used by `manage` and
+    by the daemon's `scan`. Smaller files are still read whole.
+  - `manage::TitleCache`: titles cached by (size, mtime); a re-list skips unchanged files.
+    The TUI keeps one cache for its lifetime (`list_groups_cached`; `list_groups` stays the
+    throwaway-cache wrapper for one-off callers).
+  - `run_tui` (bin): the state file is stat'ed on each 200 ms tick; `State::load` + absorb +
+    `refresh_rows` run only when (mtime, size) changed, so an idle second costs one stat.
+    State is saved only after a key that changed a user field (`App::take_user_dirty`),
+    not after every keypress.
+- Tests: `big_transcripts_are_titled_from_their_head_or_tail` (files past the whole-read
+  limit, title at head and at tail), `the_title_cache_re_reads_a_file_only_when_it_changed`,
+  `only_a_key_that_changes_a_choice_marks_state_for_saving`.
+- Suites: `sesync` **451 passed, 0 failed** (sandbox and live team env), `sh build-test.sh`
+  all passed. Deployed: `~/.local/bin/sesync` reinstalled (backup `sesync.prev-lag`),
+  `sesync.service` restarted. A running TUI must be restarted to pick up the new binary.
+
+## 2026-10-18 — mirror failures visible and bounded (same branch)
+
+- Reported: a Claude session mirrored into omp never appeared, and the TUI showed nothing.
+  The daemon log showed the real path: the chosen transcript is a 6-line **stub** (system /
+  mode / permission-mode / last-prompt / custom-title, no user or assistant turn) that the
+  TUI listed like any session; `sesync-conv from-claude` correctly refuses it, the write
+  failed, and the daemon retried every 5 s forever (`failures` went up, but nothing used it).
+  The TUI had no way to show a chosen-but-unwritten target, so the failure was invisible.
+- Fixes:
+  - `from_claude` now skips and counts unparseable lines (`stats.skipped_bad_lines`, reported
+    on stderr) instead of failing the whole conversion — matching `from_gemini`. A truncated
+    line in a real transcript must not lose the session. (Survey note: the operator's store
+    currently has **no** unparseable lines; the 6-line stub has simply no turns and still
+    refuses, which is correct.)
+  - Retry backoff: `scan::mirror_retry_due` + `scan::mirror_demand`. A chosen target with no
+    mirror forces a pass, but after failures the wait is the quiet period, doubling to 10 min
+    (`Source::last_failure`, new state field, additive). A content change (`hash_changed`)
+    still retries at once; a fully successful pass clears `failures`/`last_failure`
+    (`pass::run_pass` and `bin/sesync.rs::sync_chosen` both record and clear).
+  - MIRRORS column: a chosen target with no file shows `pi?` (pending) or `pi!` (last write
+    failing) (`app::session_cols`), so a broken mirror can be seen and unticked.
+- Tests: `from_claude::unparseable_lines_are_skipped_and_counted`, the retry/demand unit tests
+  in `scan` (`a_backing_off_missing_mirror_does_not_keep_the_source_due`,
+  `a_mirror_for_an_unchosen_target_does_not_satisfy_a_missing_choice`), `state` round trip of
+  `last_failure`, and `session_menu::a_chosen_mirror_with_no_file_yet_is_marked_pending_or_failed`.
+- Suites: `sesync` **456 passed, 0 failed** (sandbox and live team env), `sesync-conv`
+  **70 passed, 0 failed**, `sh build-test.sh` all passed. Deployed: `sesync` and
+  `sesync-conv` reinstalled, `sesync.service` restarted; verified live that the failing stub
+  is attempted once and then backs off (1 attempt in the first minute, next due after 10 min).
+- Note for the operator: the stub's omp choice is still recorded (it will retry every
+  10 min and show `omp!`). Open its options and untick omp, or pick the real session from
+  the list; a running TUI must be restarted to load this build.
+
+## Deployment
+
+- Homelab `team-server` (namespace `team`, ArgoCD app `team-server`) now runs image
+  `192.168.100.178:30950/yocoms/team-server:5e8b66e` (digest `a3d0da5…`), rolled out via
+  hlgit commits `edefa92` + `fe37290` (admin token SealedSecret). `/healthz` is 200, the new
+  tables exist, the admin routes answer; the DB is empty (no space yet).
+- `~/.local/bin/sesync` and `sesync-conv` are reinstalled from the current tree;
+  `sesync.service` is active (latest reinstall for the full-background themes, backup
+  `sesync.prev-themes`; earlier: 20:0x `sesync.prev-bar`, 19:51 `sesync.prev-qol`,
+  18:43 `sesync.prev-toolid` / `sesync-conv.prev-toolid`, 18:25 `sesync.prev-title`,
+  14:55 `sesync.prev-buckets`).
+  The admin token lives at `~/.config/sesync/admin.token` (0600); first space
+  creation needs the admin key and `SESYNC_ADMIN_TOKEN_FILE`.
+
+## Blocked / waiting
+
+- Commit split: the uncommitted work needs an operator-approved set of commits before a
+  deploy tag can point at a real revision.
+- Plaintext `/record` and `/record/read` routes still exist for legacy tests
+  (`http_flow`, `large_session`, `socket`, `push_e2e`); clients no longer use them.
+- The live team suite is not in CI (needs Postgres + a built `team-server`).
+- `team-backup` timer still needs approval; `sesync.service` disable decision is open.
+- Share/retract UI actions are still disabled (no server path yet).
+
+## Structural debt (next model, read this)
+
+- `sesync/src/bin/sesync.rs` (~960 lines) mixes argument dispatch, environment loading, the
+  daemon loop, the TUI launcher and the team CLI. Split it into focused modules when it is
+  next touched; do not grow it.
+- `sesync/src/app.rs` (~1670 lines) holds every TUI mode and handler. New modes should go in
+  their own module once they need more than a screen of code; the QoL batch grew it further.
+- `team_pull`, `team_conflict` and `divergence` are test-only; delete them or revive them
+  deliberately, but do not add callers without a decision.
+- The plaintext `/record` routes exist only for old tests; remove them together with the test
+  rework, not piecemeal.
+
+## Next action
+
+1. Operator: restart any running TUI (`q`, then `sesync --tui`) — everything above (the QoL
+   batch) is only in the 19:51 binary; the title/tool-id fixes are in the 18:43 one. Reopen the
+   `tileCoder35b` session in Claude to re-read the healed mirror (tool calls now render).
+   Restart opencode too, its config now
+   pins the subagents to `opencode/deepseek-v4.1-flash-free`.
+2. Operator decisions still open: commit split of the uncommitted tree (now including the
+   Gemini wiring), `sesync.service` enablement, plaintext route removal, lockstep client
+   update on the other machines.
+3. Optional follow-up: Antigravity (`~/.gemini/antigravity-cli/conversations/<uuid>.db`,
+   SQLite) as another target; its format is documented in session-migrate's
+   `docs/antigravity-format.md`.

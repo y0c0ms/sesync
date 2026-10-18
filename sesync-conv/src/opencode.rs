@@ -3,8 +3,11 @@
 //! The bundle is the exact JSON `opencode export` prints and `opencode import`
 //! consumes: `{ info: Session, messages: [{ info: Message, parts: [Part] }] }`.
 //! Shapes below were copied from a native 1.18.16 export on 2026-10-12.
-//! `opencode import` upserts by `info.id`, so a deterministic session id
-//! makes re-import an update instead of a duplicate.
+//! `opencode import` updates the session row in place by `info.id`, but message
+//! and part inserts are conflict-ignore (upstream `cli/cmd/import.ts`), so a
+//! re-import alone does NOT replace the conversation: the caller must delete the
+//! session first. Deterministic ids make that delete-then-import replace the
+//! same mirror every time instead of leaving duplicates.
 //!
 //! Mapping:
 //!   journal user msg        -> message{role:user} + text parts (+ file parts for images)

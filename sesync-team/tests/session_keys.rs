@@ -2,7 +2,7 @@
 //! each active device. Only a listed device can unwrap it. A device that is not listed gets
 //! nothing it can use, and a wrapped key cannot be altered without detection.
 use sesync_team::membership::Device;
-use sesync_team::session_keys::{open_session, seal_session, unwrap_for, wrap_for, DataKey, WrapError};
+use sesync_team::session_keys::{open_session_bound, seal_session_bound, session_aad, unwrap_for, wrap_for, DataKey, WrapError};
 
 fn fresh_devices(n: usize) -> Vec<Device> { (0..n).map(|_| Device::generate()).collect() }
 
@@ -12,10 +12,11 @@ fn a_session_opens_for_every_listed_device() {
     let pubs: Vec<Vec<u8>> = devs.iter().map(|d| d.box_public()).collect();
     let key = DataKey::random();
     let wraps = wrap_for(&key, &pubs).unwrap();
-    let sealed = seal_session(&key, b"session text").unwrap();
+    let aad = session_aad("personal", "ses_1", 1);
+    let sealed = seal_session_bound(&key, &aad, b"session text").unwrap();
     for d in &devs {
         let k = unwrap_for(d, &wraps).expect("a listed device unwraps");
-        assert_eq!(open_session(&k, &sealed).unwrap(), b"session text");
+        assert_eq!(open_session_bound(&k, &aad, &sealed).unwrap(), b"session text");
     }
 }
 
@@ -50,6 +51,26 @@ fn each_session_gets_its_own_key() {
 fn a_session_does_not_open_under_another_session_key() {
     let a = DataKey::random();
     let b = DataKey::random();
-    let sealed = seal_session(&a, b"private").unwrap();
-    assert!(open_session(&b, &sealed).is_err());
+    let aad = session_aad("personal", "ses_1", 1);
+    let sealed = seal_session_bound(&a, &aad, b"private").unwrap();
+    assert!(open_session_bound(&b, &aad, &sealed).is_err());
+}
+
+#[test]
+fn a_session_does_not_open_under_different_associated_data() {
+    // The session is bound to its space, conversation and sequence. Moving it to any other
+    // binding, even with the right key, must fail.
+    let key = DataKey::random();
+    let sealed = seal_session_bound(&key, &session_aad("personal", "ses_1", 1), b"bound text").unwrap();
+    assert_eq!(open_session_bound(&key, &session_aad("personal", "ses_1", 1), &sealed).unwrap(), b"bound text");
+    assert!(open_session_bound(&key, &session_aad("team-b", "ses_1", 1), &sealed).is_err(), "another space");
+    assert!(open_session_bound(&key, &session_aad("personal", "ses_2", 1), &sealed).is_err(), "another conversation");
+    assert!(open_session_bound(&key, &session_aad("personal", "ses_1", 2), &sealed).is_err(), "another sequence");
+    assert!(open_session_bound(&key, b"", &sealed).is_err(), "no associated data");
+}
+
+#[test]
+fn session_aad_length_prefixes_so_names_cannot_shift_into_each_other() {
+    // ("ab", "c") and ("a", "bc") must not produce the same associated data.
+    assert_ne!(session_aad("ab", "c", 1), session_aad("a", "bc", 1));
 }

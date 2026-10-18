@@ -42,12 +42,9 @@ pub fn install_journal(
     let out_dir = scratch.join(sub);
     let mut cmd = Command::new(sesync_conv);
     cmd.arg(verb).arg(src).arg("--out-dir").arg(&out_dir).args(&extra);
-    // to-claude takes no title; every other target gets --id and --title.
-    if verb == "to-claude" {
-        cmd.args(["--id", mirror_id]);
-    } else {
-        cmd.args(["--id", mirror_id, "--title", title]);
-    }
+    // The mirror id names the file; --title carries the conversation name
+    // (to-claude writes it as the custom-title record Claude labels the session by).
+    cmd.args(["--id", mirror_id, "--title", title]);
     let out = cmd.output().map_err(|e| format!("cannot run sesync-conv: {e}"))?;
     if !out.status.success() {
         let _ = fs::remove_dir_all(&scratch);
@@ -82,10 +79,43 @@ pub fn install_journal(
     Ok(dest)
 }
 
+/// Install an omp/Pi journal as a Gemini CLI session. `sesync-conv to-gemini` writes the
+/// session file under the project's own slug (the one Gemini registered, or the one it would
+/// generate) and registers the project in `projects.json` with a `.project_root` marker, so
+/// `gemini --list-sessions` finds the session. There is no delete-first step: one conversation
+/// keeps one deterministic file name, and the write is atomic, so a refresh replaces it in
+/// place. Returns the installed file, taken from the printed path.
+pub fn install_gemini(
+    sesync_conv: &Path,
+    src: &Path,
+    gemini_dir: &Path,
+    mirror_id: &str,
+) -> Result<PathBuf, String> {
+    let out = Command::new(sesync_conv)
+        .arg("to-gemini").arg(src)
+        .arg("--gemini-dir").arg(gemini_dir)
+        .args(["--id", mirror_id])
+        .output()
+        .map_err(|e| format!("cannot run sesync-conv: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sesync-conv to-gemini failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let produced = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let produced = PathBuf::from(produced.lines().last().unwrap_or("").trim());
+    if !produced.is_file() {
+        return Err(format!("sesync-conv printed no output file: {}", produced.display()));
+    }
+    Ok(produced)
+}
+
 /// Install an omp/Pi journal as an O-penCode session. Ported from install_opencode:
-/// `sesync-conv to-opencode` writes a bundle, then `opencode import` loads it. The import
-/// must print "Imported session" or it is not counted as installed. `env_home` is
-/// applied to the CLI's XDG_* variables so tests can point it at a sandbox.
+/// `sesync-conv to-opencode` writes a bundle, then `opencode import` loads it. Any previous
+/// import of the same mirror id is deleted first, because `opencode import` only upserts the
+/// session row and conflict-ignores message ids: without the delete a refresh would keep the
+/// old turns and pile the new ones on top. The import runs in the conversation's directory
+/// (from `cwd`, else the directory recorded in the bundle) so the session lands in the right
+/// project. `env_xdg` points the CLI's XDG_* variables at a sandbox; `None` inherits the real
+/// environment. The import must print "Imported session" or it is not counted as installed.
 pub fn install_opencode(
     opencode: &Path,
     sesync_conv: &Path,
@@ -93,9 +123,8 @@ pub fn install_opencode(
     cwd: &str,
     mirror_id: &str,
     title: &str,
-    env_home: &Path,
+    env_xdg: Option<&Path>,
 ) -> Result<String, String> {
-    let _ = cwd;
     let scratch = std::env::temp_dir().join(format!("hs-oc-install-{}-{mirror_id}", std::process::id()));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
@@ -112,12 +141,41 @@ pub fn install_opencode(
         return Err(format!("sesync-conv to-opencode failed: {}", String::from_utf8_lossy(&conv.stderr).trim()));
     }
 
+    // Where the import runs decides the project and directory OpenCode stores the session
+    // under. Prefer the conversation's own directory when it still exists, then the bundle's.
+    let bundle_dir = fs::read_to_string(&bundle).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["info"]["directory"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let dir = if Path::new(cwd).is_dir() { cwd.to_string() } else { bundle_dir };
+    let workdir = if Path::new(&dir).is_dir() { Some(PathBuf::from(dir)) } else { None };
+
+    // Delete the previous import of this mirror. A missing session is the normal first
+    // write and is ignored; any other delete failure surfaces on the import below.
+    let mut del = Command::new(opencode);
+    del.args(["session", "delete", mirror_id]);
+    if let Some(w) = &workdir {
+        del.current_dir(w);
+    }
+    if let Some(x) = env_xdg {
+        del.env("XDG_DATA_HOME", x.join("data"))
+            .env("XDG_CONFIG_HOME", x.join("cfg"))
+            .env("XDG_STATE_HOME", x.join("state"))
+            .env("XDG_CACHE_HOME", x.join("cache"));
+    }
+    let _ = del.output();
+
     let mut cmd = Command::new(opencode);
-    cmd.arg("import").arg(&bundle)
-        .env("XDG_DATA_HOME", env_home.join("data"))
-        .env("XDG_CONFIG_HOME", env_home.join("cfg"))
-        .env("XDG_STATE_HOME", env_home.join("state"))
-        .env("XDG_CACHE_HOME", env_home.join("cache"));
+    cmd.arg("import").arg(&bundle);
+    if let Some(w) = &workdir {
+        cmd.current_dir(w);
+    }
+    if let Some(x) = env_xdg {
+        cmd.env("XDG_DATA_HOME", x.join("data"))
+            .env("XDG_CONFIG_HOME", x.join("cfg"))
+            .env("XDG_STATE_HOME", x.join("state"))
+            .env("XDG_CACHE_HOME", x.join("cache"));
+    }
     let imp = cmd.output().map_err(|e| format!("cannot run opencode import: {e}"))?;
     let _ = fs::remove_dir_all(&scratch);
     let stdout = String::from_utf8_lossy(&imp.stdout);

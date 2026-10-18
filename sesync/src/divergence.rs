@@ -33,6 +33,16 @@ pub fn fingerprint(path: &Path) -> String {
     }
 }
 
+/// The file's mtime in seconds since the epoch, 0.0 when it cannot be read.
+pub fn mtime_secs(path: &Path) -> f64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 /// Compare a mirror's current content with the fingerprint recorded at install.
 /// An empty recorded fingerprint means the mirror predates fingerprinting, so it
 /// cannot be shown untouched and is frozen.

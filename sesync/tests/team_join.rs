@@ -12,7 +12,8 @@ fn sandbox(name: &str) -> std::path::PathBuf {
 
 fn cred() -> Credential {
     Credential { space: "personal".into(), member: "member-box".into(), machine: "box-2".into(),
-                 token: "tok-0123456789abcdef0123456789abcdef".into() }
+                 token: "tok-0123456789abcdef0123456789abcdef".into(),
+                 admin_public: None, signed_list: None, list_version: None }
 }
 
 #[test]

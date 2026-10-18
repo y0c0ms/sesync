@@ -12,6 +12,7 @@ fn app_with_one_session(root: &PathBuf) -> App {
         omp: root.join("omp").join("sessions"),
         pi: root.join("pi").join("sessions"),
         claude: root.join("claude").join("projects"),
+        gemini: root.join("gemini").join("tmp"),
     };
     let dir = root.join("omp").join("sessions").join("proj");
     std::fs::create_dir_all(&dir).unwrap();

@@ -1,6 +1,9 @@
 //! The HTTP layer's auth rules, tested on the handler functions without a socket.
 //! Every route except /enrol needs a bearer token bound to the requesting machine.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use sesync_team::http::{self, EnrolBody, LeaseBody};
 use sesync_team::service::{MemoryStore, Service};
 use sesync_team::totp::code_at;
@@ -24,7 +27,7 @@ fn enrol_with_the_right_code_returns_a_token_and_lifetime() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code };
+    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code, device: None };
     let (status, json) = http::enrol(&mut s, &body, T0);
     assert_eq!(status, 200);
     assert!(json["token"].as_str().unwrap().len() > 10);
@@ -35,7 +38,7 @@ fn enrol_with_the_right_code_returns_a_token_and_lifetime() {
 fn enrol_with_a_wrong_code_is_401_and_issues_nothing() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
-    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code: "000000".into() };
+    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code: "000000".into(), device: None };
     let (status, json) = http::enrol(&mut s, &body, T0);
     assert_eq!(status, 401);
     assert!(json.get("token").is_none());
@@ -129,30 +132,8 @@ fn health_is_200_when_the_store_answers() {
 #[test]
 fn health_is_503_when_the_store_does_not_answer() {
     use sesync_team::http::health;
-    use sesync_team::service::Store;
-    struct Down(MemoryStore);
-    impl Store for Down {
-        fn load_space(&self, n: &str) -> Option<sesync_team::spaces::Space> { self.0.load_space(n) }
-        fn save_space(&mut self, s: sesync_team::spaces::Space) { self.0.save_space(s) }
-        fn record(&self, s: &str, c: &str) -> Option<Vec<u8>> { self.0.record(s, c) }
-        fn put_record(&mut self, s: &str, c: &str, v: Vec<u8>) { self.0.put_record(s, c, v) }
-        fn list_conversations(&self, s: &str) -> Vec<String> { self.0.list_conversations(s) }
-        fn load_gate(&self, s: &str, m: &str) -> Option<sesync_team::totp::JoinGate> { self.0.load_gate(s, m) }
-        fn save_gate(&mut self, s: &str, m: &str, g: sesync_team::totp::JoinGate) { self.0.save_gate(s, m, g) }
-        fn load_backup(&self, s: &str) -> Option<sesync_team::backup::BackupPolicy> { self.0.load_backup(s) }
-        fn save_backup(&mut self, s: &str, p: sesync_team::backup::BackupPolicy) { self.0.save_backup(s, p) }
-        fn load_token_key(&self, s: &str) -> Option<[u8; 32]> { self.0.load_token_key(s) }
-        fn load_owner(&self, s: &str, m: &str) -> Option<String> { self.0.load_owner(s, m) }
-        fn save_owner(&mut self, s: &str, m: &str, who: &str) { self.0.save_owner(s, m, who) }
-        fn load_enrolled_at(&self, s: &str, m: &str) -> Option<u64> { self.0.load_enrolled_at(s, m) }
-        fn save_enrolled_at(&mut self, s: &str, m: &str, at: u64) { self.0.save_enrolled_at(s, m, at) }
-        fn save_trust_list(&mut self, s: &str, b: Vec<u8>) { self.0.save_trust_list(s, b) }
-        fn load_trust_list(&self, s: &str) -> Option<Vec<u8>> { self.0.load_trust_list(s) }
-        fn save_admin_key(&mut self, s: &str, k: Vec<u8>) { self.0.save_admin_key(s, k) }
-        fn load_admin_key(&self, s: &str) -> Option<Vec<u8>> { self.0.load_admin_key(s) }
-        fn ping(&self) -> bool { false }
-    }
-    let s = Service::new(Down(MemoryStore::default()));
+    use sesync_team::service::Service;
+    let s = Service::new(common::TestStore::database_down());
     let (status, json) = health(&s);
     assert_eq!(status, 503, "a dead database must fail the health check");
     assert!(!json.to_string().contains("password"), "the health reply carries no connection detail");

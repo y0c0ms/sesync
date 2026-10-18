@@ -224,10 +224,17 @@ impl Verifier {
 /// the device first. Ten minutes: a join is a short hand-over, not a standing grant.
 pub const JOIN_WINDOW_SECS: u64 = 10 * 60;
 
-/// A new device asks to join: its entry (signing and box keys), and, once a member approves, the
-/// approver's signature over the entry and the approval time.
+/// How far ahead of the checking clock an approval's signed time may be. Five minutes: enough for
+/// ordinary clock drift between two machines, too little for an approval dated far in the future
+/// to stay valid for longer than the window it was meant to have.
+pub const JOIN_SKEW_SECS: u64 = 5 * 60;
+
+/// A new device asks to join a space: its entry (signing and box keys), and, once a member
+/// approves, the approver's signature over the space, the entry and the approval time.
 #[derive(Clone, Debug)]
 pub struct Join {
+    /// The space the device asks to join. Signed by the approver, so it cannot be changed.
+    pub space: String,
     pub request: Vec<u8>,
     pub approver: Option<Vec<u8>>,
     pub approval: Option<Vec<u8>>,
@@ -241,22 +248,32 @@ pub enum JoinError {
     NotApproved,
     /// The approver is not in the current member list.
     ApproverNotMember,
-    /// The approval does not verify over this request and time.
+    /// The approval does not verify over this space, request and time.
     BadApproval,
     /// The join window has passed.
     Expired,
+    /// The approval was made for a different space, so it cannot admit a device here.
+    WrongSpace,
+    /// The approval is dated more than JOIN_SKEW_SECS after the time it is checked at.
+    ClockSkew,
 }
 
 impl Join {
-    /// A device asks to join. The request is its own entry, not signed yet.
-    pub fn request(device: &Device) -> Join {
-        Join { request: device_entry(device), approver: None, approval: None, approved_at: None }
+    /// A device asks to join `space`. The request is its own entry, not signed yet.
+    pub fn request(space: &str, device: &Device) -> Join {
+        Join {
+            space: space.to_string(),
+            request: device_entry(device),
+            approver: None,
+            approval: None,
+            approved_at: None,
+        }
     }
 
-    /// A current member approves this exact request at `now`. The approval signs the request and
-    /// the time, so neither can be changed.
+    /// A current member approves this exact request for its space at `now`. The approval signs the
+    /// space, the request and the time, so none of them can be changed.
     pub fn approve(mut self, member: &Device, now: u64) -> Join {
-        let approval = member.sign(&join_message(&self.request, now));
+        let approval = member.sign(&join_message(&self.space, &self.request, now));
         self.approver = Some(member.public_key());
         self.approval = Some(approval);
         self.approved_at = Some(now);
@@ -264,30 +281,40 @@ impl Join {
     }
 }
 
-/// What a member signs when it approves: a fixed label, the request entry and the approval time.
-fn join_message(request: &[u8], at: u64) -> Vec<u8> {
-    let mut m = b"sesync join v1".to_vec();
+/// What a member signs when it approves: a fixed label, the space name (length-prefixed), the
+/// approval time and the request entry.
+fn join_message(space: &str, request: &[u8], at: u64) -> Vec<u8> {
+    let mut m = b"sesync join v2".to_vec();
+    m.extend_from_slice(&(space.len() as u64).to_be_bytes());
+    m.extend_from_slice(space.as_bytes());
     m.extend_from_slice(&at.to_be_bytes());
     m.extend_from_slice(request);
     m
 }
 
 impl Verifier {
-    /// Admit a device if a current member approved its request within the join window at `now`.
-    /// A join never removes anyone. An admitted join lapses after JOIN_WINDOW_SECS unless the
-    /// admin's signed list includes the device, which confirms it.
-    pub fn admit_at(&mut self, join: &Join, now: u64) -> Result<(), JoinError> {
+    /// Admit a device to `space` if a current member approved its request for that space within the
+    /// join window at `now`. A join never removes anyone. An admitted join lapses after
+    /// JOIN_WINDOW_SECS unless the admin's signed list includes the device, which confirms it. An
+    /// approval dated more than JOIN_SKEW_SECS ahead of `now` is refused.
+    pub fn admit_at(&mut self, space: &str, join: &Join, now: u64) -> Result<(), JoinError> {
         let (approver, approval, at) = match (&join.approver, &join.approval, join.approved_at) {
             (Some(a), Some(s), Some(t)) => (a, s, t),
             _ => return Err(JoinError::NotApproved),
         };
+        if join.space != space {
+            return Err(JoinError::WrongSpace);
+        }
+        if at > now.saturating_add(JOIN_SKEW_SECS) {
+            return Err(JoinError::ClockSkew);
+        }
         if now >= at + JOIN_WINDOW_SECS {
             return Err(JoinError::Expired);
         }
         if !self.is_member(approver) {
             return Err(JoinError::ApproverNotMember);
         }
-        if !Device::verify(approver, &join_message(&join.request, at), approval) {
+        if !Device::verify(approver, &join_message(&join.space, &join.request, at), approval) {
             return Err(JoinError::BadApproval);
         }
         self.pending.push(Pending { entry: join.request.clone(), expires_at: at + JOIN_WINDOW_SECS });
@@ -295,9 +322,9 @@ impl Verifier {
     }
 
     /// Admit with no clock: kept for callers that check the window themselves.
-    pub fn admit(&mut self, join: &Join) -> Result<(), JoinError> {
+    pub fn admit(&mut self, space: &str, join: &Join) -> Result<(), JoinError> {
         let at = join.approved_at.ok_or(JoinError::NotApproved)?;
-        self.admit_at(join, at)
+        self.admit_at(space, join, at)
     }
 
     /// Whether a device is a member at `now`: listed by the admin, or admitted by a join still in

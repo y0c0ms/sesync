@@ -22,6 +22,7 @@ fn app_with_one_session(sb: &PathBuf, title: &str) -> App {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     };
     let dir = roots.omp.join("-tmp");
     fs::create_dir_all(&dir).unwrap();
@@ -60,7 +61,12 @@ fn the_key_help_is_drawn() {
     let sb = sandbox("help");
     let app = app_with_one_session(&sb, "x");
     let s = screen(&app, 100, 12);
-    assert!(s.contains("ctrl+d") && s.contains("rename"), "the footer must show the keys:\n{s}");
+    assert!(s.contains("ctrl+p") && s.contains("quit"), "the footer must point at the command list:\n{s}");
+    // The keys themselves live in the command list the footer points at.
+    let mut list = app_with_one_session(&sb, "x");
+    list.handle(Ev::Enter, Instant::now());
+    let p = screen(&list, 100, 12);
+    assert!(p.contains("Rename") && p.contains("Delete"), "the command list must show the actions:\n{p}");
 }
 
 #[test]
@@ -79,4 +85,33 @@ fn rename_mode_shows_the_input_with_the_current_title() {
     app.handle(Ev::Char('r'), Instant::now());
     let s = screen(&app, 100, 12);
     assert!(s.contains("Rename") && s.contains("Current name"), "rename prompt must show the title:\n{s}");
+}
+
+#[test]
+fn the_bottom_rows_sit_on_the_theme_bar_not_the_page_background() {
+    let sb = sandbox("bar");
+    let mut a = app_with_one_session(&sb, "one");
+    a.set_status("some news");
+    let h = 12;
+    let w = 100;
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw(f, &a)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let bar = sesync::theme::by(&sesync::theme::DEFAULT).bar;
+    // A cell far beyond any text on the status row and on the footer row: both must carry the
+    // bar background, so the strip is visible even where nothing is written.
+    for y in [h - 2, h - 1] {
+        let cell = buf[(w - 5, y)].clone();
+        assert_eq!(cell.bg, bar, "row {y} must be the bar, not the page background");
+    }
+    assert_eq!(buf[(2, h - 2)].clone().fg, sesync::theme::by(sesync::theme::DEFAULT).text,
+        "the message is drawn on the bar");
+    // An error message keeps its colour on the bar.
+    a.set_error("refused: no");
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| draw(f, &a)).unwrap();
+    let buf = term.backend().buffer().clone();
+    assert_eq!(buf[(2, h - 2)].clone().fg, sesync::theme::by(sesync::theme::DEFAULT).error,
+        "a failure keeps the error colour on the bar");
+    let _ = fs::remove_dir_all(&sb);
 }

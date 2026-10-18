@@ -110,6 +110,7 @@ fn claude_resume_picker_shows_the_renamed_title() {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: cfg.join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     };
     fs::create_dir_all(&roots.omp).unwrap();
     fs::create_dir_all(&roots.pi).unwrap();

@@ -7,8 +7,8 @@ use sesync::state::{Mirror, Source, State};
 #[test]
 fn a_failing_source_does_not_stop_the_others() {
     let sources = vec![
-        PassSource { key: "bad".into(), title: "t".into() },
-        PassSource { key: "good".into(), title: "t".into() },
+        PassSource { key: "bad".into(), title: "t".into(), urgent: false },
+        PassSource { key: "good".into(), title: "t".into(), urgent: false },
     ];
     let mut state = State::default();
     state.sources.insert("bad".into(), Source::new("omp", "bad"));
@@ -24,7 +24,7 @@ fn a_failing_source_does_not_stop_the_others() {
 
 #[test]
 fn a_successful_source_does_not_count_a_failure() {
-    let sources = vec![PassSource { key: "ok".into(), title: "t".into() }];
+    let sources = vec![PassSource { key: "ok".into(), title: "t".into(), urgent: false }];
     let mut state = State::default();
     state.sources.insert("ok".into(), Source::new("omp", "ok"));
     run_pass(&mut state, &sources, |_| Ok(()));
@@ -37,7 +37,8 @@ fn status_lists_each_source_then_its_mirrors() {
     let mut src = Source::new("omp", "/x/2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     src.last_seen_change = 5.0;
     src.mirrors.insert("pi".into(), Mirror { target: "pi".into(), path: "/p/mirror.jsonl".into(),
-        source_hash: String::new(), installed_hash: String::new(), diverged: false });
+        source_hash: String::new(), installed_hash: String::new(), diverged: false,
+        edit_stamp: String::new(), target_updated: 0.0 });
     let key = "/x/2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl";
     state.sources.insert(key.into(), src);
     let text = format_status(&state);

@@ -1,4 +1,4 @@
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use crypto_box::{aead::OsRng, PublicKey, SecretKey};
 use ring::rand::SystemRandom;
@@ -62,22 +62,41 @@ pub fn unwrap_for(device: &Device, wraps: &[Wrap]) -> Result<DataKey, WrapError>
     Ok(DataKey(bytes))
 }
 
-/// Seal a session under its data key. Output: nonce || ciphertext-with-tag.
-pub fn seal_session(key: &DataKey, plain: &[u8]) -> Result<Vec<u8>, WrapError> {
+/// The associated data a session is sealed under: the space, the conversation and the sequence.
+/// Each text is length-prefixed, so two different bindings never share an encoding. A session
+/// sealed for one space, conversation or sequence does not open under another.
+pub fn session_aad(space: &str, conversation: &str, sequence: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + space.len() + conversation.len() + 8);
+    out.extend_from_slice(&(space.len() as u64).to_be_bytes());
+    out.extend_from_slice(space.as_bytes());
+    out.extend_from_slice(&(conversation.len() as u64).to_be_bytes());
+    out.extend_from_slice(conversation.as_bytes());
+    out.extend_from_slice(&sequence.to_be_bytes());
+    out
+}
+
+/// Seal a session under its data key, bound to `aad`. Output: nonce || ciphertext-with-tag. The
+/// tag covers `aad` without storing it, so the same `aad` must be given to `open_session_bound`.
+pub fn seal_session_bound(key: &DataKey, aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, WrapError> {
     let rng = SystemRandom::new();
     let mut nonce = [0u8; 12];
     ring::rand::SecureRandom::fill(&rng, &mut nonce).map_err(|_| WrapError::Failed)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
-    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plain).map_err(|_| WrapError::Failed)?;
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad })
+        .map_err(|_| WrapError::Failed)?;
     let mut out = nonce.to_vec();
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-/// Open a session sealed under `key`.
-pub fn open_session(key: &DataKey, sealed: &[u8]) -> Result<Vec<u8>, WrapError> {
+/// Open a session sealed under `key` and bound to `aad`. Fails if the key or the `aad` differ from
+/// the ones it was sealed with.
+pub fn open_session_bound(key: &DataKey, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, WrapError> {
     if sealed.len() < 12 { return Err(WrapError::Failed); }
     let (nonce, ct) = sealed.split_at(12);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
-    cipher.decrypt(Nonce::from_slice(nonce), ct).map_err(|_| WrapError::Failed)
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
+        .map_err(|_| WrapError::Failed)
 }
