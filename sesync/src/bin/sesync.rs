@@ -817,6 +817,7 @@ fn run_tui(
     loop {
         term.draw(|f| sesync::ui::draw(f, &app))?;
         if !event::poll(Duration::from_millis(200))? {
+            tr("poll timeout", &mut trace);
             // A running daemon writes mirrors and floors into the same file; take them in
             // about once a second so the table shows them without a keypress.
             if last_merge.elapsed() >= Duration::from_secs(1) {
@@ -833,7 +834,10 @@ fn run_tui(
             }
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            tr("poll non-key event", &mut trace);
+            continue;
+        };
         tr(&format!("key {} {:?}", key.code, key.modifiers), &mut trace);
         if key.kind != crossterm::event::KeyEventKind::Press {
             continue;
