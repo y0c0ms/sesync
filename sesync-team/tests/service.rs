@@ -123,7 +123,7 @@ fn http_enrol_and_acquire_return_the_right_status_codes() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
     let good = EnrolBody { space: "team-alpha".into(), member: "alice".into(), machine: "box-1".into(),
-                           code: code_at(&secret_of(&s, "team-alpha"), T0) };
+                           code: code_at(&secret_of(&s, "team-alpha"), T0), device: None };
     let (status, json) = enrol(&mut s, &good, T0);
     assert_eq!(status, 200);
     let header = format!("Bearer {}", json["token"].as_str().unwrap());

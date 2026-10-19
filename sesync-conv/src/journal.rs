@@ -86,9 +86,20 @@ impl Journal {
         self.header().and_then(|h| h.get("timestamp")).and_then(Value::as_str)
     }
 
-    /// Display title: the slot (omp), else the last `session_info` name (Pi),
+    /// Display title: the last `title_change` (a rename made inside omp; omp
+    /// overlays it over the slot on read, and the slot can lag behind until omp
+    /// saves again), else the slot (omp), else the last `session_info` name (Pi),
     /// else the header title, else the first user line.
     pub fn title_text(&self) -> String {
+        for r in self.records.iter().rev() {
+            if r.get("type").and_then(Value::as_str) == Some("title_change") {
+                if let Some(n) = r.get("name").or(r.get("title")).and_then(Value::as_str) {
+                    if !n.trim().is_empty() {
+                        return n.trim().to_string();
+                    }
+                }
+            }
+        }
         if let Some(t) = self.title.as_ref().and_then(|t| t.get("title")).and_then(Value::as_str) {
             let t = t.trim();
             if !t.is_empty() {
@@ -97,7 +108,7 @@ impl Journal {
         }
         for r in self.records.iter().rev() {
             match r.get("type").and_then(Value::as_str) {
-                Some("session_info") | Some("title_change") => {
+                Some("session_info") => {
                     if let Some(n) = r.get("name").or(r.get("title")).and_then(Value::as_str) {
                         if !n.trim().is_empty() {
                             return n.trim().to_string();

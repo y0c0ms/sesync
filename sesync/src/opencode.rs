@@ -53,6 +53,11 @@ pub fn sessions(db: &Path) -> Vec<Session> {
     }
 }
 
+/// One row's last update, in seconds. 0.0 when the store or the row is unreadable.
+pub fn row_updated(db: &Path, session_id: &str) -> Option<f64> {
+    sessions(db).into_iter().find(|s| s.id == session_id).map(|s| s.updated)
+}
+
 /// The first real user prompt of a session: its first line, at most 80 characters.
 /// Text that starts with '<' is a command wrapper, not a prompt. Empty when none.
 pub fn first_prompt(db: &Path, session_id: &str) -> String {

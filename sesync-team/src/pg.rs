@@ -68,6 +68,10 @@ impl PgStore {
              CREATE TABLE IF NOT EXISTS owners (space TEXT NOT NULL, machine TEXT NOT NULL, member TEXT NOT NULL,
                  PRIMARY KEY (space, machine));
              CREATE TABLE IF NOT EXISTS enrolled (space TEXT NOT NULL, machine TEXT NOT NULL, at BIGINT NOT NULL,
+                 PRIMARY KEY (space, machine));
+             CREATE TABLE IF NOT EXISTS trust (space TEXT PRIMARY KEY, signed_list BYTEA NOT NULL);
+             CREATE TABLE IF NOT EXISTS admin_keys (space TEXT PRIMARY KEY, admin BYTEA NOT NULL);
+             CREATE TABLE IF NOT EXISTS devices (space TEXT NOT NULL, machine TEXT NOT NULL, entry BYTEA NOT NULL,
                  PRIMARY KEY (space, machine));",
         ).map_err(|e| match e.as_db_error() {
             Some(db) => format!("{}: {}", db.code().code(), db.message()),
@@ -119,6 +123,36 @@ impl Store for PgStore {
     fn record(&self, space: &str, conv: &str) -> Option<Vec<u8>> {
         self.ensure_connected();
         self.one_bytes("SELECT sealed FROM records WHERE space = $1 AND conversation = $2", &[&space, &conv])
+    }
+
+    fn save_trust_list(&mut self, space: &str, bytes: Vec<u8>) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "INSERT INTO trust (space, signed_list) VALUES ($1, $2)
+             ON CONFLICT (space) DO UPDATE SET signed_list = EXCLUDED.signed_list",
+            &[&space, &bytes]);
+    }
+
+    fn load_trust_list(&self, space: &str) -> Option<Vec<u8>> {
+        self.ensure_connected();
+        self.client.borrow_mut()
+            .query_opt("SELECT signed_list FROM trust WHERE space = $1", &[&space])
+            .ok().flatten().map(|r| r.get::<_, Vec<u8>>(0))
+    }
+
+    fn save_admin_key(&mut self, space: &str, key: Vec<u8>) {
+        self.ensure_connected();
+        // Pinned once: a later attempt to change the admin key is ignored.
+        let _ = self.client.borrow_mut().execute(
+            "INSERT INTO admin_keys (space, admin) VALUES ($1, $2) ON CONFLICT (space) DO NOTHING",
+            &[&space, &key]);
+    }
+
+    fn load_admin_key(&self, space: &str) -> Option<Vec<u8>> {
+        self.ensure_connected();
+        self.client.borrow_mut()
+            .query_opt("SELECT admin FROM admin_keys WHERE space = $1", &[&space])
+            .ok().flatten().map(|r| r.get::<_, Vec<u8>>(0))
     }
 
     fn ping(&self) -> bool {
@@ -202,6 +236,33 @@ impl Store for PgStore {
             "INSERT INTO owners (space, machine, member) VALUES ($1, $2, $3)
              ON CONFLICT (space, machine) DO UPDATE SET member = EXCLUDED.member",
             &[&space, &machine, &member]);
+    }
+
+    fn load_device(&self, space: &str, machine: &str) -> Option<Vec<u8>> {
+        self.ensure_connected();
+        self.client.borrow_mut()
+            .query_opt("SELECT entry FROM devices WHERE space = $1 AND machine = $2", &[&space, &machine])
+            .ok().flatten().map(|r| r.get::<_, Vec<u8>>(0))
+    }
+
+    fn save_device(&mut self, space: &str, machine: &str, entry: Vec<u8>) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "INSERT INTO devices (space, machine, entry) VALUES ($1, $2, $3)
+             ON CONFLICT (space, machine) DO UPDATE SET entry = EXCLUDED.entry",
+            &[&space, &machine, &entry]);
+    }
+    fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)> {
+        self.ensure_connected();
+        let rows = self.client.borrow_mut()
+            .query("SELECT machine, entry FROM devices WHERE space = $1 ORDER BY machine", &[&space])
+            .unwrap_or_default();
+        rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, Vec<u8>>(1))).collect()
+    }
+    fn remove_device(&mut self, space: &str, machine: &str) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "DELETE FROM devices WHERE space = $1 AND machine = $2", &[&space, &machine]);
     }
 
     fn load_token_key(&self, space: &str) -> Option<[u8; 32]> {

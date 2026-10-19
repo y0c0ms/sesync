@@ -2,7 +2,7 @@
 //! the write happens under the granted lease; the lease is always given back, even when the
 //! write fails; and a held conversation is refused without writing.
 use sesync::state::State;
-use sesync::team_push::{push_marked, PushError, TeamRemote};
+use sesync::team_push::{push_marked, push_marked_sealed, PushError, TeamRemote};
 use std::cell::RefCell;
 
 #[derive(Default)]
@@ -55,6 +55,27 @@ fn a_held_conversation_is_refused_and_nothing_is_written() {
     let r = push_marked(&marked("ses_1"), &f, "personal", "ses_1", b"x");
     assert_eq!(r, Err(PushError::Held));
     assert_eq!(*f.log.borrow(), vec!["acquire ses_1"], "no write and no release for a lease never granted");
+}
+
+#[test]
+fn the_seal_is_given_the_version_the_lease_granted_and_is_written_under_it() {
+    let f = Fake::default();
+    *f.acquire_result.borrow_mut() = Some(Ok(4));
+    let seen = std::cell::Cell::new(0u64);
+    push_marked_sealed(&marked("ses_1"), &f, "personal", "ses_1", |v| {
+        seen.set(v);
+        Ok(format!("sealed under {v}").into_bytes())
+    }).unwrap();
+    assert_eq!(seen.get(), 4, "the seal sees the granted version");
+    assert_eq!(*f.log.borrow(), vec!["acquire ses_1", "put ses_1 v4 14b", "release ses_1"]);
+}
+
+#[test]
+fn a_failed_seal_writes_nothing_and_still_releases_the_lease() {
+    let f = Fake::default();
+    let r = push_marked_sealed(&marked("ses_1"), &f, "personal", "ses_1", |_| Err("cannot seal".into()));
+    assert_eq!(r, Err(PushError::Refused("cannot seal".into())));
+    assert_eq!(*f.log.borrow(), vec!["acquire ses_1", "release ses_1"], "no write, and the lease is given back");
 }
 
 #[test]

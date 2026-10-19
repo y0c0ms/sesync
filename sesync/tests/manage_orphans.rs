@@ -20,6 +20,7 @@ fn roots(sb: &PathBuf) -> Roots {
         omp: sb.join("omp").join("sessions"),
         pi: sb.join("pi").join("sessions"),
         claude: sb.join("claude").join("projects"),
+        gemini: sb.join("gemini").join("tmp"),
     }
 }
 
@@ -35,6 +36,8 @@ fn a_source_in_state_with_no_file_is_listed_as_an_orphan_with_its_mirror() {
     src.mirrors.insert("pi".into(), Mirror {
         target: "pi".into(), path: mirror.display().to_string(),
         source_hash: String::new(), installed_hash: String::new(), diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
     });
     state.sources.insert(gone.display().to_string(), src);
 
@@ -127,4 +130,31 @@ fn deleting_a_session_leaves_its_subagent_transcripts_alone() {
     assert_eq!(fs::read_to_string(&a).unwrap(), "keep me", "a rename must not touch subagent files");
     sesync::manage::delete_group(&r, &g, &sb.join("locks"), &sb.join("no-sesync_lock")).unwrap();
     assert!(a.exists(), "deleting the session must not delete its subagent transcripts");
+}
+
+#[test]
+fn an_opencode_session_shows_its_recorded_title_not_its_id() {
+    // O-penCode sources are keyed by session id and have no file on disk. The name the daemon
+    // recorded at scan time is what the list must show.
+    let sb = sandbox("opencode-title");
+    let r = roots(&sb);
+    let mut state = State::default();
+    let mut src = Source::new("opencode", "ses_eb579e7e9ffefKdqb3YByMN2xG");
+    src.title = "Fixing sesync session failures and locked sessions".into();
+    state.sources.insert("ses_eb579e7e9ffefKdqb3YByMN2xG".into(), src);
+    let groups = list_groups(&r, &state);
+    let g = groups.iter().find(|g| g.key == "ses_eb579e7e9ffefKdqb3YByMN2xG").expect("listed");
+    assert_eq!(g.title, "Fixing sesync session failures and locked sessions");
+    assert!(!g.title.starts_with("ses_"), "the id must not be the visible name");
+}
+
+#[test]
+fn an_opencode_session_without_a_recorded_title_falls_back_to_its_id() {
+    let sb = sandbox("opencode-noname");
+    let r = roots(&sb);
+    let mut state = State::default();
+    state.sources.insert("ses_x".into(), Source::new("opencode", "ses_x"));
+    let groups = list_groups(&r, &state);
+    let g = groups.iter().find(|g| g.key == "ses_x").expect("listed");
+    assert_eq!(g.title, "ses_x", "with no recorded name, the id is the only honest label");
 }

@@ -5,6 +5,10 @@
 //! 0.64.0 in an isolated container (2026-10-16). Gemini finds a session through its project
 //! registry, not through the folder name, so the caller must also register the project
 //! (`projects.json` entry and a `.project_root` marker); `register_project` does that.
+//! The folder name (slug) must be the one Gemini itself would use: `resolve_slug` reuses the
+//! registered slug for the project, then finds it by marker, then falls back to Gemini's own
+//! `slugify` of the folder name with its `-1`, `-2` collision suffixes. Using a different slug
+//! would hide the user's native sessions for that project from `--list-sessions`.
 //!
 //! Mapping:
 //!   header                 -> {sessionId, projectHash, startTime, lastUpdated, kind:"main"}
@@ -180,6 +184,85 @@ pub fn register_project(gemini_dir: &std::path::Path, project_root: &str, slug: 
     Ok(())
 }
 
+/// The project root as Gemini's registry compares it: resolved, and without a trailing
+/// slash. Callers hand in already-absolute paths; a trailing slash is the one difference
+/// that would otherwise register the same project twice.
+pub fn normalize_root(project_root: &str) -> String {
+    let t = project_root.trim();
+    if t.len() > 1 { t.trim_end_matches('/').to_string() } else { t.to_string() }
+}
+
+/// Gemini's slug rule for a project folder (projectRegistry.ts `slugify`): lowercase,
+/// every run of characters outside [a-z0-9] becomes one '-', and leading/trailing '-'
+/// are dropped. An empty result becomes "project".
+pub fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() { "project".into() } else { out }
+}
+
+/// The slug Gemini uses for this project, without creating anything. Precedence:
+/// the `projects.json` entry for the path, then the `.project_root` marker in a
+/// `tmp/<slug>/` folder, then a fresh `slugify` name avoiding every slug already
+/// registered or already on disk (Gemini appends `-1`, `-2`, … on collision).
+pub fn resolve_slug(gemini_dir: &std::path::Path, project_root: &str) -> String {
+    let root = normalize_root(project_root);
+    let mut taken: Vec<String> = Vec::new();
+    if let Ok(t) = std::fs::read_to_string(gemini_dir.join("projects.json")) {
+        if let Some(p) = serde_json::from_str::<Value>(&t).ok()
+            .and_then(|v| v.get("projects").and_then(Value::as_object).cloned())
+        {
+            for (path, slug) in &p {
+                let Some(s) = slug.as_str() else { continue };
+                if normalize_root(path) == root {
+                    return s.to_string();
+                }
+                taken.push(s.to_string());
+            }
+        }
+    }
+    let tmp = gemini_dir.join("tmp");
+    if let Ok(rd) = std::fs::read_dir(&tmp) {
+        for e in rd.flatten().filter(|e| e.path().is_dir()) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if std::fs::read_to_string(e.path().join(".project_root"))
+                .map(|owner| normalize_root(&owner) == root)
+                .unwrap_or(false)
+            {
+                return name;
+            }
+            // A folder that exists is never reused: mixing two projects' sessions in one
+            // folder is worse than a suffix. A marker-less folder belongs to something.
+            taken.push(name);
+        }
+    }
+    let base = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(slugify)
+        .unwrap_or_else(|| "project".into());
+    let mut n = 0usize;
+    loop {
+        let candidate = if n == 0 { base.clone() } else { format!("{base}-{n}") };
+        if !taken.iter().any(|t| t == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +382,57 @@ mod tests {
         assert_eq!(reg["projects"]["/home/u/proj"], "proj");
         assert_eq!(reg["projects"]["/other"], "other", "other projects must be kept");
         assert_eq!(std::fs::read_to_string(d.join("tmp/proj/.project_root")).unwrap(), "/home/u/proj");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn slugify_matches_gemini_slug_rules() {
+        assert_eq!(slugify("DoppelClanker"), "doppelclanker");
+        assert_eq!(slugify("my project!"), "my-project");
+        assert_eq!(slugify("a__b"), "a-b");
+        assert_eq!(slugify("--x--"), "x");
+        assert_eq!(slugify("///"), "project");
+        assert_eq!(slugify(""), "project");
+        assert_eq!(slugify("Ünïcode-42"), "n-code-42");
+    }
+
+    #[test]
+    fn normalize_root_drops_the_trailing_slash_and_keeps_root() {
+        assert_eq!(normalize_root("/home/u/proj/"), "/home/u/proj");
+        assert_eq!(normalize_root("/home/u/proj"), "/home/u/proj");
+        assert_eq!(normalize_root("/"), "/");
+        assert_eq!(normalize_root("  /x  "), "/x");
+    }
+
+    #[test]
+    fn resolve_slug_reuses_the_registered_slug() {
+        let d = std::env::temp_dir().join(format!("hs-gemslug-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("projects.json"), r#"{"projects":{"/home/u/proj/":"proj"}}"#).unwrap();
+        assert_eq!(resolve_slug(&d, "/home/u/proj"), "proj");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resolve_slug_finds_the_project_by_its_marker() {
+        let d = std::env::temp_dir().join(format!("hs-gemslug-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("tmp/doppelclanker")).unwrap();
+        std::fs::write(d.join("tmp/doppelclanker/.project_root"), "/home/u/DoppelClanker\n").unwrap();
+        assert_eq!(resolve_slug(&d, "/home/u/DoppelClanker"), "doppelclanker");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resolve_slug_avoids_names_already_on_disk() {
+        let d = std::env::temp_dir().join(format!("hs-gemslug-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("tmp/proj")).unwrap();
+        std::fs::write(d.join("tmp/proj/.project_root"), "/somewhere/else").unwrap();
+        std::fs::create_dir_all(d.join("tmp/proj-1")).unwrap();
+        std::fs::write(d.join("tmp/proj-1/.project_root"), "/another/place").unwrap();
+        assert_eq!(resolve_slug(&d, "/home/u/proj"), "proj-2");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -45,9 +45,12 @@ impl<R: TeamRemote> Drop for Lease<'_, R> {
     }
 }
 
-/// Push one marked session: take the lease, write under it, release. Refuses to push a session
-/// that is not marked, so the rule holds even if a caller forgets to check.
-pub fn push_marked<R: TeamRemote>(state: &State, remote: &R, space: &str, session_id: &str, bytes: &[u8])
+/// Push one marked session: take the lease, seal under the version it granted, write, release.
+/// `seal` receives that version, which is the record's sequence, so the sealed bytes are bound to
+/// the lease they were written under. Refuses to push a session that is not marked, so the rule
+/// holds even if a caller forgets to check. A failed seal writes nothing and still releases.
+pub fn push_marked_sealed<R: TeamRemote>(state: &State, remote: &R, space: &str, session_id: &str,
+                                         seal: impl FnOnce(u64) -> Result<Vec<u8>, String>)
     -> Result<(), PushError>
 {
     if !state.is_marked(session_id) {
@@ -55,7 +58,16 @@ pub fn push_marked<R: TeamRemote>(state: &State, remote: &R, space: &str, sessio
     }
     let version = remote.acquire(space, session_id)?;
     let _guard = Lease { remote, space: space.to_string(), conversation: session_id.to_string() };
-    remote.put(space, session_id, version, bytes)
+    let bytes = seal(version).map_err(PushError::Refused)?;
+    remote.put(space, session_id, version, &bytes)
+}
+
+/// Push already-sealed bytes for a marked session under a lease. For callers whose bytes do not
+/// depend on the lease version; the sealed path uses `push_marked_sealed`.
+pub fn push_marked<R: TeamRemote>(state: &State, remote: &R, space: &str, session_id: &str, bytes: &[u8])
+    -> Result<(), PushError>
+{
+    push_marked_sealed(state, remote, space, session_id, |_| Ok(bytes.to_vec()))
 }
 
 /// The team server over HTTP. Settings come from the caller: base URL, the member token, and
@@ -87,8 +99,24 @@ impl TeamRemote for HttpTeam {
     }
 
     fn put(&self, space: &str, conversation: &str, version: u64, bytes: &[u8]) -> Result<(), PushError> {
+        // The sealed route is the only way new writes go out: the server never sees plaintext.
+        self.put_to("/record/sealed", space, conversation, version, bytes)
+    }
+
+    fn release(&self, space: &str, conversation: &str) -> Result<(), PushError> {
+        self.post("/lease/release", serde_json::json!({
+            "space": space, "conversation": conversation, "machine": self.machine}))?;
+        Ok(())
+    }
+}
+
+impl HttpTeam {
+    /// PUT-style write under a lease to `route`. New writes go to `/record/sealed` — a
+    /// client-sealed, signed record the server stores without reading. `/record` is the legacy
+    /// plaintext route, kept only until the sealed path is the only writer.
+    pub fn put_to(&self, route: &str, space: &str, conversation: &str, version: u64, bytes: &[u8]) -> Result<(), PushError> {
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(60)).build();
-        let url = format!("{}/record?space={space}&conversation={conversation}&machine={}&version={version}",
+        let url = format!("{}{route}?space={space}&conversation={conversation}&machine={}&version={version}",
                           self.base.trim_end_matches('/'), self.machine);
         match agent.post(&url).set("Authorization", &format!("Bearer {}", self.token))
             .set("Content-Type", "application/octet-stream").send_bytes(bytes) {
@@ -97,11 +125,5 @@ impl TeamRemote for HttpTeam {
             Err(ureq::Error::Status(code, _)) => Err(PushError::Refused(format!("server refused ({code})"))),
             Err(_) => Err(PushError::Unreachable),
         }
-    }
-
-    fn release(&self, space: &str, conversation: &str) -> Result<(), PushError> {
-        self.post("/lease/release", serde_json::json!({
-            "space": space, "conversation": conversation, "machine": self.machine}))?;
-        Ok(())
     }
 }

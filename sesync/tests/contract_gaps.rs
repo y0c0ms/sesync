@@ -99,7 +99,7 @@ fn a_failed_to_opencode_conversion_is_an_error_and_nothing_is_imported() {
     for p in [&fake_sesync_conv, &fake_oc] {
         stage_exec(p);
     }
-    let r = install_opencode(&fake_oc, &fake_sesync_conv, &src, "/", "ses_convfail00000000000000000", "t", &sb.join("xdg"));
+    let r = install_opencode(&fake_oc, &fake_sesync_conv, &src, "/", "ses_convfail00000000000000000", "t", Some(&sb.join("xdg")));
     let err = r.expect_err("a failed conversion must be an error");
     assert!(err.contains("to-opencode failed"), "the guard must be what stops it: {err}");
     assert!(!marker.exists(), "import must not run when the conversion failed");

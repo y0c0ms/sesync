@@ -1,6 +1,9 @@
 //! The join and renew calls a member machine makes, against a real team-server process over
 //! HTTP: enrol with the authenticator code, then renew the token. Runs only when TEAM_TEST_PG
 //! names a throwaway database and TEAM_SERVER_BIN names the built binary; otherwise it skips.
+#[path = "common/mod.rs"]
+mod common;
+
 use sesync_team::pg::PgStore;
 use sesync_team::service::Service;
 use sesync_team::totp::code_at;
@@ -29,8 +32,7 @@ fn post(port: u16, path: &str, auth: Option<&str>, body: &str) -> (u16, String) 
 
 #[test]
 fn enrol_then_renew_over_a_real_server() {
-    let (Some(url), Some(bin)) = (std::env::var("TEAM_TEST_PG").ok(), std::env::var("TEAM_SERVER_BIN").ok())
-        else { eprintln!("skipped: set TEAM_TEST_PG and TEAM_SERVER_BIN"); return };
+    let Some((url, bin)) = common::live_env() else { return };
     let schema = "t_join_e2e";
     {
         let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();

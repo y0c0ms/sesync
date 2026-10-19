@@ -4,7 +4,7 @@
 use sesync_team::membership::{Device, MemberList, MembershipError, Verifier};
 
 fn list(version: u64, devices: &[&Device]) -> MemberList {
-    MemberList::new(version, devices.iter().map(|d| d.public_key()).collect())
+    MemberList::new(version, devices.iter().map(|d| sesync_team::membership::device_entry(d)).collect())
 }
 
 #[test]

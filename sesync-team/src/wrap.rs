@@ -2,7 +2,7 @@
 //! under the master key, which comes from the cluster's sealed secret and never reaches the
 //! database. The database stores only the wrapped bytes.
 
-use crate::spaces::{seal, open, Space};
+use crate::spaces::{seal, Space};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WrapError {

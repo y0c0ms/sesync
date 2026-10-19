@@ -1,9 +1,10 @@
 //! Cross-machine turn lease.
 //!
 //! One lease per conversation. It is held by one machine, expires `LEASE_SECS` after the
-//! holder's last heartbeat (or acquire), and every takeover increments a version. A write
-//! carries the version it was made under; a write under an older version is refused, so a
-//! machine that slept through its lease cannot overwrite the newer holder's work.
+//! holder's last heartbeat (or acquire), and every new grant increments a version. A version is
+//! never granted twice for a conversation, even after a release. A write carries the version it
+//! was made under; a write under an older version is refused, so a machine that slept through its
+//! lease cannot overwrite the newer holder's work.
 //! Times are seconds since the epoch, passed in, so the rules are testable.
 
 use std::collections::HashMap;
@@ -34,6 +35,10 @@ pub enum LeaseError {
 #[derive(Default)]
 pub struct LeaseTable {
     leases: HashMap<String, Lease>,
+    /// The highest version ever granted per conversation. It outlives a release, so a version is
+    /// never granted twice: a push that takes and releases the lease each time still gets a higher
+    /// version, and a record's sequence only rises.
+    granted: HashMap<String, u64>,
 }
 
 impl LeaseTable {
@@ -53,7 +58,8 @@ impl LeaseTable {
                 return self.heartbeat(conversation, machine, now);
             }
         }
-        let version = self.leases.get(conversation).map_or(1, |c| c.version + 1);
+        let version = self.granted.get(conversation).map_or(1, |v| v + 1);
+        self.granted.insert(conversation.to_string(), version);
         let lease = Lease {
             conversation: conversation.to_string(),
             holder: machine.to_string(),
@@ -86,6 +92,26 @@ impl LeaseTable {
 
     /// Check a write made under `version` by `machine`. Refused if the version is stale, or
     /// the machine is no longer the holder.
+    /// Whether this table has granted a version for the conversation before (live or released).
+    pub fn has_grant(&self, conversation: &str) -> bool {
+        self.granted.contains_key(conversation)
+    }
+
+    /// Continue a conversation's versions from `floor`, the highest version already written for it.
+    /// Used after a restart, when the table has forgotten its grants: the next grant is then above
+    /// anything written before. Never lowers a version already granted.
+    pub fn seed(&mut self, conversation: &str, floor: u64) {
+        let cur = self.granted.get(conversation).copied().unwrap_or(0);
+        if floor > cur {
+            self.granted.insert(conversation.to_string(), floor);
+        }
+    }
+
+    /// The version of the live lease on a conversation, if one is held.
+    pub fn current_version(&self, conversation: &str) -> Option<u64> {
+        self.leases.get(conversation).map(|l| l.version)
+    }
+
     pub fn check_write(&self, conversation: &str, version: u64, machine: &str) -> Result<(), LeaseError> {
         let cur = self.leases.get(conversation).ok_or(LeaseError::Missing)?;
         if version < cur.version {

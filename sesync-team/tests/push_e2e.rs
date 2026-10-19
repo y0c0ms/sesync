@@ -1,6 +1,9 @@
 //! The push end to end against a real team-server process: a marked session is written under a
 //! lease and the server holds it sealed; a second machine is refused while the first holds the
 //! lease. Runs only when TEAM_TEST_PG and TEAM_SERVER_BIN are set; otherwise it skips.
+#[path = "common/mod.rs"]
+mod common;
+
 use sesync_team::pg::PgStore;
 use sesync_team::service::Service;
 use sesync_team::totp::code_at;
@@ -26,8 +29,7 @@ fn http(port: u16, method: &str, path: &str, auth: Option<&str>, ctype: &str, bo
 
 #[test]
 fn a_marked_session_is_stored_and_a_second_machine_is_held_out() {
-    let (Some(url), Some(bin)) = (std::env::var("TEAM_TEST_PG").ok(), std::env::var("TEAM_SERVER_BIN").ok())
-        else { eprintln!("skipped: set TEAM_TEST_PG and TEAM_SERVER_BIN"); return };
+    let Some((url, bin)) = common::live_env() else { return };
     let schema = "t_push_e2e";
     {
         let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();

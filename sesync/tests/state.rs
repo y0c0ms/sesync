@@ -34,6 +34,7 @@ fn loads_the_python_state_layout() {
     let src = &s.sources["omp:/x/a.jsonl"];
     assert_eq!(src.fmt, "omp");
     assert_eq!(src.failures, 1);
+    assert_eq!(src.last_failure, 0.0, "an older file without the field is still valid");
     assert_eq!(src.last_hash, "abc");
     let m = &src.mirrors["pi"];
     assert_eq!(m.path, "/p/a.jsonl");
@@ -56,13 +57,18 @@ fn save_then_load_round_trips() {
     let mut s = State::default();
     let mut src = Source::new("opencode", "ses_9");
     src.last_hash = "h".into();
+    src.failures = 2;
+    src.last_failure = 1_234.5;
     src.mirrors.insert("claude".into(), Mirror { target: "claude".into(), path: "/c/x.jsonl".into(),
-        source_hash: "h".into(), installed_hash: String::new(), diverged: false });
+        source_hash: "h".into(), installed_hash: String::new(), diverged: false,
+        edit_stamp: String::new(), target_updated: 0.0 });
     s.sources.insert("opencode:ses_9".into(), src);
     s.mirror_keys.insert("/c/x.jsonl".into());
     s.save(&f).unwrap();
     let back = State::load(&f).unwrap();
     assert_eq!(back.sources["opencode:ses_9"].mirrors["claude"].path, "/c/x.jsonl");
+    assert_eq!(back.sources["opencode:ses_9"].last_failure, 1_234.5);
+    assert_eq!(back.sources["opencode:ses_9"].failures, 2);
     assert!(back.mirror_keys.contains("/c/x.jsonl"));
 }
 
@@ -113,4 +119,79 @@ fn a_state_file_written_before_subagents_existed_still_loads() {
     let s = State::load(&f).unwrap();
     assert!(s.subagents.is_empty());
     assert!(s.sources.contains_key("omp:/x/a.jsonl"));
+}
+
+#[test]
+fn the_team_sequence_floors_round_trip_and_default_to_empty() {
+    // The highest team record sequence accepted per conversation survives a restart, so an old
+    // record cannot be replayed after the daemon has been restarted.
+    let d = tmp("team-seen");
+    let f = d.join("state.json");
+    let mut s = State::default();
+    s.team_seen.insert("ses_a".into(), 7);
+    s.team_seen.insert("ses_b".into(), 1);
+    s.save(&f).unwrap();
+    let back = State::load(&f).unwrap();
+    assert_eq!(back.team_seen.get("ses_a"), Some(&7));
+    assert_eq!(back.team_seen.get("ses_b"), Some(&1));
+    assert_eq!(back.team_seen.len(), 2);
+}
+
+#[test]
+fn a_state_file_written_before_team_floors_existed_has_none() {
+    let d = tmp("no-team-seen");
+    let f = d.join("state.json");
+    fs::write(&f, PY_STATE).unwrap();
+    let s = State::load(&f).unwrap();
+    assert!(s.team_seen.is_empty(), "the optional key defaults to empty");
+}
+
+#[test]
+fn a_tui_save_keeps_everything_the_daemon_recorded() {
+    let dir = tmp("tui-keeps-daemon");
+    let path = dir.join("state.json");
+    let mut daemon = State::default();
+    let mut src = Source::new("omp", "/omp/s.jsonl");
+    src.mirrors.insert("pi".into(), Mirror {
+        target: "pi".into(), path: "/pi/m.jsonl".into(), ..Default::default()
+    });
+    daemon.sources.insert("/omp/s.jsonl".into(), src);
+    daemon.mirror_keys.insert("/pi/m.jsonl".into());
+    daemon.team_seen.insert("ses_x".into(), 7);
+    daemon.save(&path).unwrap();
+
+    // Exactly what the TUI does: load, set the choice, save only the user-owned fields.
+    let mut tui = State::load(&path).unwrap();
+    tui.sources.get_mut("/omp/s.jsonl").unwrap().chosen_targets.insert("pi".into());
+    tui.save_user(&path).unwrap();
+
+    let after = State::load(&path).unwrap();
+    assert!(after.mirror_keys.contains("/pi/m.jsonl"), "the daemon mirror record survives a TUI save");
+    assert_eq!(after.team_seen.get("ses_x"), Some(&7), "the team floor survives");
+    assert!(after.sources["/omp/s.jsonl"].chosen_targets.contains("pi"), "the choice is written");
+    assert_eq!(after.sources["/omp/s.jsonl"].mirrors.len(), 1, "the recorded mirror survives");
+}
+
+#[test]
+fn the_daemon_adopts_a_choice_made_while_it_ran() {
+    let dir = tmp("adopt-choice");
+    let path = dir.join("state.json");
+    let mut tui = State::default();
+    let mut src = Source::new("omp", "/omp/s.jsonl");
+    src.chosen_targets.insert("pi".into());
+    tui.sources.insert("/omp/s.jsonl".into(), src);
+    tui.mark("/omp/s.jsonl");
+    tui.save_user(&path).unwrap();
+
+    let mut daemon = State::default();
+    daemon.mirror_keys.insert("/old/m.jsonl".into());
+    daemon.absorb_user_edits(&path).unwrap();
+    assert!(daemon.sources["/omp/s.jsonl"].chosen_targets.contains("pi"), "the daemon sees the choice");
+    assert!(daemon.is_marked("/omp/s.jsonl"), "the daemon sees the mark");
+    assert!(daemon.mirror_keys.contains("/old/m.jsonl"), "the daemon keeps its own records");
+
+    daemon.save(&path).unwrap();
+    let after = State::load(&path).unwrap();
+    assert!(after.sources["/omp/s.jsonl"].chosen_targets.contains("pi"), "the choice survives the daemon save");
+    assert!(after.mirror_keys.contains("/old/m.jsonl"), "and the daemon record is there");
 }

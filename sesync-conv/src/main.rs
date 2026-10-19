@@ -8,7 +8,9 @@
 //! `inspect` prints what the reader sees, for differential tests.
 //!
 //! All ids are deterministic from --id (or the source id), so re-running
-//! produces the same mirror and the daemon can replace in place.
+//! produces the same mirror. O-penCode's importer keeps its session row on a
+//! re-import but ignores existing message ids, so replacing an imported mirror
+//! means delete-then-import under the same deterministic id.
 
 mod claude;
 mod from_claude;
@@ -67,9 +69,10 @@ fn usage() -> ! {
          sesync-conv from-claude <transcript.jsonl> --out <journal.jsonl>\n\
          sesync-conv from-opencode <export.json> --out <journal.jsonl>\n\
          sesync-conv from-gemini <session.jsonl> --out <journal.jsonl>\n\
-         sesync-conv to-claude <journal> --out-dir <~/.claude/projects> [--id UUID] [--cli-version V]\n\
+         sesync-conv to-gemini <journal.jsonl> --gemini-dir <~/.gemini> [--project <abs path>] [--slug <slug>] [--id UUID]\n\
+         sesync-conv to-claude <journal> --out-dir <~/.claude/projects> [--id UUID] [--title T] [--cli-version V]\n\
          sesync-conv ids <seed>            (prints the deterministic opencode and claude ids)\n\
-         Output path is printed on stdout for to-pi/to-omp/to-claude."
+         Output path is printed on stdout for to-pi/to-omp/to-claude/to-gemini."
     );
     process::exit(1)
 }
@@ -143,8 +146,8 @@ fn main() {
                     let mut text = lines.join("\n");
                     text.push('\n');
                     fs::write(&out, text).map_err(|e| format!("{out}: {e}"))?;
-                    eprintln!("from-claude: {} message(s), {} text block(s), skipped {} tool / {} thinking / {} records",
-                        stats.messages, stats.text_blocks, stats.skipped_tool_blocks, stats.skipped_thinking_blocks, stats.skipped_records);
+                    eprintln!("from-claude: {} message(s), {} text block(s), skipped {} tool / {} thinking / {} records / {} bad line(s)",
+                        stats.messages, stats.text_blocks, stats.skipped_tool_blocks, stats.skipped_thinking_blocks, stats.skipped_records, stats.skipped_bad_lines);
                     println!("{out}");
                     Ok(())
                 })
@@ -184,15 +187,14 @@ fn main() {
                 })
         }
         "to-gemini" => (|| -> Result<(), String> {
-            // to-gemini <journal.jsonl> --gemini-dir <~/.gemini> --project <abs path> --slug <slug> [--id UUID]
+            // to-gemini <journal.jsonl> --gemini-dir <~/.gemini> [--project <abs path>] [--slug <slug>] [--id UUID]
             let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
             let gdir = PathBuf::from(arg(&args, "--gemini-dir").unwrap_or_else(|| usage()));
-            let project = arg(&args, "--project").unwrap_or_else(|| usage());
-            let slug = arg(&args, "--slug").unwrap_or_else(|| usage());
             let raw = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
             let mut records: Vec<Value> = Vec::new();
             let mut header_id = String::new();
             let mut start = String::new();
+            let mut cwd = String::new();
             for (n, line) in raw.lines().enumerate() {
                 let t = line.trim();
                 if t.is_empty() { continue; }
@@ -200,10 +202,21 @@ fn main() {
                 if v.get("type").and_then(Value::as_str) == Some("session") {
                     header_id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                     start = v.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
+                    cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
                 } else {
                     records.push(v);
                 }
             }
+            // The journal's own directory is the project; --project overrides for callers
+            // that know better. Normalized, so the registry key and the header hash match
+            // the path Gemini itself would resolve a cwd to.
+            let project = to_gemini::normalize_root(&arg(&args, "--project").unwrap_or(cwd));
+            if project.is_empty() {
+                return Err("to-gemini needs --project or a journal whose header carries cwd".into());
+            }
+            // The slug must be Gemini's own for this project, or native sessions of the
+            // project would vanish from `--list-sessions` under a second folder.
+            let slug = arg(&args, "--slug").unwrap_or_else(|| to_gemini::resolve_slug(&gdir, &project));
             let sid = arg(&args, "--id").unwrap_or(header_id);
             let (lines, stats) = to_gemini::to_session_lines(&sid, &project, &start, &records)?;
             let short: String = sid.chars().take(8).collect();
@@ -211,6 +224,16 @@ fn main() {
             let dir = gdir.join("tmp").join(&slug).join("chats");
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let dst = dir.join(format!("session-{stamp}-{short}.jsonl"));
+            // One conversation keeps one file: drop older files for the same mirror id,
+            // whatever their timestamp prefix, exactly as the journal installers do.
+            if let Ok(rd) = fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    if e.path() == dst { continue; }
+                    if e.file_name().to_string_lossy().ends_with(&format!("-{short}.jsonl")) {
+                        let _ = fs::remove_file(e.path());
+                    }
+                }
+            }
             let tmp = dst.with_extension("jsonl.tmp");
             let mut text = lines.join("\n");
             text.push('\n');
@@ -294,7 +317,8 @@ fn main() {
                 let sid = arg(&args, "--id").unwrap_or_else(|| claude::session_id_for(&seed));
                 let cwd = j.cwd().unwrap_or("").to_string();
                 let ver = arg(&args, "--cli-version").unwrap_or_else(|| "2.1.245".into());
-                let lines = claude::to_lines(&j, &claude::Options { session_id: &sid, cwd: &cwd, cli_version: &ver });
+                let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
+                let lines = claude::to_lines(&j, &claude::Options { session_id: &sid, cwd: &cwd, cli_version: &ver, title: &title });
                 if lines.is_empty() {
                     return Err("no resumable conversation (no user/assistant messages)".into());
                 }

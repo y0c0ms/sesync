@@ -17,6 +17,7 @@ fn base() -> ScanInput {
         live_mirrors_current: false,
         mirror_count: 0,
         wanted_mirrors: 1,
+        needs_mirror: false,
     }
 }
 
@@ -39,6 +40,14 @@ fn files_older_than_the_window_are_skipped() {
     let mut i = base();
     i.now = i.mtime + i.max_age_secs + 1.0;
     assert!(!should_sync(&i));
+}
+
+#[test]
+fn an_explicitly_chosen_mirror_bypasses_the_age_window() {
+    let mut i = base();
+    i.now = i.mtime + i.max_age_secs + 1.0;
+    i.needs_mirror = true;
+    assert!(should_sync(&i), "a target the user chose must be written even for an old session");
 }
 
 #[test]

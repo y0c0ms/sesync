@@ -25,16 +25,26 @@ A refused claim blocks the prompt and names the holder, so two harnesses never w
 ## Layout
 
 ```
-lock/      sesync-lock: claim / release / check / resolve / sweep / list
-sesync-conv/    sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude
-hooks/     per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
-sesync/ sesync: the sync daemon and manage TUI (Rust)
+sesync-lock/   sesync-lock: claim / release / check / resolve / sweep / list
+sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude / to-gemini
+sesync/        the sync daemon and manage TUI
+sesync-team/   team sync core (sealed records, leases, member list) and team-server
+hooks/         per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
+docs/          architecture, status, research notes
 ```
+
+## Documentation
+
+- [AGENTS.md](AGENTS.md) — how to work in this repo: safety rules, build and test commands,
+  module map, invariants.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design, trust model, wire formats, routes,
+  persistence.
+- [docs/STATUS.md](docs/STATUS.md) — last known state, deployment, open decisions.
 
 ## Requirements
 
 - Rust (stable) to build `sesync-lock` and `sesync-conv`.
-- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code.
+- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code, Gemini CLI.
 
 ## Build
 
@@ -56,6 +66,11 @@ The daemon reads these environment variables. All are optional.
 | `PI_AGENT_DIR` | `~/.pi/agent` | Pi data |
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | OpenCode database |
 | `SESYNC_CONV` | `~/bin/sesync-conv.exe` | Path to the converter |
+| `SESYNC_CONFIG_DIR` | `~/.config/sesync` | Team credentials, device key and admin key |
+| `SESYNC_TEAM_URL` | unset | Team server; team sync is off without it |
+
+The full table, including the team trigger and poll settings, is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Usage
 
@@ -64,6 +79,16 @@ sesync --once      # run one sync pass and exit
 sesync --watch     # run continuously (SESYNC_POLL seconds apart)
 sesync --status    # show current state
 sesync --tui       # manage sessions: list, rename, delete
+```
+
+Team commands (create/publish/forget additionally need `SESYNC_ADMIN_TOKEN_FILE`):
+
+```sh
+sesync team create <name> [--member <m>]
+sesync team join <name> --member <m>
+sesync team renew <name>
+sesync team publish <name>
+sesync team forget <name> <machine>
 ```
 
 Inspect the lock and converter directly:
