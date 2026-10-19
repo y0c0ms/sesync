@@ -27,35 +27,63 @@ pub fn team_quiet_secs() -> f64 {
     std::env::var("SESYNC_TEAM_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TEAM_QUIET_SECS)
 }
 
-/// Run one team pass. `content_of` gives canonical journal bytes for a marked session; `last_change_of`
-/// gives its source's last write time (seconds). Both come from the caller, which owns the sources.
+/// Run a pass for every team this machine belongs to: each team pushes the sessions shared with
+/// it, under its own lease and sequence. The canonical bytes for a conversation are built ONCE
+/// and reused for every team it is shared with, so a session on two teams is converted once.
 pub fn run(
     config_dir: &Path,
     state: &mut State,
     now: f64,
-    content_of: impl FnMut(&str) -> Result<Vec<u8>, String>,
-    last_change_of: impl FnMut(&str) -> Option<f64>,
-) -> Result<TeamPass, NotRun> {
+    mut content_of: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    mut last_change_of: impl FnMut(&str) -> Option<f64>,
+) -> Result<Vec<TeamPass>, NotRun> {
     let base = std::env::var("SESYNC_TEAM_URL").map_err(|_| NotRun::NoTeam)?;
-    let space = std::env::var("SESYNC_TEAM_SPACE").ok();
-    let cred_space = space.clone().or_else(|| single_team(config_dir)).ok_or(NotRun::NoTeam)?;
-    let cred = team_join::load(&team_join::credential_path(config_dir, &cred_space)).map_err(|_| NotRun::NoTeam)?;
-    let pinned = team_join::trust_of(&cred).ok_or(NotRun::NoTrustRoot)?;
-
-    // Refresh before sealing: records must be signed under the current list version.
-    let trust = fetch_and_verify(&base, &cred.token, &cred.machine, &cred_space, &pinned)
-        .unwrap_or(pinned);
-    let writer = load_or_create(config_dir).map_err(|_| NotRun::NoTeam)?;
-    let remote = HttpTeam { base: base.clone(), token: cred.token.clone(), machine: cred.machine.clone() };
-    let quiet = team_quiet_secs();
-
-    // Each record is bound to the credential's space, its session id as the conversation, and the
-    // lease version it is written under as the sequence.
-    let seal = |session: &str, version: u64, plain: &[u8]| -> Result<Vec<u8>, String> {
-        seal_for_devices(&writer, &trust, &cred_space, session, version, plain)
-            .map_err(|e| format!("cannot seal: {e:?}"))
+    let spaces: Vec<String> = match std::env::var("SESYNC_TEAM_SPACE").ok() {
+        Some(s) => vec![s],
+        None => {
+            let all = crate::team_watch::all_teams(config_dir);
+            if all.is_empty() { single_team(config_dir).into_iter().collect() } else { all }
+        }
     };
-    Ok(push_due(state, &remote, &cred_space, now, quiet, content_of, last_change_of, seal))
+    if spaces.is_empty() { return Err(NotRun::NoTeam); }
+    // Build each conversation's canonical bytes once, whatever it is shared with.
+    let mut canon = CanonCache::default();
+    let mut passes = Vec::new();
+    for space in spaces {
+        let cred = team_join::load(&team_join::credential_path(config_dir, &space)).map_err(|_| NotRun::NoTeam)?;
+        let Some(pinned) = team_join::trust_of(&cred) else { continue };
+        // Refresh before sealing: records must be signed under the current list version.
+        let trust = fetch_and_verify(&base, &cred.token, &cred.machine, &space, &pinned).unwrap_or(pinned);
+        let Ok(writer) = load_or_create(config_dir) else { continue };
+        let remote = HttpTeam { base: base.clone(), token: cred.token.clone(), machine: cred.machine.clone() };
+        let quiet = team_quiet_secs();
+        let seal = |session: &str, version: u64, plain: &[u8]| -> Result<Vec<u8>, String> {
+            seal_for_devices(&writer, &trust, &space, session, version, plain)
+                .map_err(|e| format!("cannot seal: {e:?}"))
+        };
+        let mut content = |id: &str| canon.get(id, |id| content_of(id));
+        passes.push(push_due(state, &remote, &space, now, quiet, content, &mut last_change_of, seal));
+    }
+    if passes.is_empty() { return Err(NotRun::NoTeam); }
+    Ok(passes)
+}
+
+/// Canonical journal bytes, built once per pass: a session shared with more than one team is
+/// converted once, not once per team.
+#[derive(Default)]
+pub struct CanonCache {
+    map: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl CanonCache {
+    pub fn get(&mut self, id: &str, build: impl FnOnce(&str) -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+        if let Some(b) = self.map.get(id) {
+            return Ok(b.clone());
+        }
+        let b = build(id)?;
+        self.map.insert(id.to_string(), b.clone());
+        Ok(b)
+    }
 }
 
 /// The one credential on this machine, when there is exactly one team; otherwise none.

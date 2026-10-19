@@ -83,6 +83,8 @@ pub enum Mode {
     Transcript,
     /// The delete confirmation: names what goes and what stays, confirmed by ctrl+d/enter/y.
     DeleteConfirm,
+    /// The share picker: one row per team this machine belongs to, space ticks.
+    SharePick,
 }
 
 /// Which dialog the form serves: joining a team or starting one (admin side).
@@ -236,6 +238,12 @@ pub struct App {
     /// The team session shown when `i` was pressed. Only this one can be imported by `y`, so a
     /// pull that changes the list between the question and the answer cannot change the target.
     pending_import: Option<(String, Vec<u8>)>,
+    /// The teams this machine belongs to, as space names, set by the caller at start-up.
+    /// Empty means no team is configured. One team toggles directly; several open the picker.
+    teams: Vec<String>,
+    /// Cursor and ticks of the share picker (one row per configured team).
+    share_cursor: usize,
+    pick_shares: std::collections::BTreeSet<String>,
     /// Set by ctrl+r in browse mode. The caller performs the refresh and clears the request.
     refresh_requested: bool,
     /// Whether the caller found team-server configuration, so "Refresh team" can be offered.
@@ -314,6 +322,9 @@ impl App {
             status_at: Instant::now(),
             quit: false,
             pending_import: None,
+            teams: Vec::new(),
+            share_cursor: 0,
+            pick_shares: Default::default(),
             refresh_requested: false,
             team_configured: false,
             palette_query: String::new(),
@@ -423,12 +434,11 @@ impl App {
     /// Raise the app's copy of the conversation floors to what this pull accepted, so the next
     /// pull never accepts a record below what this one verified. In memory only: the daemon
     /// owns the persisted floors, and `save_user` does not write these.
-    pub fn absorb_pull_floors(&mut self, accepted: &std::collections::BTreeMap<String, u64>) {
-        for (conv, seq) in accepted {
-            let cur = self.state.team_seen.entry(conv.clone()).or_insert(0);
-            if *seq > *cur {
-                *cur = *seq;
-            }
+    /// Raise the floors a pull accepted. They are per (team, conversation): a record received
+    /// under one team never raises another team's floor for the same conversation.
+    pub fn absorb_pull_floors(&mut self, accepted: &[(String, String, u64)]) {
+        for (space, conv, seq) in accepted {
+            self.state.raise_seen(space, conv, *seq);
         }
     }
 
@@ -544,6 +554,7 @@ impl App {
             Mode::Help => "esc close".to_string(),
             Mode::Transcript => "j/k scroll · esc close".to_string(),
             Mode::DeleteConfirm => "ctrl+d delete · any other key cancels".to_string(),
+            Mode::SharePick => "space tick · a all · n none · enter keep · esc cancel".to_string(),
             Mode::Browse => match self.view {
                 View::Sessions => {
                     let view_key = match self.filter_scope {
@@ -573,7 +584,7 @@ impl App {
     fn passes(&self, g: &Group) -> bool {
         let scope_ok = match self.filter_scope {
             FilterScope::All => true,
-            FilterScope::Marked => self.state.is_marked(&self.state.team_id_of(&g.key)),
+            FilterScope::Marked => self.state.is_shared(&self.state.team_id_of(&g.key)),
             FilterScope::Mirrored => {
                 !g.mirrors.is_empty()
                     || self.state.sources.get(&g.key).map_or(false, |s| !s.chosen_targets.is_empty())
@@ -617,9 +628,14 @@ impl App {
         });
     }
 
-    /// Whether a listed group is marked for the team. The view uses this to show the mark.
+    /// The teams this machine belongs to (set by the caller at start-up).
+    pub fn set_teams(&mut self, teams: Vec<String>) {
+        self.teams = teams;
+    }
+
+    /// Whether a listed group is shared with any team. The view uses this to show the mark.
     pub fn is_marked(&self, g: &Group) -> bool {
-        self.state.is_marked(&self.state.team_id_of(&g.key))
+        self.state.is_shared(&self.state.team_id_of(&g.key))
     }
 
     /// True when any local session has a chosen mirror still pending or failing, so the
@@ -639,9 +655,12 @@ impl App {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let last_change = self.state.sources.get(&g.key).map_or(0.0, |s| s.last_seen_change);
+        let pushed_at = self.state.shares_of(&id).iter()
+            .filter_map(|space| self.state.team_pushed_at(space, &id))
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         crate::session_cols::columns(&crate::session_cols::Input {
-            marked: self.state.is_marked(&id),
-            pushed_at: self.state.team.get(&id).map(|t| t.pushed_at),
+            marked: self.state.is_shared(&id),
+            pushed_at,
             last_change,
             now,
             quiet_secs: crate::team_pass::team_quiet_secs(),
@@ -666,34 +685,95 @@ impl App {
     }
 
     pub fn is_selected_marked(&self) -> bool {
-        self.selected().map_or(false, |g| self.state.is_marked(&self.state.team_id_of(&g.key)))
+        self.selected().map_or(false, |g| self.state.is_shared(&self.state.team_id_of(&g.key)))
     }
 
-    /// Toggle the team mark on the selected session. Returns the new state, or None if nothing
-    /// is selected. Only the session id is stored, never its contents.
+    /// Share, or stop sharing, the selected session. With one team on this machine it toggles
+    /// that team directly; with several it opens a picker, one row per team, because one
+    /// session can live on more than one. Returns the new state when it toggled, None when a
+    /// picker opened (or nothing is selected).
     pub fn toggle_mark(&mut self) -> Option<bool> {
         let g = self.selected()?;
         let id = self.state.team_id_of(&g.key);
-        let now_marked = if self.state.is_marked(&id) {
-            self.state.unmark(&id);
+        if self.teams.is_empty() {
+            self.say("no team is configured; join a team to share a session");
+            return None;
+        }
+        if self.teams.len() > 1 {
+            self.pick_shares = self.state.shares_of(&id);
+            self.share_cursor = 0;
+            self.mode = Mode::SharePick;
+            self.say("Space toggles a team; Enter keeps the share set; Esc cancels.");
+            return None;
+        }
+        let space = self.teams[0].clone();
+        let now_shared = if self.state.is_shared_with(&id, &space) {
+            self.state.unshare(&id, &space);
             false
         } else {
-            self.state.mark(&id);
+            self.state.share(&id, &space);
             true
         };
-        self.say(if now_marked {
-            format!("marked '{}' for the team", g.title)
+        self.say(if now_shared {
+            format!("'{}' is now shared with team '{}'", g.title, space)
         } else {
-            format!("unmarked '{}'", g.title)
+            format!("'{}' is no longer shared with team '{}'", g.title, space)
         });
-        // In the marked-only view, a row that no longer qualifies leaves the list at once.
+        self.mark_view_follow(g);
+        self.user_dirty = true;
+        Some(now_shared)
+    }
+
+    /// In the shared-only view, a row that no longer qualifies leaves the list at once.
+    fn mark_view_follow(&mut self, g: Group) {
         if self.filter_scope == FilterScope::Marked {
             self.recompute_visible();
-            self.rebuild_model_keep(Some(g.key.clone()));
+            self.rebuild_model_keep(Some(g.key));
         }
-        self.user_dirty = true;
-        Some(now_marked)
     }
+
+    fn handle_share_pick(&mut self, ev: Ev) {
+        let rows = self.teams.clone();
+        let last = rows.len().saturating_sub(1);
+        match ev {
+            Ev::Esc => {
+                self.mode = Mode::Browse;
+                self.say("share cancelled");
+            }
+            Ev::Up | Ev::Char('k') => self.share_cursor = self.share_cursor.saturating_sub(1),
+            Ev::Down | Ev::Char('j') => self.share_cursor = (self.share_cursor + 1).min(last),
+            Ev::Char(' ') => {
+                if let Some(t) = rows.get(self.share_cursor) {
+                    if !self.pick_shares.remove(t) {
+                        self.pick_shares.insert(t.clone());
+                    }
+                }
+            }
+            Ev::Char('a') => self.pick_shares = rows.iter().cloned().collect(),
+            Ev::Char('n') => self.pick_shares.clear(),
+            Ev::Enter => {
+                let Some(g) = self.selected() else { self.mode = Mode::Browse; return };
+                let id = self.state.team_id_of(&g.key);
+                let chosen = self.pick_shares.clone();
+                self.state.set_shares(&id, chosen);
+                self.mode = Mode::Browse;
+                let current = self.state.shares_of(&id);
+                self.say(if current.is_empty() {
+                    format!("'{}' is not shared with any team", g.title)
+                } else {
+                    format!("'{}' is shared with: {}", g.title,
+                        current.iter().cloned().collect::<Vec<_>>().join(", "))
+                });
+                self.mark_view_follow(g);
+                self.user_dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn share_cursor(&self) -> usize { self.share_cursor }
+    pub fn share_is_picked(&self, team: &str) -> bool { self.pick_shares.contains(team) }
+    pub fn teams(&self) -> &[String] { &self.teams }
 
     /// True once the user changed a field the app owns (a mark or a mirror choice), and
     /// clears the flag. The caller saves state only when this returns true.
@@ -738,6 +818,7 @@ impl App {
         let ctx = palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
+            session_shared: self.is_selected_marked(),
             team_selected: self.team.get(self.team_index).is_some(),
             team_configured: self.team_configured,
         };
@@ -885,6 +966,7 @@ impl App {
             Mode::Help => self.handle_help(ev),
             Mode::Transcript => self.handle_transcript(ev),
             Mode::DeleteConfirm => self.handle_delete_confirm(ev),
+            Mode::SharePick => self.handle_share_pick(ev),
             Mode::Browse => self.handle_browse(ev, now),
         }
     }
@@ -956,6 +1038,41 @@ impl App {
                     return;
                 }
                 self.toggle_mark();
+            }
+            // s opens the share picker (explicit team choice); u stops sharing everywhere.
+            Ev::Char('s') => {
+                if self.view != View::Sessions {
+                    self.say("sharing a session starts from the Sessions tab");
+                    return;
+                }
+                if self.teams.is_empty() {
+                    self.say("no team is configured; join a team to share a session");
+                    return;
+                }
+                if let Some(g) = self.selected() {
+                    let id = self.state.team_id_of(&g.key);
+                    self.pick_shares = self.state.shares_of(&id);
+                    self.share_cursor = 0;
+                    self.mode = Mode::SharePick;
+                    self.say("Space toggles a team; Enter keeps the share set; Esc cancels.");
+                }
+            }
+            Ev::Char('u') => {
+                if self.view != View::Sessions {
+                    self.say("sharing a session starts from the Sessions tab");
+                    return;
+                }
+                if let Some(g) = self.selected() {
+                    let id = self.state.team_id_of(&g.key);
+                    if self.state.shares_of(&id).is_empty() {
+                        self.say(format!("'{}' is not shared with any team", g.title));
+                        return;
+                    }
+                    self.state.set_shares(&id, Default::default());
+                    self.say(format!("'{}' is no longer shared with any team", g.title));
+                    self.mark_view_follow(g);
+                    self.user_dirty = true;
+                }
             }
             // `/` opens the filter at the status line; `f` cycles which subset is listed.
             Ev::Char('/') => {
@@ -1363,6 +1480,7 @@ impl App {
         let ctx = palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
+            session_shared: self.is_selected_marked(),
             team_selected: self.team.get(self.team_index).is_some(),
             team_configured: self.team_configured,
         };

@@ -118,7 +118,7 @@ where
     S: FnMut(&str, u64, &[u8]) -> Result<Vec<u8>, String>,
 {
     let mut out = TeamPass::default();
-    for id in state.marked_sessions() {
+    for id in state.sessions_shared_with(space) {
         let Some(changed) = last_change_of(&id) else { continue };
         let plain = match content_of(&id) {
             Ok(b) => b,
@@ -127,7 +127,7 @@ where
         // Change is judged on the plaintext journal. Sealing draws a fresh key and nonce every
         // time, so hashing the sealed bytes would make every quiet tick look like a change.
         let hash = crate::mirror::file_hash_bytes(&plain);
-        let pushed_hash = state.team_hash(&id).unwrap_or_default();
+        let pushed_hash = state.team_hash(space, &id).unwrap_or_default();
         if !is_due(now, changed, quiet_secs, &hash, &pushed_hash) {
             out.skipped_unchanged.push(id);
             continue;
@@ -137,7 +137,7 @@ where
         let pushed = push_marked_sealed(state, remote, space, &id, |version| seal(&id, version, &plain));
         match pushed {
             Ok(()) => {
-                state.record_team_push(&id, &hash, now);
+                state.record_team_push(space, &id, &hash, now);
                 out.pushed.push(id);
             }
             Err(PushError::Held) => out.failed.push((id, "held by another machine; will retry".into())),

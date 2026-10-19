@@ -42,7 +42,7 @@ pub struct PulledRecord {
     pub text: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PullOutcome {
     /// Records that verified, ready for display.
     pub shown: Vec<PulledRecord>,

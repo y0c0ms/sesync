@@ -33,6 +33,7 @@ fn sandbox(name: &str) -> PathBuf {
 fn m_marks_then_unmarks_the_selected_session() {
     let root = sandbox("toggle");
     let mut a = app_with_one_session(&root);
+    a.set_teams(vec!["team-a".into()]);
     assert!(a.rows().len() >= 1, "a session is listed");
     a.handle(Ev::Char('m'), Instant::now());
     assert!(a.is_selected_marked(), "m marks the selected session");
@@ -45,8 +46,9 @@ fn m_marks_then_unmarks_the_selected_session() {
 fn a_mark_is_reported_in_the_status_line() {
     let root = sandbox("status");
     let mut a = app_with_one_session(&root);
+    a.set_teams(vec!["team-a".into()]);
     a.handle(Ev::Char('m'), Instant::now());
-    assert!(a.status().contains("marked"), "status says marked: {}", a.status());
+    assert!(a.status().contains("shared with team"), "status says shared: {}", a.status());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -54,6 +56,7 @@ fn a_mark_is_reported_in_the_status_line() {
 fn the_rename_key_still_renames() {
     let root = sandbox("rename");
     let mut a = app_with_one_session(&root);
+    a.set_teams(vec!["team-a".into()]);
     a.handle(Ev::Char('r'), Instant::now());
     assert_eq!(a.mode(), sesync::app::Mode::Rename, "r still enters rename mode");
     let _ = std::fs::remove_dir_all(&root);
@@ -63,6 +66,7 @@ fn the_rename_key_still_renames() {
 fn a_marked_row_is_flagged_for_the_view() {
     let root = sandbox("flag");
     let mut a = app_with_one_session(&root);
+    a.set_teams(vec!["team-a".into()]);
     let g = a.rows()[0].clone();
     assert!(!a.is_marked(&g), "unmarked at first");
     a.handle(Ev::Char('m'), Instant::now());

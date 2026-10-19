@@ -19,18 +19,19 @@ pub struct TeamWatch {
     pub trust: Option<Trust>,
 }
 
+/// One team's pull and the floors it was pulled under: the floors are per (space,
+/// conversation), so a record received under one team never raises another team's floor.
+#[derive(Debug, Clone)]
+pub struct TeamPull {
+    pub space: String,
+    pub out: PullOutcome,
+}
+
 impl TeamWatch {
-    /// Configured when the server address is set and the rest comes from either the
-    /// environment or the single credential the machine joined with. Missing any of them,
-    /// the team side stays off.
+    /// The first configured team, for callers that act on a single one (the TUI's manual
+    /// refresh uses all of them: see `teams_from_env`).
     pub fn from_env(config_dir: &std::path::Path) -> Option<TeamWatch> {
-        let base = std::env::var("SESYNC_TEAM_URL").ok()?;
-        let token = std::env::var("SESYNC_TEAM_TOKEN").ok();
-        let machine = std::env::var("SESYNC_TEAM_MACHINE").ok();
-        let space = std::env::var("SESYNC_TEAM_SPACE").ok();
-        let (token, machine, space, trust) = fill_from_credential(config_dir, token, machine, space)?;
-        let device = load_or_create(config_dir).ok()?;
-        Some(TeamWatch { base, token, machine, space, device, trust })
+        teams_from_env(config_dir).into_iter().next()
     }
 
     /// One verified pull, incremental: a conversation the server advertises at or below the floor
@@ -47,6 +48,35 @@ impl TeamWatch {
     /// set of what this device may show. For a caller that replaces its whole list with the result.
     pub fn pull_all(&self, last_seen: &BTreeMap<String, u64>) -> PullOutcome {
         self.pull_with(last_seen, pull_verified_all)
+    }
+
+    /// Pull every team this machine belongs to. One conversation shared into several teams is
+    /// fetched from each team that advertises it above that team's own floor, but the floors
+    /// stay per team, and the caller merges the results so the local view holds one entry per
+    /// conversation. Order is by space name, so it is deterministic.
+    pub fn pull_each(teams: &[TeamWatch], floors: &BTreeMap<String, BTreeMap<String, u64>>) -> Vec<TeamPull> {
+        let empty = BTreeMap::new();
+        teams.iter().map(|t| {
+            let own = floors.get(&t.space).unwrap_or(&empty);
+            TeamPull { space: t.space.clone(), out: t.pull_all(own) }
+        }).collect()
+    }
+
+    /// Every conversation the given pulls can show, one entry each: when a conversation was
+    /// pulled from more than one team the highest accepted sequence wins, so the newest copy a
+    /// team holds is the one shown. Ties keep the first team in order.
+    pub fn newest_per_conversation(pulls: &[TeamPull]) -> Vec<(String, Vec<u8>)> {
+        let mut best: BTreeMap<String, (u64, String, Vec<u8>)> = BTreeMap::new();
+        for p in pulls {
+            for r in &p.out.shown {
+                let seq = p.out.accepted.get(&r.conversation).copied().unwrap_or(0);
+                let entry = best.get(&r.conversation);
+                if entry.map_or(true, |(prev, _, _)| seq > *prev) {
+                    best.insert(r.conversation.clone(), (seq, p.space.clone(), r.text.clone()));
+                }
+            }
+        }
+        best.into_iter().map(|(conv, (_, _space, text))| (conv, text)).collect()
     }
 
     fn pull_with(&self, last_seen: &BTreeMap<String, u64>,
@@ -102,6 +132,62 @@ fn fill_from_credential(
     let trust = cred.as_ref().and_then(team_join::trust_of);
     if token.is_empty() || machine.is_empty() { return None; }
     Some((token, machine, space, trust))
+}
+
+/// Every team this machine belongs to. The server is named by `SESYNC_TEAM_URL`; a credential
+/// under the configuration directory names each team's space, and a token and machine may come
+/// from the environment instead when there is exactly one team. `SESYNC_TEAM_SPACE` narrows
+/// everything to that one team (the pre-multi-team behaviour). Sorted by space.
+pub fn teams_from_env(config_dir: &std::path::Path) -> Vec<TeamWatch> {
+    let Ok(base) = std::env::var("SESYNC_TEAM_URL") else { return Vec::new() };
+    let token = std::env::var("SESYNC_TEAM_TOKEN").ok();
+    let machine = std::env::var("SESYNC_TEAM_MACHINE").ok();
+    let named = std::env::var("SESYNC_TEAM_SPACE").ok();
+    let named_space = named.clone();
+    let mut spaces: Vec<String> = match named {
+        Some(s) => vec![s],
+        None => all_teams(config_dir),
+    };
+    // No credential at all: the environment may still name one team entirely.
+    if spaces.is_empty() {
+        if let (Some(t), Some(m)) = (token.clone(), machine.clone()) {
+            let Ok(device) = load_or_create(config_dir) else { return Vec::new() };
+            return vec![TeamWatch { base, token: t, machine: m, space: String::new(), device, trust: None }];
+        }
+        return Vec::new();
+    }
+    let multi = spaces.len() > 1;
+    spaces.sort();
+    spaces.dedup();
+    spaces.into_iter().filter_map(|space| {
+        let Some(device) = load_or_create(config_dir).ok() else { return None };
+        // Environment token/machine apply only when they cannot be ambiguous (one team) or
+        // when they were named together with the space.
+        let (token, machine, trust) = if multi && named_space.is_none() {
+            let cred = crate::team_join::load(&crate::team_join::credential_path(config_dir, &space)).ok()?;
+            (cred.token.clone(), cred.machine.clone(), crate::team_join::trust_of(&cred))
+        } else {
+            let (t, m, _s, trust) = fill_from_credential(config_dir, token.clone(), machine.clone(), Some(space.clone()))?;
+            (t, m, trust)
+        };
+        if token.is_empty() || machine.is_empty() { return None; }
+        Some(TeamWatch { base: base.clone(), token, machine, space, device, trust })
+    }).collect()
+}
+
+/// Every credential under the configuration directory, as space names.
+pub fn all_teams(config_dir: &std::path::Path) -> Vec<String> {
+    let dir = config_dir.join("teams");
+    let mut out: Vec<String> = std::fs::read_dir(dir).ok().into_iter().flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension()? == "cred" { p.file_stem().map(|s| s.to_string_lossy().to_string()) } else { None }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The only team credential on disk, or None when there is none or more than one.
