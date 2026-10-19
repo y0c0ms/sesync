@@ -81,38 +81,30 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
     // no longer exported. Without it a compacted journal would simply start mid-thread. (The
     // module doc has always claimed this mapping; the code never had it, which only became
     // visible once the archive stopped being exported.)
+    //
+    // It goes out as a *user* message, the shape the first message of a conversation already has
+    // and that `opencode import` accepts: an assistant record here needs a `parentID`, and a
+    // parentless one makes the whole import fail with "Missing key at [parentID]" - which creates
+    // the session row and then leaves it empty, the exact symptom seen on a real mirror.
     if let (Some(note), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
         let t = crate::journal::parse_iso_ms(ts).unwrap_or(0);
         first_ts = first_ts.min(t);
         last_ts = last_ts.max(t);
         let mid = next("msg", t);
-        let mk = |typ: &str, extra: Value, id: String| {
-            let mut p = match extra { Value::Object(m) => m, _ => Map::new() };
-            p.insert("type".into(), typ.into());
-            p.insert("id".into(), id.into());
-            p.insert("sessionID".into(), o.session_id.into());
-            p.insert("messageID".into(), mid.clone().into());
-            Value::Object(p)
-        };
-        let parts = vec![
-            mk("step-start", json!({}), next("prt", t)),
-            mk("text", json!({"text": note}), next("prt", t)),
-            mk("step-finish", json!({"reason": "stop", "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}}), next("prt", t)),
-        ];
+        let mut part = Map::new();
+        part.insert("type".into(), "text".into());
+        part.insert("text".into(), note.into());
+        part.insert("id".into(), next("prt", t).into());
+        part.insert("sessionID".into(), o.session_id.into());
+        part.insert("messageID".into(), mid.clone().into());
         let mut info = Map::new();
         info.insert("id".into(), mid.clone().into());
         info.insert("sessionID".into(), o.session_id.into());
-        info.insert("role".into(), "assistant".into());
-        info.insert("time".into(), json!({"created": t, "completed": t}));
-        info.insert("modelID".into(), model.1.clone().into());
-        info.insert("providerID".into(), model.0.clone().into());
-        info.insert("mode".into(), "build".into());
+        info.insert("role".into(), "user".into());
+        info.insert("time".into(), json!({"created": t}));
         info.insert("agent".into(), "build".into());
-        info.insert("path".into(), json!({"cwd": o.directory, "root": o.directory}));
-        info.insert("cost".into(), 0.into());
-        info.insert("tokens".into(), json!({"total":0,"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}));
-        info.insert("finish".into(), "stop".into());
-        out_msgs.push(json!({"info": Value::Object(info), "parts": parts}));
+        info.insert("model".into(), json!({"providerID": model.0, "modelID": model.1}));
+        out_msgs.push(json!({"info": Value::Object(info), "parts": [Value::Object(part)]}));
         last_id = Some(mid);
     }
 
@@ -303,5 +295,22 @@ mod tests {
             assert!(!text.contains(archived), "turns archived by the compaction must not be exported: {archived}");
         }
         assert!(text.contains(SUMMARY), "the compaction summary stands in for them");
+
+        // `opencode import` rejects an assistant message that has no `parentID` ("Missing key at
+        // [parentID]") and the whole import then leaves the session EMPTY - which is what emptied
+        // a real mirror. Pin the requirement, and the shape the summary goes out as.
+        let msgs = b["messages"].as_array().expect("messages");
+        let first = &msgs[0];
+        assert_eq!(first["info"]["role"], "user", "the summary opens the conversation as a user message");
+        assert!(
+            first["parts"][0]["text"].as_str().unwrap_or("").contains(SUMMARY),
+            "the summary text is the first part"
+        );
+        for m in msgs {
+            let info = &m["info"];
+            if info["role"] == "assistant" {
+                assert!(info.get("parentID").is_some(), "every assistant message needs a parentID: {info}");
+            }
+        }
     }
 }
