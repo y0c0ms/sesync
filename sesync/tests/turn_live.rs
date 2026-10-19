@@ -204,13 +204,13 @@ fn a_second_real_answer_turns_the_session_back() {
     let disk = State::load(&sb.join("state").join("state.json")).unwrap();
     assert!(disk.sources.contains_key(&omp_now.display().to_string()),
         "the second answer made omp the source again");
-    // The claude copy was re-minted under the new source key and the loser replaced.
+    // Mirror ids are minted from the conversation's stable id, so the claude copy is
+    // replaced in place: the same path holds the turn's result, and no second copy exists.
     let claude_now = walk(&sb.join("claude").join("projects"));
-    assert_eq!(claude_now.len(), 1, "exactly one claude copy after the turn");
-    let claude_text = fs::read_to_string(&claude_now[0]).unwrap();
+    assert_eq!(claude_now, vec![claude_path.clone()], "exactly one claude copy, at its stable path");
+    let claude_text = fs::read_to_string(&claude_path).unwrap();
     assert!(claude_text.contains("answered in omp again"), "the omp answer reached claude:\n{claude_text}");
-    assert!(!claude_path.exists(), "the losing claude file was replaced, not duplicated");
-    assert!(disk.mirror_keys.contains(&claude_now[0].display().to_string()),
+    assert!(disk.mirror_keys.contains(&claude_path.display().to_string()),
         "the claude copy is recorded as a mirror after losing the turn");
     let _ = fs::remove_dir_all(&sb);
 }

@@ -573,7 +573,7 @@ impl App {
     fn passes(&self, g: &Group) -> bool {
         let scope_ok = match self.filter_scope {
             FilterScope::All => true,
-            FilterScope::Marked => self.state.is_marked(&crate::manage::session_id_of(&g.key)),
+            FilterScope::Marked => self.state.is_marked(&self.state.team_id_of(&g.key)),
             FilterScope::Mirrored => {
                 !g.mirrors.is_empty()
                     || self.state.sources.get(&g.key).map_or(false, |s| !s.chosen_targets.is_empty())
@@ -619,7 +619,7 @@ impl App {
 
     /// Whether a listed group is marked for the team. The view uses this to show the mark.
     pub fn is_marked(&self, g: &Group) -> bool {
-        self.state.is_marked(&crate::manage::session_id_of(&g.key))
+        self.state.is_marked(&self.state.team_id_of(&g.key))
     }
 
     /// True when any local session has a chosen mirror still pending or failing, so the
@@ -635,7 +635,7 @@ impl App {
     /// Whether the selected session is marked for the team.
     /// The sessions-list columns for one row, read from state at the current time.
     pub fn session_cols(&self, g: &Group) -> crate::session_cols::Cols {
-        let id = manage::session_id_of(&g.key);
+        let id = self.state.team_id_of(&g.key);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         let last_change = self.state.sources.get(&g.key).map_or(0.0, |s| s.last_seen_change);
@@ -666,14 +666,14 @@ impl App {
     }
 
     pub fn is_selected_marked(&self) -> bool {
-        self.selected().map_or(false, |g| self.state.is_marked(&crate::manage::session_id_of(&g.key)))
+        self.selected().map_or(false, |g| self.state.is_marked(&self.state.team_id_of(&g.key)))
     }
 
     /// Toggle the team mark on the selected session. Returns the new state, or None if nothing
     /// is selected. Only the session id is stored, never its contents.
     pub fn toggle_mark(&mut self) -> Option<bool> {
         let g = self.selected()?;
-        let id = crate::manage::session_id_of(&g.key);
+        let id = self.state.team_id_of(&g.key);
         let now_marked = if self.state.is_marked(&id) {
             self.state.unmark(&id);
             false
