@@ -105,7 +105,37 @@ pub fn apply(state: &mut State, planned: &[Planned], lock_dir: &Path, sesync_loc
     log
 }
 
-fn forget(state: &mut State, p: &Planned) {
+/// The mirrors the user no longer wants: every recorded mirror whose target has left
+/// `chosen_targets`. Un-choosing a target is how a session stops being mirrored somewhere, and
+/// nothing else drops that copy — `plan()` only sees what is still recorded, and for OpenCode it
+/// declines anyway ("remove it through OpenCode, not by file").
+///
+/// Verdicts are the same ones `plan()` uses, so a file that changed since sesync wrote it, or
+/// whose source is gone, is still kept. The OpenCode verdict is the signal for the caller to
+/// remove the copy through the CLI and forget the record.
+pub fn plan_unchosen(state: &State) -> Vec<Planned> {
+    let mut out: Vec<Planned> = Vec::new();
+    for (key, src) in &state.sources {
+        for (target, m) in &src.mirrors {
+            if src.chosen_targets.contains(target) {
+                continue;
+            }
+            out.push(Planned {
+                source: key.clone(),
+                target: target.clone(),
+                path: m.path.clone(),
+                installed_hash: m.installed_hash.clone(),
+                verdict: verdict_for(key, target, &m.path, &m.installed_hash),
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+    out
+}
+
+/// Drop a mirror's bookkeeping: its record on the source and its `mirror_keys` entry. Used after
+/// the copy itself is gone, whichever way it went.
+pub fn forget(state: &mut State, p: &Planned) {
     if let Some(src) = state.sources.get_mut(&p.source) {
         src.mirrors.remove(&p.target);
     }

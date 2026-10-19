@@ -4,7 +4,7 @@
 use sesync::lock::ClaimOutcome;
 use sesync::manage::{delete_group, Group, Roots};
 use sesync::mirror::file_hash;
-use sesync::mirror_cleanup::{apply, plan, Verdict};
+use sesync::mirror_cleanup::{apply, plan, plan_unchosen, Verdict};
 use sesync::state::{Mirror, Source, State};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -188,4 +188,73 @@ fn deleting_a_session_removes_only_that_file_and_leaves_its_mirror() {
     assert!(mir.exists(), "its mirror in another harness is not touched by delete");
     let _ = ClaimOutcome::Ran(()); // the claim type is part of the public contract
     let _ = fs::remove_dir_all(&sb);
+}
+
+// ---- the mirrors the user no longer wants --------------------------------------------------
+//
+// Un-choosing a target is how a session stops being mirrored somewhere. Nothing else drops that
+// copy: `plan` only sees what is still recorded, and it declines for OpenCode by design ("remove
+// it through OpenCode, not by file"). A pass now drops them, and these pin the rule.
+
+#[test]
+fn an_unchosen_file_mirror_is_planned_for_removal_and_forgotten() {
+    let sb = sandbox("unchosen");
+    let (key, _src, mir) = recorded_pair(&sb, "session body\n");
+    let mut state = state_with_mirror(&key, &mir, &file_hash(&mir).unwrap());
+    assert!(state.sources[&key].chosen_targets.is_empty(), "no target is chosen, by construction");
+
+    let planned = plan_unchosen(&state);
+    assert_eq!(planned.len(), 1, "the un-chosen mirror is planned");
+    assert_eq!(planned[0].verdict, Verdict::Remove);
+    assert!(mir.exists(), "planning changes nothing");
+
+    let log = apply(&mut state, &planned, &sb.join("locks"), Path::new(MISSING_CLIENT));
+    assert!(log.iter().any(|l| l.starts_with("removed")), "log: {log:?}");
+    assert!(!mir.exists(), "the copy is gone");
+    assert!(state.sources[&key].mirrors.is_empty(), "the record is gone");
+    assert!(
+        !state.mirror_keys.contains(&mir.display().to_string()),
+        "and so is its mirror_keys entry, so the scan never re-adopts it"
+    );
+}
+
+#[test]
+fn a_chosen_mirror_is_never_in_the_unchosen_plan() {
+    let sb = sandbox("chosen");
+    let (key, _src, mir) = recorded_pair(&sb, "session body\n");
+    let mut state = state_with_mirror(&key, &mir, &file_hash(&mir).unwrap());
+    state.sources.get_mut(&key).unwrap().chosen_targets.insert("pi".into());
+
+    assert!(plan_unchosen(&state).is_empty(), "a chosen target is left alone");
+    assert!(mir.exists(), "and its copy is untouched");
+}
+
+#[test]
+fn an_un_chosen_opencode_mirror_is_handed_to_the_cli_and_kept_by_the_file_rule() {
+    let sb = sandbox("unchosen-opencode");
+    let key = sb.join("omp").join("sessions").join("src.jsonl").display().to_string();
+    fs::create_dir_all(Path::new(&key).parent().unwrap()).unwrap();
+    fs::write(&key, "session body\n").unwrap();
+
+    let mut state = State::default();
+    let mut src = Source::new("omp", &key);
+    src.mirrors.insert("opencode".into(), Mirror {
+        target: "opencode".into(),
+        // For OpenCode the record's path is the session id, not a file: there is nothing to delete.
+        path: "ses_003220097fe04c7bvvm4CnHYO6".into(),
+        source_hash: String::new(),
+        installed_hash: String::new(),
+        diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
+    });
+    state.sources.insert(key.clone(), src);
+
+    let planned = plan_unchosen(&state);
+    assert_eq!(planned.len(), 1, "an un-chosen OpenCode mirror is planned too");
+    assert_eq!(
+        planned[0].verdict,
+        Verdict::Keep("OpenCode session: remove it through OpenCode, not by file".into()),
+        "the file rule never touches it; the caller removes it through the CLI"
+    );
 }

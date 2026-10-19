@@ -317,6 +317,11 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     }
     let changed = scan(env, state);
     let attempted = changed.len();
+    // Un-choosing a target has to drop the copy, and that is not a content change, so it runs on
+    // every pass rather than inside the `changed` loop.
+    for line in drop_unchosen(env, state) {
+        println!("sesync: {line}");
+    }
     for s in &changed {
         sync_chosen(env, state, s);
     }
@@ -327,6 +332,33 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
         eprintln!("sesync: cannot save state: {e}");
     }
     attempted
+}
+
+/// Drop the mirrors the user no longer wants. Un-choosing a target is how a session stops being
+/// mirrored there, and nothing else removes the copy: `sesync mirrors` only plans what is still
+/// recorded, and it declines for OpenCode by design ("remove it through OpenCode"). File mirrors
+/// go through the same safety rule and logging as that command; an OpenCode mirror is removed by
+/// asking the CLI to delete the session, never by touching a file.
+fn drop_unchosen(env: &Env, state: &mut State) -> Vec<String> {
+    let planned = sesync::mirror_cleanup::plan_unchosen(state);
+    let (opencode, files): (Vec<_>, Vec<_>) =
+        planned.into_iter().partition(|p| p.target == "opencode");
+    let mut log = sesync::mirror_cleanup::apply(state, &files, &env.lock_dir(), &env.sesync_lock);
+    for p in &opencode {
+        // `opencode session delete` is scoped to the directory it runs in: from the wrong cwd it
+        // answers "Session not found" and the copy would silently stay behind. Use the
+        // conversation's own cwd, the same way the import does.
+        let fmt = state.sources.get(&p.source).map(|s| s.fmt.clone()).unwrap_or_default();
+        let cwd = sesync::buckets::cwd_from_head(&fmt, std::path::Path::new(&p.source)).unwrap_or_default();
+        match sesync::install::remove_opencode_session(&env.opencode_bin, &p.path, &cwd, None) {
+            Ok(()) => {
+                sesync::mirror_cleanup::forget(state, p);
+                log.push(format!("removed opencode {}", p.path));
+            }
+            Err(e) => log.push(format!("kept    opencode {}: {e}", p.path)),
+        }
+    }
+    log
 }
 
 /// Write mirrors for one changed source, only into the targets the user chose for it. A source

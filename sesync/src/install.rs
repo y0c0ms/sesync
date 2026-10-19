@@ -108,6 +108,42 @@ pub fn install_gemini(
     Ok(produced)
 }
 
+/// Remove an O-penCode session by id, through the CLI. The mirror's `path` IS its session id, so
+/// this is how an OpenCode mirror is taken away - never by deleting a file. `env_xdg` points the
+/// CLI's XDG_* variables at a sandbox; `None` inherits the real environment. A session that is
+/// not there counts as removed: that is the normal state of a mirror never imported.
+pub fn remove_opencode_session(
+    opencode: &Path,
+    mirror_id: &str,
+    cwd: &str,
+    env_xdg: Option<&Path>,
+) -> Result<(), String> {
+    let mut del = Command::new(opencode);
+    del.args(["session", "delete", mirror_id]);
+    if Path::new(cwd).is_dir() {
+        del.current_dir(cwd);
+    }
+    if let Some(x) = env_xdg {
+        del.env("XDG_DATA_HOME", x.join("data"))
+            .env("XDG_CONFIG_HOME", x.join("cfg"))
+            .env("XDG_STATE_HOME", x.join("state"))
+            .env("XDG_CACHE_HOME", x.join("cache"));
+    }
+    let out = del.output().map_err(|e| format!("cannot run opencode session delete: {e}"))?;
+    // Exit 0 is success, whatever it printed: this CLI writes its "Session … deleted" line to
+    // stderr, so requiring an empty stderr turned a real deletion into a reported failure.
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // A session that is not there is the normal case for a mirror that was never imported.
+    if err.contains("not found") || stdout.contains("not found") {
+        return Ok(());
+    }
+    Err(format!("opencode session delete failed: {}", if err.is_empty() { stdout } else { err }))
+}
+
 /// Install an omp/Pi journal as an O-penCode session. Ported from install_opencode:
 /// `sesync-conv to-opencode` writes a bundle, then `opencode import` loads it. Any previous
 /// import of the same mirror id is deleted first, because `opencode import` only upserts the
@@ -148,22 +184,11 @@ pub fn install_opencode(
         .and_then(|v| v["info"]["directory"].as_str().map(str::to_string))
         .unwrap_or_default();
     let dir = if Path::new(cwd).is_dir() { cwd.to_string() } else { bundle_dir };
-    let workdir = if Path::new(&dir).is_dir() { Some(PathBuf::from(dir)) } else { None };
+    let workdir = if Path::new(&dir).is_dir() { Some(PathBuf::from(&dir)) } else { None };
 
     // Delete the previous import of this mirror. A missing session is the normal first
     // write and is ignored; any other delete failure surfaces on the import below.
-    let mut del = Command::new(opencode);
-    del.args(["session", "delete", mirror_id]);
-    if let Some(w) = &workdir {
-        del.current_dir(w);
-    }
-    if let Some(x) = env_xdg {
-        del.env("XDG_DATA_HOME", x.join("data"))
-            .env("XDG_CONFIG_HOME", x.join("cfg"))
-            .env("XDG_STATE_HOME", x.join("state"))
-            .env("XDG_CACHE_HOME", x.join("cache"));
-    }
-    let _ = del.output();
+    let _ = remove_opencode_session(opencode, mirror_id, dir.as_str(), env_xdg);
 
     let mut cmd = Command::new(opencode);
     cmd.arg("import").arg(&bundle);
