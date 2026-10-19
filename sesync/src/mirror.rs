@@ -34,6 +34,17 @@ pub fn file_hash_bytes(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether a source or mirror key names a file in a harness store, as opposed to an OpenCode
+/// session id (`ses_...`), which is opaque and lives in the database.
+///
+/// This used to be spelled `key.starts_with('/')`. A Windows path is absolute but never starts
+/// with `/`, so the test was false for every path on Windows: the demoted source in `promote`
+/// was never recorded in `mirror_keys`, the scan re-adopted it as a source, and a conversation
+/// ended up claiming to be both the source and its own mirror.
+pub fn is_file_key(key: &str) -> bool {
+    std::path::Path::new(key).is_absolute()
+}
+
 /// Lowercase sha256 hex of a file, read in 1 MiB chunks (the Python file_hash).
 pub fn file_hash(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read;

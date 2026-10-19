@@ -238,7 +238,7 @@ fn promote(state: &mut State, edit: &MirrorEdit) -> Option<String> {
     // The old source's harness becomes a mirror of the winner. For a file that is the stale
     // bytes as they sit on disk; for OpenCode it is the conversation id, and the next write
     // replaces that conversation in place.
-    let installed_hash = if edit.source_key.starts_with('/') {
+    let installed_hash = if crate::mirror::is_file_key(&edit.source_key) {
         crate::mirror::file_hash(Path::new(&edit.source_key)).unwrap_or_default()
     } else {
         String::new()
@@ -257,7 +257,7 @@ fn promote(state: &mut State, edit: &MirrorEdit) -> Option<String> {
     state.sources.insert(edit.path.clone(), new);
     // The winner is no longer a mirror; the old source now is, when it is a file.
     state.mirror_keys.remove(&edit.path);
-    if edit.source_key.starts_with('/') {
+    if crate::mirror::is_file_key(&edit.source_key) {
         state.mirror_keys.insert(edit.source_key.clone());
     }
     Some(edit.path.clone())

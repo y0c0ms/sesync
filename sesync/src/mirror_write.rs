@@ -169,7 +169,7 @@ pub fn record_mirror(state: &mut State, source_key: &str, target: &str, installe
     if let Some((old_path, old_hash)) = replaced {
         if old_path != path {
             let p = Path::new(&old_path);
-            let ours_unchanged = old_path.starts_with('/')
+            let ours_unchanged = crate::mirror::is_file_key(&old_path)
                 && !old_hash.is_empty()
                 && file_hash(p).map(|h| h == old_hash).unwrap_or(false);
             if ours_unchanged {
