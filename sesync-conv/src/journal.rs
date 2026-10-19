@@ -170,6 +170,19 @@ impl Journal {
             cur = r.get("parentId").and_then(Value::as_str);
         }
         chain.reverse();
+        // The live context, not the whole history. Everything before the last compaction's kept
+        // window was archived into that compaction's summary, and the engines resume without it:
+        // an omp session compacted down to ~30k tokens was exported to OpenCode as 3.4M tokens,
+        // because the chain walk through `parentId` crosses the compaction and keeps pulling in
+        // the archived turns. The compaction record itself stays in the window so the target
+        // still receives the summary that replaced them.
+        if let Some(cut) = chain.iter().rposition(|r| r.get("type").and_then(Value::as_str) == Some("compaction")) {
+            let kept = chain[cut].get("firstKeptEntryId").and_then(Value::as_str);
+            let start = kept
+                .and_then(|id| chain[..cut].iter().rposition(|r| r.get("id").and_then(Value::as_str) == Some(id)))
+                .unwrap_or(cut);
+            chain.drain(..start);
+        }
         chain
             .into_iter()
             .filter(|r| r.get("type").and_then(Value::as_str) == Some("message"))
@@ -374,4 +387,63 @@ pub fn journal_filename(timestamp_iso: &str, id: &str) -> String {
 pub fn blobs_dir_for(journal_path: &Path) -> Option<PathBuf> {
     // <agent>/sessions/<bucket>/<file> -> <agent>/blobs
     journal_path.parent()?.parent()?.parent().map(|a| a.join("blobs"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Everything before the last compaction's kept window was archived into that compaction's
+    /// summary, and the engines resume without it. Exporting it anyway is what turned a session
+    /// compacted to ~32k tokens into a 3.4M-token OpenCode copy.
+    #[test]
+    fn messages_stop_at_the_last_compactions_kept_window() {
+        let dir = std::env::temp_dir().join(format!("sesync-conv-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let msg = |id: &str, parent: &str, t: &str, text: &str| {
+            let p = if parent.is_empty() { String::new() } else { format!(r#","parentId":"{parent}""#) };
+            format!(
+                r#"{{"type":"message","id":"{id}"{p},"timestamp":"{t}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        writeln!(f, r#"{{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z"}}"#).unwrap();
+        writeln!(f, "{}", msg("a1", "", "2026-01-01T00:00:01.000Z", "archived one")).unwrap();
+        writeln!(f, "{}", msg("a2", "a1", "2026-01-01T00:00:02.000Z", "archived two")).unwrap();
+        writeln!(f, "{}", msg("k1", "a2", "2026-01-01T00:00:03.000Z", "kept one")).unwrap();
+        writeln!(f, "{}", msg("k2", "k1", "2026-01-01T00:00:04.000Z", "kept two")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"compaction","id":"c1","parentId":"k2","timestamp":"2026-01-01T00:00:05.000Z","summary":"what came before","firstKeptEntryId":"k1"}}"#
+        )
+        .unwrap();
+        writeln!(f, "{}", msg("n1", "c1", "2026-01-01T00:00:06.000Z", "newest")).unwrap();
+        drop(f);
+
+        let j = Journal::read(&path).unwrap();
+        let texts: Vec<&str> = j.messages().iter().map(|m| m.first_text().unwrap_or("")).collect();
+        assert_eq!(texts, vec!["kept one", "kept two", "newest"], "archived turns must not be exported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A journal with no compaction is unchanged: the whole chain is the live context.
+    #[test]
+    fn without_a_compaction_the_whole_chain_is_exported() {
+        let dir = std::env::temp_dir().join(format!("sesync-conv-nocompact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"message","id":"a1","timestamp":"2026-01-01T00:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"first"}}]}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:02.000Z","message":{{"role":"user","content":[{{"type":"text","text":"second"}}]}}}}"#).unwrap();
+        drop(f);
+        let j = Journal::read(&path).unwrap();
+        let texts: Vec<&str> = j.messages().iter().map(|m| m.first_text().unwrap_or("")).collect();
+        assert_eq!(texts, vec!["first", "second"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
