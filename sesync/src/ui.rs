@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use std::time::Instant;
@@ -219,8 +219,11 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
 
 /// Fill the area with the page background and draw a bordered box; returns the inside of the box.
 fn dialog(f: &mut Frame, title: &str, th: &Theme, outer: Rect) -> Rect {
-    // A dialog floats over rows that were already painted; restamp them with the page
-    // background so no list text shows through, then draw the box.
+    // A dialog floats over rows that were already painted. `set_style` only restyles the cells
+    // that are there - it does not replace their symbols - so restamping the background alone
+    // leaves the list's characters (a stray `"`, the TEAM column) showing through under the box.
+    // Clear the rectangle first (that is what removes the symbols), then paint the background.
+    f.render_widget(Clear, outer);
     f.render_widget(Block::default().style(Style::default().bg(th.bg)), outer);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -310,8 +313,11 @@ fn draw_session_menu(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 /// own format is never offered. A ticked row is marked with [x], and each row leads with the
 /// harness's glyph so the list reads at a glance.
 fn draw_mirror_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    const HINT: &str = "up/down · space tick · a all · n none · enter mirror · esc cancel";
     let targets = app.picker_targets();
-    let outer = centered(56, targets.len().max(1) as u16 + 4, area);
+    // Wide enough for the hint plus the border and padding: the fixed 56 used to cut "esc cancel" off.
+    let width = (HINT.chars().count() as u16 + 4).max(56);
+    let outer = centered(width, targets.len().max(1) as u16 + 4, area);
     let inner = dialog(f, "Mirror to harness", th, outer);
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     if targets.is_empty() {
@@ -331,7 +337,7 @@ fn draw_mirror_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         }).collect();
         f.render_widget(List::new(lines), parts[0]);
     }
-    hint(f, "up/down · space tick · a all · n none · enter mirror · esc cancel", th, parts[1]);
+    hint(f, HINT, th, parts[1]);
 }
 
 /// The glyph shown before a harness's name in the picker.

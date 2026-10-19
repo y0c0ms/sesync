@@ -32,10 +32,12 @@ impl Env {
         let num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         // install.sh puts sesync-conv and sesync-lock next to this binary (~/.local/bin by default).
         // Look there first, so the defaults match what is installed rather than a ~/bin that may not exist.
+        // Windows binaries carry `.exe`, so the bare name is not the file that exists.
         let beside_me = |name: &str| -> PathBuf {
+            let candidates: Vec<PathBuf> = executable_candidates(Path::new(name));
             std::env::current_exe().ok()
-                .and_then(|e| e.parent().map(|d| d.join(name)))
-                .filter(|p| p.exists())
+                .and_then(|e| e.parent().map(|d| candidates.iter().map(|c| d.join(c)).collect::<Vec<_>>()))
+                .and_then(|ps| ps.into_iter().find(|p| p.exists()))
                 .unwrap_or_else(|| home.join(".local/bin").join(name))
         };
         Env {
@@ -735,12 +737,28 @@ fn perform_setup(app: &mut sesync::app::App, req: sesync::app::SetupRequest, con
 
 /// Whether a tool can be run: an explicit path is checked directly, a bare name is looked up
 /// on PATH. Used for the installed-harness probe, which must not start the tool.
+///
+/// Windows executables carry `.exe`, and the configured name is usually bare (`opencode`), so
+/// every candidate is also tried with the platform's executable suffixes. Without this, a
+/// harness whose CLI is plainly installed is never offered as a mirror target.
+fn executable_candidates(tool: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![tool.to_path_buf()];
+    if tool.extension().is_none() {
+        for ext in ["exe", "cmd", "bat"] {
+            out.push(tool.with_extension(ext));
+        }
+    }
+    out
+}
+
 fn command_available(tool: &Path) -> bool {
+    let candidates = executable_candidates(tool);
     if tool.parent().map_or(false, |d| !d.as_os_str().is_empty()) {
-        return tool.is_file();
+        return candidates.iter().any(|c| c.is_file());
     }
     std::env::var_os("PATH").map_or(false, |paths| {
-        std::env::split_paths(&paths).any(|d| d.join(tool).is_file())
+        std::env::split_paths(&paths)
+            .any(|d| candidates.iter().any(|c| d.join(c).is_file()))
     })
 }
 
