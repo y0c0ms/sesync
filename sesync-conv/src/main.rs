@@ -190,22 +190,25 @@ fn main() {
             // to-gemini <journal.jsonl> --gemini-dir <~/.gemini> [--project <abs path>] [--slug <slug>] [--id UUID]
             let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
             let gdir = PathBuf::from(arg(&args, "--gemini-dir").unwrap_or_else(|| usage()));
-            let raw = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let mut records: Vec<Value> = Vec::new();
-            let mut header_id = String::new();
-            let mut start = String::new();
-            let mut cwd = String::new();
-            for (n, line) in raw.lines().enumerate() {
-                let t = line.trim();
-                if t.is_empty() { continue; }
-                let v: Value = serde_json::from_str(t).map_err(|e| format!("{}:{}: {e}", p.display(), n + 1))?;
-                if v.get("type").and_then(Value::as_str) == Some("session") {
-                    header_id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                    start = v.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
-                    cwd = v.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
-                } else {
-                    records.push(v);
-                }
+            let j = journal::Journal::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let header_id = j.session_id().unwrap_or("").to_string();
+            let start = j.timestamp().unwrap_or("").to_string();
+            let cwd = j.cwd().unwrap_or("").to_string();
+            // The live window, not the whole journal: the archived turns are already summarised
+            // by the compaction, and exporting them inflated a mirror far past the model's
+            // window. The summary itself is carried as the first message, since Gemini has no
+            // compaction of its own to replace them.
+            let mut records: Vec<Value> = j.live_records().into_iter().cloned().map(Value::Object).collect();
+            if let Some(note) = j.compaction_note() {
+                records.insert(
+                    0,
+                    serde_json::json!({
+                        "type": "message",
+                        "id": "compaction-summary",
+                        "timestamp": start,
+                        "message": {"role": "user", "content": [{"type": "text", "text": note}]},
+                    }),
+                );
             }
             // The journal's own directory is the project; --project overrides for callers
             // that know better. Normalized, so the registry key and the header hash match
@@ -335,4 +338,26 @@ fn main() {
         process::exit(1);
     }
     let _ = Map::<String, Value>::new();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::fixture::*;
+
+    /// `to-pi` and `to-omp` copy the journal itself rather than exporting a live window: the
+    /// format is theirs, and the receiving harness applies its own compaction. So the archive and
+    /// the compaction record must survive the copy, unlike the message-based targets (OpenCode,
+    /// Claude, Gemini) which export the window and carry the summary instead.
+    #[test]
+    fn a_journal_copy_keeps_the_compaction_record_and_the_archive() {
+        let mut j = compacted_journal("journal-copy");
+        rewrite_ids(&mut j, "01a10000-0000-7000-9000-000000000000");
+        let types: Vec<&str> = j.records.iter().filter_map(|r| r.get("type").and_then(Value::as_str)).collect();
+        assert!(types.contains(&"compaction"), "the compaction record survives the copy");
+        let all = serde_json::to_string(&j.records).unwrap();
+        for t in [ARCHIVED_ONE, KEPT_ONE, NEWEST, SUMMARY] {
+            assert!(all.contains(t), "a journal copy keeps every record, including {t}");
+        }
+    }
 }

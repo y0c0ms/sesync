@@ -435,4 +435,29 @@ mod tests {
         assert_eq!(resolve_slug(&d, "/home/u/proj"), "proj-2");
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// Same compacted journal as every other target's test, driven the way `to-gemini` does it:
+    /// the live window plus the summary note, never the archive.
+    #[test]
+    fn a_compacted_journal_exports_only_the_live_window() {
+        use crate::journal::fixture::*;
+        let j = compacted_journal("gemini");
+        let mut records: Vec<Value> = j.live_records().into_iter().cloned().map(Value::Object).collect();
+        if let Some(note) = j.compaction_note() {
+            records.insert(0, json!({
+                "type": "message", "id": "compaction-summary", "timestamp": "2026-01-01T00:00:00.000Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": note}]},
+            }));
+        }
+        let (lines, _) = to_session_lines("0f3c9a12-1111-4222-8333-444455556666", "/home/u/proj",
+            "2026-01-01T00:00:00.000Z", &records).unwrap();
+        let text = lines.join("\n");
+        for kept in [KEPT_ONE, KEPT_TWO, NEWEST] {
+            assert!(text.contains(kept), "the live window is exported: {kept}");
+        }
+        for archived in [ARCHIVED_ONE, ARCHIVED_TWO] {
+            assert!(!text.contains(archived), "turns archived by the compaction must not be exported: {archived}");
+        }
+        assert!(text.contains(SUMMARY), "the compaction summary stands in for them");
+    }
 }
