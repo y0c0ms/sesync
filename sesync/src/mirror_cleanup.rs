@@ -133,6 +133,24 @@ pub fn plan_unchosen(state: &State) -> Vec<Planned> {
     out
 }
 
+/// Stop claiming a mirror without removing the copy. This is what an un-chosen target gets when
+/// the copy cannot safely be deleted - it changed since sesync wrote it, has no recorded hash, or
+/// its source is gone. Keeping the record would leave sesync pointing at a copy it will never
+/// update again, shown as a mirror forever; releasing it lets the file be a session of its own and
+/// makes the TUI honest. Returns one log line per mirror.
+pub fn release(state: &mut State, planned: &[Planned]) -> Vec<String> {
+    let mut log = Vec::new();
+    for p in planned {
+        let why = match &p.verdict {
+            Verdict::Keep(r) => r.clone(),
+            _ => "not removed".to_string(),
+        };
+        forget(state, p);
+        log.push(format!("released {} {} (kept the copy: {why})", p.target, p.path));
+    }
+    log
+}
+
 /// Drop a mirror's bookkeeping: its record on the source and its `mirror_keys` entry. Used after
 /// the copy itself is gone, whichever way it went.
 pub fn forget(state: &mut State, p: &Planned) {

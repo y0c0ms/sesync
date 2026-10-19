@@ -4,7 +4,7 @@
 use sesync::lock::ClaimOutcome;
 use sesync::manage::{delete_group, Group, Roots};
 use sesync::mirror::file_hash;
-use sesync::mirror_cleanup::{apply, plan, plan_unchosen, Verdict};
+use sesync::mirror_cleanup::{apply, plan, plan_unchosen, release, Verdict};
 use sesync::state::{Mirror, Source, State};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -257,4 +257,29 @@ fn an_un_chosen_opencode_mirror_is_handed_to_the_cli_and_kept_by_the_file_rule()
         Verdict::Keep("OpenCode session: remove it through OpenCode, not by file".into()),
         "the file rule never touches it; the caller removes it through the CLI"
     );
+}
+
+/// A copy that cannot be proven unchanged is kept, but its record is released. Keeping the record
+/// would leave sesync pointing at a mirror it will never update again, shown in the TUI forever -
+/// which is the state the operator hit after un-ticking a target whose record had no hash.
+#[test]
+fn a_mirror_that_cannot_be_proven_unchanged_is_released_not_deleted() {
+    let sb = sandbox("release");
+    let (key, _src, mir) = recorded_pair(&sb, "session body\n");
+    let mut state = state_with_mirror(&key, &mir, ""); // no recorded hash
+
+    let planned = plan_unchosen(&state);
+    assert_eq!(
+        planned[0].verdict,
+        Verdict::Keep("no recorded hash, so it cannot be shown unchanged".into())
+    );
+
+    let log = release(&mut state, &planned);
+    assert!(mir.exists(), "the copy itself is kept");
+    assert!(state.sources[&key].mirrors.is_empty(), "but the record is gone");
+    assert!(
+        !state.mirror_keys.contains(&mir.display().to_string()),
+        "and its mirror_keys entry, so the file can be a session of its own again"
+    );
+    assert!(log[0].starts_with("released"), "log: {log:?}");
 }

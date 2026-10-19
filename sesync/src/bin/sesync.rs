@@ -341,9 +341,15 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
 /// asking the CLI to delete the session, never by touching a file.
 fn drop_unchosen(env: &Env, state: &mut State) -> Vec<String> {
     let planned = sesync::mirror_cleanup::plan_unchosen(state);
-    let (opencode, files): (Vec<_>, Vec<_>) =
+    let (opencode, rest): (Vec<_>, Vec<_>) =
         planned.into_iter().partition(|p| p.target == "opencode");
-    let mut log = sesync::mirror_cleanup::apply(state, &files, &env.lock_dir(), &env.sesync_lock);
+    // Only the copies that provably lose nothing are deleted; the rest are released, so the record
+    // stops claiming a mirror sesync will never update again while the copy itself stays.
+    let (removable, releasable): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|p| matches!(p.verdict, sesync::mirror_cleanup::Verdict::Remove));
+    let mut log = sesync::mirror_cleanup::apply(state, &removable, &env.lock_dir(), &env.sesync_lock);
+    log.extend(sesync::mirror_cleanup::release(state, &releasable));
     for p in &opencode {
         // `opencode session delete` is scoped to the directory it runs in: from the wrong cwd it
         // answers "Session not found" and the copy would silently stay behind. Use the
