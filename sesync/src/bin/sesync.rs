@@ -593,9 +593,9 @@ fn main() {
                 let scratch = env.state_dir.join("team-scratch");
                 let paths: std::collections::HashMap<String, (String, f64)> = state.marked_sessions().into_iter()
                     .filter_map(|id| {
-                        let key = state.sources.iter()
-                            .find(|(_, s)| sesync::manage::session_id_of(&s.key) == id || s.key == id)
-                            .map(|(k, _)| k.clone())?;
+                        // The marked id is the conversation's stable id; the entry holding it
+                        // can move between keys when a local turn promotes a copy.
+                        let key = state.key_of_team_id(&id)?;
                         let fmt = state.sources[&key].fmt.clone();
                         let changed = state.sources[&key].last_seen_change;
                         Some((id, (format!("{fmt}\u{1f}{key}"), changed)))
