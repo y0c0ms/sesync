@@ -228,6 +228,22 @@ pub fn delete_group(roots: &Roots, g: &Group, lock_dir: &Path, sesync_lock: &Pat
 /// Rename a source by rewriting only its title record. Refused outside the roots.
 pub fn rename_group(roots: &Roots, g: &Group, title: &str, lock_dir: &Path, sesync_lock: &Path) -> Result<String, String> {
     let new = validate_title(title)?;
+    // An OpenCode session has no file: its name lives in OpenCode's own store and is changed
+    // through its API (PATCH /session/{id}), reusing a `serve` that is already running. This has
+    // to come before the orphan check - an OpenCode source is never "on disk", which is what the
+    // rename used to complain about.
+    if g.fmt == "opencode" {
+        let conv = conversation_id(&g.key);
+        let outcome = with_claim(sesync_lock, Some(lock_dir), &conv, "tui", std::process::id(), &g.key, || {
+            crate::opencode_rename::rename_session(&g.key, &new, None, None)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        return match outcome {
+            ClaimOutcome::Skipped(h) => Err(format!("conversation is in use by {h}")),
+            ClaimOutcome::Ran(r) => r.map(|_| new),
+        };
+    }
     if g.orphan {
         return Err("source is not on disk; nothing to rename".into());
     }
