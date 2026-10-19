@@ -99,15 +99,17 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
     std::env::set_var("SESYNC_TEAM_URL", &base);
     let journal = b"{\"type\":\"session\"}\nthe team pass session\n".to_vec();
     let mut state = State::default();
-    state.mark("ses_pass");
+    state.share("ses_pass", "personal");
     let content = |id: &str| -> Result<Vec<u8>, String> {
         assert_eq!(id, "ses_pass", "only the marked session is offered");
         Ok(journal.clone())
     };
-    let pass = team_pass::run(&dir.join("keys/writer"), &mut state, now as f64 + 3600.0,
+    let passes = team_pass::run(&dir.join("keys/writer"), &mut state, now as f64 + 3600.0,
         content, |_| Some(now as f64)).expect("the writer has a team configured");
-    assert_eq!(pass.pushed, vec!["ses_pass".to_string()], "the marked, quiet session is pushed: {pass:?}");
-    assert!(state.team_hash("ses_pass").is_some(), "the push is recorded in state");
+    assert_eq!(passes.len(), 1, "the machine belongs to one team here");
+    let pass = &passes[0];
+    assert_eq!(pass.pushed, vec!["ses_pass".to_string()], "the shared, quiet session is pushed: {pass:?}");
+    assert!(state.team_hash("team-a", "ses_pass").is_some(), "the push is recorded in state");
     let _ = writer_cred;
 
     // The database holds the session only as ciphertext.
@@ -138,8 +140,8 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
     // A second pass with the same content uploads nothing new.
     let again = team_pass::run(&dir.join("keys/writer"), &mut state, now as f64 + 7200.0,
         |_| Ok(journal.clone()), |_| Some(now as f64)).unwrap();
-    assert!(again.pushed.is_empty(), "an unchanged session is not re-uploaded: {again:?}");
-    assert_eq!(again.skipped_unchanged, vec!["ses_pass".to_string()]);
+    assert!(again.iter().all(|p| p.pushed.is_empty()), "an unchanged session is not re-uploaded: {again:?}");
+    assert_eq!(again[0].skipped_unchanged, vec!["ses_pass".to_string()]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

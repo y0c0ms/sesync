@@ -29,7 +29,7 @@ impl TeamRemote for Fake {
 
 fn marked(id: &str) -> State {
     let mut st = State::default();
-    st.mark(id);
+    st.share(id, "personal");
     st
 }
 

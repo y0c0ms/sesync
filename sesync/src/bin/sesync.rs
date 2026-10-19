@@ -547,7 +547,9 @@ fn main() {
             std::env::var("SESYNC_POLL").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0));
         let mut passes = 0u64;
         // The team side is optional: configured only by the team environment (see team_watch).
-        let team = sesync::team_watch::TeamWatch::from_env(&team_config_dir());
+        // A machine can belong to more than one team; every one of them is pulled and pushed.
+        let teams = sesync::team_watch::teams_from_env(&team_config_dir());
+        state.migrate_legacy_team_state(&teams.iter().map(|t| t.space.clone()).collect::<Vec<_>>());
         // The team pull and push run on their own interval: SESYNC_POLL at first, doubling while the
         // team has nothing new, capped at SESYNC_TEAM_POLL_MAX (team_backoff). The local pass is not
         // affected and still runs on every SESYNC_POLL tick.
@@ -562,21 +564,22 @@ fn main() {
             if team_due {
                 // Set when a pull accepts a record or a push succeeds: the team interval resets.
                 let mut activity = false;
-                if let Some(t) = &team {
+                if !teams.is_empty() {
                     // Display-only: the pull verifies and counts. Nothing is written into a harness;
                     // importing a shown session stays a separate, confirmed action.
-                    let out = t.pull(&state.team_seen);
-                    eprintln!("sesync: team pull: {} shown, {} dropped, {} rolled back",
-                        out.shown.len(), out.dropped, out.rolled_back);
-                    let visible = out.shown.len() + out.unchanged;
-                    activity |= !sesync::team_backoff::pull_is_idle(out.accepted.len(), visible, visible_before);
-                    visible_before = Some(visible);
-                    // The floor only rises: each conversation keeps the highest sequence accepted, so an
-                    // older record replayed later is refused, including after a restart.
+                    let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &state.floors_all());
                     let before = state.team_seen.clone();
-                    for (conv, seq) in &out.accepted {
-                        let floor = state.team_seen.entry(conv.clone()).or_insert(0);
-                        *floor = (*floor).max(*seq);
+                    for p in &pulls {
+                        eprintln!("sesync: team pull [{}]: {} shown, {} dropped, {} rolled back",
+                            p.space, p.out.shown.len(), p.out.dropped, p.out.rolled_back);
+                        let visible = p.out.shown.len() + p.out.unchanged;
+                        activity |= !sesync::team_backoff::pull_is_idle(p.out.accepted.len(), visible, visible_before);
+                        visible_before = Some(visible);
+                        // The floor only rises, and it is per team: a record received under one
+                        // team never raises another team's floor for the same conversation.
+                        for (conv, seq) in &p.out.accepted {
+                            state.raise_seen(&p.space, conv, *seq);
+                        }
                     }
                     if state.team_seen != before {
                         if let Err(e) = state.absorb_user_edits(&env.state_file()) {
@@ -593,7 +596,7 @@ fn main() {
                 let conv = env.sesync_conv.clone();
                 let opencode_bin = env.opencode_bin.clone();
                 let scratch = env.state_dir.join("team-scratch");
-                let paths: std::collections::HashMap<String, (String, f64)> = state.marked_sessions().into_iter()
+                let paths: std::collections::HashMap<String, (String, f64)> = state.shared_sessions().into_iter()
                     .filter_map(|id| {
                         // The marked id is the conversation's stable id; the entry holding it
                         // can move between keys when a local turn promotes a copy.
@@ -610,16 +613,18 @@ fn main() {
                 };
                 let last_change = |id: &str| paths.get(id).map(|(_, t)| *t);
                 match sesync::team_pass::run(&team_config_dir(), &mut state, now, content_of, last_change) {
-                    Ok(pass) => {
-                        eprintln!("sesync: {}", sesync::team_pass::summary(&pass));
-                        activity |= !pass.pushed.is_empty();
+                    Ok(passes) => {
+                        for pass in &passes {
+                            eprintln!("sesync: {}", sesync::team_pass::summary(pass));
+                            activity |= !pass.pushed.is_empty();
+                        }
                     }
                     Err(sesync::team_pass::NotRun::NoTeam) => {}
                     Err(e) => eprintln!("sesync: team push not run: {e:?}"),
                 }
                 // Only a configured team backs off. Without one the team step returns at once, so it
                 // keeps running on every tick, as it always has.
-                if team.is_some() {
+                if !teams.is_empty() {
                     let before_interval = team_backoff.interval();
                     team_backoff = team_backoff.next(activity);
                     if team_backoff.interval() != before_interval {
@@ -649,37 +654,42 @@ fn main() {
 enum TeamPull {
     /// The request was refused before starting (not configured, or one already running).
     None,
-    /// A worker is pulling; the receiver returns its verified outcome.
-    Running(std::sync::mpsc::Receiver<sesync::team_pull_verified::PullOutcome>),
+    /// A worker is pulling; the receiver returns one verified outcome per team.
+    Running(std::sync::mpsc::Receiver<Vec<sesync::team_watch::TeamPull>>),
 }
 
-/// Put the result on the app: the verified sessions and the refuse count. Runs on the main
-/// thread after the worker sent its outcome.
-fn apply_pull(app: &mut sesync::app::App, out: sesync::team_pull_verified::PullOutcome) {
-    let sesync::team_pull_verified::PullOutcome { shown, dropped, accepted, .. } = out;
-    app.set_pull_result(shown.into_iter().map(|r| (r.conversation, r.text)).collect(), dropped);
-    app.absorb_pull_floors(&accepted);
+/// Put the result on the app: the verified sessions (one entry per conversation, the newest
+/// across the teams) and the refuse count. Runs on the main thread after the worker sent it.
+fn apply_pull(app: &mut sesync::app::App, pulls: Vec<sesync::team_watch::TeamPull>) {
+    let shown = sesync::team_watch::TeamWatch::newest_per_conversation(&pulls);
+    let refused: usize = pulls.iter().map(|p| p.out.dropped).sum();
+    let floors: Vec<(String, String, u64)> = pulls.iter()
+        .flat_map(|p| p.out.accepted.iter().map(|(c, s)| (p.space.clone(), c.clone(), *s)))
+        .collect();
+    app.set_pull_result(shown, refused);
+    app.absorb_pull_floors(&floors);
 }
 
 /// Start a `TeamPull::Running` worker, or explain why not.
 fn request_team_pull(app: &mut sesync::app::App, config_dir: &std::path::Path) -> TeamPull {
-    let Some(watch) = sesync::team_watch::TeamWatch::from_env(config_dir) else {
+    let teams = sesync::team_watch::teams_from_env(config_dir);
+    if teams.is_empty() {
         app.set_error(
-            "team server not configured: set SESYNC_TEAM_URL, SESYNC_TEAM_TOKEN, SESYNC_TEAM_MACHINE and SESYNC_TEAM_SPACE",
+            "team server not configured: set SESYNC_TEAM_URL and join a team, or set SESYNC_TEAM_TOKEN, SESYNC_TEAM_MACHINE and SESYNC_TEAM_SPACE",
         );
         return TeamPull::None;
-    };
+    }
     if !app.begin_pull() {
         return TeamPull::None;
     }
-    // The floors the daemon has persisted. The app only reads them; the daemon's loop raises them.
-    // The app replaces its list with what this pull shows, so it asks for every conversation,
-    // not only the ones that changed since the daemon's last pull.
-    let seen = app.state().team_seen.clone();
+    // The floors the daemon has persisted, per team; the app only reads them. The app replaces
+    // its list with what this pull shows, so every conversation is fetched, not only the ones
+    // that changed since the daemon's last pull.
+    let floors = app.state().floors_all();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = watch.pull_all(&seen);
-        let _ = tx.send(out);
+        let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &floors);
+        let _ = tx.send(pulls);
     });
     TeamPull::Running(rx)
 }
@@ -817,14 +827,19 @@ fn run_tui(
     if roots.claude.parent().map_or(false, |p| p.is_dir()) { installed.push("claude".to_string()); }
     if roots.gemini.parent().map_or(false, |p| p.is_dir()) { installed.push("gemini".to_string()); }
     if command_available(&opencode_bin) { installed.push("opencode".to_string()); }
+    // The Team tab and "Refresh team" exist before the first pull; without configuration they
+    // say what is missing instead of failing silently. A machine can belong to several teams.
+    let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
+        .map(|t| t.space.clone()).collect();
+    let mut state = state;
+    state.migrate_legacy_team_state(&teams);
     let mut app = App::new(roots, state, lock_dir, sesync_lock);
     app.set_installed_targets(installed);
+    app.set_team_configured(!teams.is_empty());
+    app.set_teams(teams);
     // Restore last-run taste (theme, tab) from this user's configuration directory.
     let prefs = sesync::app::prefs::load(&config_dir);
     app.restore_prefs(prefs.theme, prefs.view);
-    // The Team tab and "Refresh team" exist before the first pull; without configuration they
-    // say what is missing instead of failing silently.
-    app.set_team_configured(sesync::team_watch::TeamWatch::from_env(&config_dir).is_some());
 
     // The state file is read back only when it changed since the last look: the daemon
     // rewrites it on every pass, and a keystroke must not pay for a reload that shows

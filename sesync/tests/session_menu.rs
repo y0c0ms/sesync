@@ -73,6 +73,7 @@ fn only_a_key_that_changes_a_choice_marks_state_for_saving() {
     // keypress must not rewrite the state file.
     let sb = sandbox("dirty");
     let mut a = app(&sb, fixture(&sb));
+    a.set_teams(vec!["team-a".into()]);
     assert!(!a.take_user_dirty(), "a fresh app has nothing to save");
     press(&mut a, Ev::Down);
     assert!(!a.take_user_dirty(), "moving the cursor changes nothing to save");
@@ -133,14 +134,16 @@ fn rename_from_the_menu_enters_rename_mode() {
 }
 
 #[test]
-fn mark_from_the_menu_marks_the_session_for_the_team() {
+fn mark_from_the_menu_shares_the_session_with_the_team() {
     let sb = sandbox("mark");
     let mut a = app(&sb, fixture(&sb));
+    a.set_teams(vec!["team-a".into()]);
     press(&mut a, Ev::Enter);
     press(&mut a, Ev::Down);
-    press(&mut a, Ev::Enter); // row 1: Mark
+    press(&mut a, Ev::Enter); // row 1: share with the team
     assert_eq!(a.mode(), Mode::Browse);
-    assert!(a.status().contains("marked"), "status: {}", a.status());
+    assert!(a.status().contains("shared with team 'team-a'"), "status: {}", a.status());
+    assert!(a.is_selected_marked(), "the view shows the share");
 }
 
 #[test]

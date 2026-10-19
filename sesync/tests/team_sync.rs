@@ -59,19 +59,19 @@ fn an_unmarked_session_is_never_pushed() {
 #[test]
 fn a_marked_quiet_session_is_pushed_once_and_recorded() {
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"journal bytes".to_vec()), |_| Some(800.0), |_, _, b| Ok(b.to_vec()));
     assert_eq!(pass.pushed, vec!["sess-1".to_string()]);
     assert_eq!(remote.writes.borrow().len(), 1);
-    assert!(state.team_hash("sess-1").is_some(), "the push is recorded");
+    assert!(state.team_hash("personal", "sess-1").is_some(), "the push is recorded");
 }
 
 #[test]
 fn an_unchanged_session_is_not_pushed_again() {
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     let content = |_: &str| Ok(b"same content".to_vec());
     push_due(&mut state, &remote, "personal", 1000.0, 120.0, content, |_| Some(800.0), |_, _, b| Ok(b.to_vec()));
@@ -83,7 +83,7 @@ fn an_unchanged_session_is_not_pushed_again() {
 #[test]
 fn a_session_still_being_written_waits_for_the_quiet_period() {
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"x".to_vec()), |_| Some(990.0), |_, _, b| Ok(b.to_vec()));
@@ -94,19 +94,19 @@ fn a_session_still_being_written_waits_for_the_quiet_period() {
 #[test]
 fn a_failed_push_is_reported_and_the_others_still_go() {
     let mut state = State::default();
-    state.mark("bad");
-    state.mark("good");
+    state.share("bad", "personal");
+    state.share("good", "personal");
     let remote = Recording { fail: true, ..Default::default() };
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"x".to_vec()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()));
     assert_eq!(pass.failed.len(), 2, "each failure is named");
-    assert!(state.team_hash("bad").is_none(), "a failed push records nothing");
+    assert!(state.team_hash("team-a", "bad").is_none(), "a failed push records nothing");
 }
 
 #[test]
 fn a_session_whose_content_cannot_be_built_is_reported_not_sent() {
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Err("converter failed".into()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()));
@@ -147,11 +147,11 @@ fn the_team_push_record_survives_a_restart() {
     let d = sandbox("restart");
     let path = d.join("state.json");
     let mut state = State::default();
-    state.record_team_push("sess-1", "abc123", 1234.5);
+    state.record_team_push("personal", "sess-1", "abc123", 1234.5);
     state.save(&path).unwrap();
     let back = State::load(&path).unwrap();
-    assert_eq!(back.team_hash("sess-1").as_deref(), Some("abc123"), "the hash is kept so no re-upload happens after restart");
-    assert_eq!(back.team["sess-1"].pushed_at, 1234.5);
+    assert_eq!(back.team_hash("personal", "sess-1").as_deref(), Some("abc123"), "the hash is kept so no re-upload happens after restart");
+    assert_eq!(back.team_pushed_at("personal", "sess-1"), Some(1234.5));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -160,7 +160,7 @@ fn a_randomized_seal_does_not_make_an_unchanged_session_look_changed() {
     // Sealing is randomized (fresh key and nonce per call). Change must be judged on the plaintext,
     // so the second quiet tick must skip even though every sealed output differs.
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     let counter = std::cell::Cell::new(0u8);
     let seal = |_id: &str, _version: u64, b: &[u8]| -> Result<Vec<u8>, String> {
@@ -180,7 +180,7 @@ fn a_randomized_seal_does_not_make_an_unchanged_session_look_changed() {
 #[test]
 fn what_is_pushed_is_the_sealed_output_not_the_plaintext() {
     let mut state = State::default();
-    state.mark("sess-1");
+    state.share("sess-1", "personal");
     let remote = Recording::default();
     push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"plain journal".to_vec()), |_| Some(0.0),
@@ -206,13 +206,14 @@ fn the_seal_is_given_the_session_and_the_version_its_lease_was_granted() {
     // The sealed record's sequence is the lease version, so the seal must see that version and the
     // session id it is bound to, and the bytes must go out under the same version.
     let mut state = State::default();
-    state.mark("sess-9");
+    state.share("sess-9", "team-a");
     let remote = Granting { version: 7, writes: RefCell::new(Vec::new()) };
     let seen = RefCell::new(Vec::new());
     let seal = |id: &str, v: u64, plain: &[u8]| -> Result<Vec<u8>, String> {
         seen.borrow_mut().push((id.to_string(), v, plain.to_vec()));
         Ok(format!("{id}@{v}").into_bytes())
     };
+    state.share("sess-9", "personal");
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"plain".to_vec()), |_| Some(0.0), seal);
     assert_eq!(pass.pushed, vec!["sess-9".to_string()]);

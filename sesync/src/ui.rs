@@ -69,6 +69,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Help => draw_help(f, app, th, area),
         Mode::Transcript => draw_transcript(f, app, th, area),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, th, area),
+        Mode::SharePick => draw_share_pick(f, app, th, area),
         _ => {}
     }
 }
@@ -445,6 +446,28 @@ fn draw_transcript(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .collect();
     f.render_widget(List::new(shown), parts[0]);
     hint(f, "j/k scroll · esc close", th, parts[1]);
+}
+
+/// The share picker: one row per team this machine belongs to, space ticks. A session can be
+/// shared into several teams; the ticks start from what it already is.
+fn draw_share_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let teams = app.teams();
+    let outer = centered(56, teams.len().max(1) as u16 + 4, area);
+    let inner = dialog(f, "Share with teams", th, outer);
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    if teams.is_empty() {
+        f.render_widget(Paragraph::new(" no team is configured here").style(Style::default().fg(th.dim)), parts[0]);
+    } else {
+        let cursor = app.share_cursor();
+        let lines: Vec<ListItem> = teams.iter().enumerate().map(|(i, t)| {
+            let mark = if app.share_is_picked(t) { "[x]" } else { "[ ]" };
+            let on = i == cursor;
+            let style = if on { on_accent(th, true) } else { Style::default().fg(th.text) };
+            ListItem::new(Line::from(Span::styled(format!(" {mark} {t}"), style)))
+        }).collect();
+        f.render_widget(List::new(lines), parts[0]);
+    }
+    hint(f, "space tick · a all · n none · enter keep · esc cancel", th, parts[1]);
 }
 
 /// The delete confirmation: what will go, and the copies that will not.

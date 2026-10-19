@@ -81,7 +81,7 @@ fn enter_opens_the_palette_listing_every_action() {
     a.handle(Ev::CtrlP, Instant::now());
     assert_eq!(a.mode(), Mode::Palette, "enter opens the command list");
     let text = screen(&a, 120, 30);
-    for name in ["Rename", "Delete", "Mark", "Import", "Share with team", "Unshare", "Refresh team", "Switch", "Quit"] {
+    for name in ["Rename", "Delete", "Import", "Share", "Stop sharing", "Refresh team", "Switch", "Quit"] {
         assert!(text.contains(name), "the palette lists {name}:\n{text}");
     }
     let _ = fs::remove_dir_all(&sb);
@@ -105,9 +105,9 @@ fn typing_filters_the_palette() {
     write_session(&sb, SID_A, "one");
     let mut a = app(&sb);
     a.handle(Ev::CtrlP, Instant::now());
-    type_text(&mut a, "mark");
+    type_text(&mut a, "share");
     let titles = a.palette_titles();
-    assert_eq!(titles.first().copied(), Some("Mark / unmark for team"), "{titles:?}");
+    assert_eq!(titles.first().copied(), Some("Share with teams"), "{titles:?}");
     assert!(!titles.iter().any(|t| t.starts_with("Quit")), "non-matching actions are hidden: {titles:?}");
     let _ = fs::remove_dir_all(&sb);
 }
@@ -117,11 +117,16 @@ fn enter_in_the_palette_runs_the_highlighted_action() {
     let sb = sandbox("run");
     write_session(&sb, SID_A, "one");
     let mut a = app(&sb);
+    a.set_teams(vec!["team-a".into(), "team-b".into()]);
+    a.set_team_configured(true);
     a.handle(Ev::CtrlP, Instant::now());
-    type_text(&mut a, "mark");
+    type_text(&mut a, "share");
     a.handle(Ev::Enter, Instant::now());
-    assert_eq!(a.mode(), Mode::Browse, "the palette closes after an action runs");
-    assert!(a.is_selected_marked(), "the highlighted action ran on the selected session");
+    assert_eq!(a.mode(), Mode::SharePick, "the share picker opens");
+    a.handle(Ev::Char('a'), Instant::now()); // tick every team
+    a.handle(Ev::Enter, Instant::now());
+    assert_eq!(a.mode(), Mode::Browse);
+    assert!(a.is_selected_marked(), "the action shared the selected session");
     let _ = fs::remove_dir_all(&sb);
 }
 
@@ -131,10 +136,10 @@ fn a_disabled_action_does_not_run_and_says_why() {
     write_session(&sb, SID_A, "one");
     let mut a = app(&sb);
     a.handle(Ev::CtrlP, Instant::now());
-    type_text(&mut a, "share");
+    type_text(&mut a, "stop");
     a.handle(Ev::Enter, Instant::now());
     assert_eq!(a.mode(), Mode::Palette, "the list stays open when the action cannot run");
-    assert!(a.status().contains("not available yet"), "the reason is shown: {}", a.status());
+    assert!(a.status().contains("not shared"), "the reason is shown: {}", a.status());
     let _ = fs::remove_dir_all(&sb);
 }
 
@@ -257,7 +262,7 @@ fn the_palette_shows_a_reason_for_each_disabled_action() {
     let mut a = app(&sb);
     a.handle(Ev::CtrlP, Instant::now());
     let text = screen(&a, 140, 30);
-    assert!(text.contains("not available yet"), "{text}");
+    assert!(text.contains("no team configured") || text.contains("not shared"), "{text}");
     let _ = fs::remove_dir_all(&sb);
 }
 

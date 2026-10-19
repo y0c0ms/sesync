@@ -6,23 +6,23 @@ use sesync::team_push::select_for_push;
 #[test]
 fn only_marked_sessions_are_selected() {
     let mut st = State::default();
-    st.mark("ses_a");
-    st.mark("ses_c");
+    st.share("ses_a", "team-a");
+    st.share("ses_c", "team-a");
     let all = vec!["ses_a".to_string(), "ses_b".to_string(), "ses_c".to_string()];
-    assert_eq!(select_for_push(&st, &all), vec!["ses_a".to_string(), "ses_c".to_string()]);
+    assert_eq!(select_for_push(&st, "team-a", &all), vec!["ses_a".to_string(), "ses_c".to_string()]);
 }
 
 #[test]
 fn nothing_is_selected_when_nothing_is_marked() {
     let st = State::default();
     let all = vec!["ses_a".to_string()];
-    assert!(select_for_push(&st, &all).is_empty(), "no marks, no push");
+    assert!(select_for_push(&st, "team-a", &all).is_empty(), "no marks, no push");
 }
 
 #[test]
 fn a_marked_session_that_no_longer_exists_is_not_selected() {
     let mut st = State::default();
-    st.mark("ses_gone");
+    st.share("ses_gone", "team-a");
     let all = vec!["ses_a".to_string()];
-    assert!(select_for_push(&st, &all).is_empty(), "only sessions that exist can be pushed");
+    assert!(select_for_push(&st, "team-a", &all).is_empty(), "only sessions that exist can be pushed");
 }

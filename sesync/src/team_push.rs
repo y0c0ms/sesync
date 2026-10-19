@@ -5,10 +5,10 @@
 
 use crate::state::State;
 
-/// The sessions that may be pushed: those that exist locally and are marked. Order follows the
-/// input, so the result is stable.
-pub fn select_for_push(state: &State, local_sessions: &[String]) -> Vec<String> {
-    local_sessions.iter().filter(|s| state.is_marked(s)).cloned().collect()
+/// The sessions that may be pushed into this team: those that exist locally and are shared
+/// with it. Order follows the input, so the result is stable.
+pub fn select_for_push(state: &State, space: &str, local_sessions: &[String]) -> Vec<String> {
+    local_sessions.iter().filter(|s| state.is_shared_with(s, space)).cloned().collect()
 }
 
 /// What a push needs from the team server. The HTTP client implements this; tests use a fake.
@@ -53,8 +53,8 @@ pub fn push_marked_sealed<R: TeamRemote>(state: &State, remote: &R, space: &str,
                                          seal: impl FnOnce(u64) -> Result<Vec<u8>, String>)
     -> Result<(), PushError>
 {
-    if !state.is_marked(session_id) {
-        return Err(PushError::Refused("session is not marked for the team".into()));
+    if !state.is_shared_with(session_id, space) {
+        return Err(PushError::Refused("session is not shared with this team".into()));
     }
     let version = remote.acquire(space, session_id)?;
     let _guard = Lease { remote, space: space.to_string(), conversation: session_id.to_string() };

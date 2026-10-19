@@ -9,7 +9,6 @@ use crate::app::{Ev, View};
 pub enum Action {
     Rename,
     Delete,
-    Mark,
     Import,
     Share,
     Unshare,
@@ -32,10 +31,9 @@ struct Def {
 const ACTIONS: &[Def] = &[
     Def { action: Action::Rename, title: "Rename session", key: "r", event: Ev::Char('r') },
     Def { action: Action::Delete, title: "Delete session", key: "ctrl+d", event: Ev::CtrlD },
-    Def { action: Action::Mark, title: "Mark / unmark for team", key: "m", event: Ev::Char('m') },
     Def { action: Action::Import, title: "Import team session", key: "i", event: Ev::Char('i') },
-    Def { action: Action::Share, title: "Share with team", key: "", event: Ev::Char('s') },
-    Def { action: Action::Unshare, title: "Unshare", key: "", event: Ev::Char('u') },
+    Def { action: Action::Share, title: "Share with teams", key: "s", event: Ev::Char('s') },
+    Def { action: Action::Unshare, title: "Stop sharing", key: "u", event: Ev::Char('u') },
     Def { action: Action::RefreshTeam, title: "Refresh team", key: "ctrl+r", event: Ev::CtrlR },
     Def { action: Action::SwitchView, title: "Switch Sessions/Team", key: "tab", event: Ev::Tab },
     Def { action: Action::Quit, title: "Quit", key: "q", event: Ev::Char('q') },
@@ -49,6 +47,8 @@ const ACTIONS: &[Def] = &[
 pub struct Ctx {
     pub view: crate::app::View,
     pub session_selected: bool,
+    /// Whether the selected session is shared with at least one team.
+    pub session_shared: bool,
     pub team_selected: bool,
     pub team_configured: bool,
 }
@@ -56,18 +56,26 @@ pub struct Ctx {
 /// Ok, or the reason the action cannot run right now, shown beside it in the list.
 pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
     match action {
-        Action::Rename | Action::Delete | Action::Mark => match (ctx.view, ctx.session_selected) {
+        Action::Rename | Action::Delete => match (ctx.view, ctx.session_selected) {
             (View::Sessions, true) => Ok(()),
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("older sessions are on the Team tab; press tab"),
+        },
+        Action::Share => match (ctx.view, ctx.session_selected) {
+            (View::Sessions, false) => Err("no local session selected"),
+            (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Sessions, true) => if ctx.team_configured { Ok(()) } else { Err("no team configured; join one first") },
+        },
+        Action::Unshare => match (ctx.view, ctx.session_selected) {
+            (View::Sessions, false) => Err("no local session selected"),
+            (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Sessions, true) => if ctx.session_shared { Ok(()) } else { Err("this session is not shared with any team") },
         },
         Action::Import => match (ctx.view, ctx.team_selected) {
             (View::Team, true) => Ok(()),
             (View::Team, false) => Err("no team session selected"),
             (View::Sessions, _) => Err("team sessions are on the Team tab; press tab"),
         },
-        Action::Share => Err("not available yet: sharing needs the team member list"),
-        Action::Unshare => Err("not available yet: nothing is shared"),
         Action::RefreshTeam => {
             if ctx.team_configured {
                 Ok(())

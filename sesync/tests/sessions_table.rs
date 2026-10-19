@@ -78,9 +78,10 @@ fn a_wide_pane_shows_the_column_headers() {
 }
 
 #[test]
-fn a_marked_never_pushed_session_reads_marked_and_never() {
+fn a_shared_never_pushed_session_reads_marked_and_never() {
     let mut a = app(State::default());
-    a.handle(Ev::Char('m'), Instant::now()); // mark the selected session for the team
+    a.set_teams(vec!["team-a".into()]);
+    a.handle(Ev::Char('m'), Instant::now()); // share the selected session with the team
     let lines = screen(&a, 140, 20);
     let row = lines.iter().find(|l| l.contains("Table session")).expect("the session row");
     assert!(row.contains("marked"), "team state: {row}");
@@ -91,8 +92,8 @@ fn a_marked_never_pushed_session_reads_marked_and_never() {
 #[test]
 fn a_pushed_session_reads_shared_with_its_last_sync_and_mirror_targets() {
     let mut state = State::default();
-    state.mark(SID);
-    state.record_team_push(SID, "h", 1.0e12); // pushed far in the future: reads "just now"
+    state.share(SID, "team-a");
+    state.record_team_push("team-a", SID, "h", 1.0e12); // pushed far in the future: reads "just now"
     let a = app(state);
     let lines = screen(&a, 140, 20);
     let row = lines.iter().find(|l| l.contains("Table session")).expect("the session row");

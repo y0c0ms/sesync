@@ -83,29 +83,152 @@ pub struct State {
     /// Subagent transcript files, keyed by the parent session id. They belong to the
     /// parent: shown under it, never synced as conversations of their own.
     pub subagents: BTreeMap<String, Vec<String>>,
-    /// Sessions the user marked for the team. Only these are eligible to push. A session is
-    /// never pushed unless it is in this set.
-    pub marked: BTreeSet<String>,
-    /// Per-session team push record: what was last sent and when.
+    /// Sessions shared with teams, per conversation: the set of team spaces this conversation
+    /// is shared into. Empty or absent means nowhere. A session is never pushed into a space
+    /// it is not shared with, and one conversation can be shared into several teams.
+    pub shares: BTreeMap<String, BTreeSet<String>>,
+    /// Per (space, conversation) team push record: what was last sent and when. A conversation
+    /// shared into two teams keeps one record per team.
     pub team: std::collections::BTreeMap<String, TeamPush>,
-    /// Per conversation, the highest team record sequence this device has accepted. A record
-    /// below it is a rollback and is refused. Only ever raised.
+    /// Per (space, conversation), the highest team record sequence this device has accepted.
+    /// A record below it is a rollback and is refused. Only ever raised.
     pub team_seen: BTreeMap<String, u64>,
+    /// Runtime only: conversation ids read from a pre-multi-team `marked` list. The caller
+    /// folds them into `shares` once it knows the machine's teams. Never saved.
+    pub legacy_marked: BTreeSet<String>,
+}
+
+/// The key for the per-team maps: one conversation can be shared into more than one team, and
+/// each team has its own pushes and its own rollback floors. A unit-separator cannot appear in
+/// a space name, so the key never collides.
+pub fn team_key(space: &str, conversation: &str) -> String {
+    format!("{space}\u{1f}{conversation}")
 }
 
 impl State {
-    pub fn mark(&mut self, session: &str) { self.marked.insert(session.to_string()); }
-    pub fn unmark(&mut self, session: &str) { self.marked.remove(session); }
-    pub fn is_marked(&self, session: &str) -> bool { self.marked.contains(session) }
-    /// The content hash last pushed to the team for a session, if any.
-    pub fn team_hash(&self, session: &str) -> Option<String> {
-        self.team.get(session).map(|t| t.hash.clone())
+    /// The teams a conversation is shared with.
+    pub fn shares_of(&self, conversation: &str) -> BTreeSet<String> {
+        self.shares.get(conversation).cloned().unwrap_or_default()
     }
-    /// Record a successful team push: the content hash pushed and when.
-    pub fn record_team_push(&mut self, session: &str, hash: &str, at: f64) {
-        self.team.insert(session.to_string(), TeamPush { hash: hash.to_string(), pushed_at: at });
+
+    /// Set the teams a conversation is shared with; an empty set removes the share entirely.
+    pub fn set_shares(&mut self, conversation: &str, spaces: BTreeSet<String>) {
+        if spaces.is_empty() {
+            self.shares.remove(conversation);
+        } else {
+            self.shares.insert(conversation.to_string(), spaces);
+        }
     }
-    pub fn marked_sessions(&self) -> Vec<String> { self.marked.iter().cloned().collect() }
+
+    /// Whether a conversation is shared with any team at all.
+    pub fn is_shared(&self, conversation: &str) -> bool {
+        self.shares.get(conversation).map_or(false, |s| !s.is_empty())
+    }
+
+    /// Every conversation shared with at least one team.
+    pub fn shared_sessions(&self) -> Vec<String> { self.shares.keys().cloned().collect() }
+
+    /// Every conversation shared with this team.
+    pub fn sessions_shared_with(&self, space: &str) -> Vec<String> {
+        self.shares.iter().filter(|(_, s)| s.contains(space)).map(|(c, _)| c.clone()).collect()
+    }
+
+    /// The content hash last pushed to a team for a conversation, if any.
+    pub fn team_hash(&self, space: &str, conversation: &str) -> Option<String> {
+        self.team.get(&team_key(space, conversation)).map(|t| t.hash.clone())
+    }
+
+    /// Record a successful push: the content hash sent and when.
+    pub fn record_team_push(&mut self, space: &str, conversation: &str, hash: &str, at: f64) {
+        self.team.insert(team_key(space, conversation), TeamPush { hash: hash.to_string(), pushed_at: at });
+    }
+
+    /// When the last successful push for this team happened, if any.
+    pub fn team_pushed_at(&self, space: &str, conversation: &str) -> Option<f64> {
+        self.team.get(&team_key(space, conversation)).map(|t| t.pushed_at)
+    }
+
+    /// The highest accepted sequence for this team's copy of the conversation (0 = none).
+    pub fn seen_floor(&self, space: &str, conversation: &str) -> u64 {
+        self.team_seen.get(&team_key(space, conversation)).copied().unwrap_or(0)
+    }
+
+    /// Share a conversation into one team.
+    pub fn share(&mut self, conversation: &str, space: &str) {
+        self.shares.entry(conversation.to_string()).or_default().insert(space.to_string());
+    }
+
+    /// Stop sharing a conversation into one team. Other teams are untouched.
+    pub fn unshare(&mut self, conversation: &str, space: &str) {
+        if let Some(spaces) = self.shares.get_mut(conversation) {
+            spaces.remove(space);
+            if spaces.is_empty() {
+                self.shares.remove(conversation);
+            }
+        }
+    }
+
+    /// Whether a conversation is shared into this team.
+    pub fn is_shared_with(&self, conversation: &str, space: &str) -> bool {
+        self.shares.get(conversation).map_or(false, |s| s.contains(space))
+    }
+
+    /// Fold a pre-multi-team `marked` list into shares: the ids go to the one team the machine
+    /// belongs to, or to the first of several (sorted, so the outcome is deterministic and the
+    /// user can adjust with the share picker). With no team configured the ids stay pending.
+    /// The same pass re-keys the older conversation-keyed push records and sequence floors.
+    pub fn migrate_legacy_team_state(&mut self, teams: &[String]) {
+        if teams.is_empty() {
+            return;
+        }
+        let space = teams.iter().min().cloned().unwrap_or_default();
+        for conv in std::mem::take(&mut self.legacy_marked) {
+            self.share(&conv, &space);
+        }
+        let rekey = |old: &str| -> String {
+            if old.contains('\u{1f}') { old.to_string() } else { team_key(&space, old) }
+        };
+        let pushed = std::mem::take(&mut self.team);
+        for (k, v) in pushed {
+            self.team.insert(rekey(&k), v);
+        }
+        let floors = std::mem::take(&mut self.team_seen);
+        for (k, v) in floors {
+            self.team_seen.insert(rekey(&k), v);
+        }
+    }
+
+    /// Every team's floors at once: space → conversation → highest accepted sequence. Used by
+    /// callers that pull several teams (and by a worker thread, which takes this map instead of
+    /// the whole state).
+    pub fn floors_all(&self) -> BTreeMap<String, BTreeMap<String, u64>> {
+        let mut out: BTreeMap<String, BTreeMap<String, u64>> = Default::default();
+        for (k, v) in &self.team_seen {
+            if let Some((space, conv)) = k.split_once('\u{1f}') {
+                out.entry(space.to_string()).or_default().insert(conv.to_string(), *v);
+            }
+        }
+        out
+    }
+
+    /// The sequence floors this device holds for one team, as the pull expects them: per
+    /// conversation, the highest accepted sequence. Other teams' floors are not included: a
+    /// record received under one team must never raise another team's floor.
+    pub fn floors_for_space(&self, space: &str) -> BTreeMap<String, u64> {
+        let prefix = format!("{space}\u{1f}");
+        self.team_seen.iter()
+            .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|conv| (conv.to_string(), *v)))
+            .collect()
+    }
+
+    /// Raise the accepted sequence for this team's copy. Never lowers it: a record below the
+    /// floor is a rollback and must stay refused.
+    pub fn raise_seen(&mut self, space: &str, conversation: &str, sequence: u64) {
+        let e = self.team_seen.entry(team_key(space, conversation)).or_insert(0);
+        if sequence > *e {
+            *e = sequence;
+        }
+    }
 
     /// The stable team id for a source key: the conversation's origin id (`Source::conv`) when
     /// the scan has pinned it, else the key's own session id. Everything the team keys on —
@@ -195,13 +318,20 @@ impl State {
                 }
             }
         }
-        // Marks are optional: a state file written before they existed has none.
-        if let Some(marked) = raw.get("marked").and_then(Value::as_array) {
-            for m in marked {
-                if let Some(id) = m.as_str() {
-                    st.marked.insert(id.to_string());
+        // Shares: per conversation, the teams it is shared into. A state file written before
+        // teams were per-session carries a legacy `marked` list instead; those ids are held
+        // until the caller names the machine's teams (migrate_legacy_team_state).
+        if let Some(shares) = raw.get("shares").and_then(Value::as_object) {
+            for (conv, spaces) in shares {
+                let set: BTreeSet<String> = spaces.as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                if !set.is_empty() {
+                    st.shares.insert(conv.clone(), set);
                 }
             }
+        } else if let Some(marked) = raw.get("marked").and_then(Value::as_array) {
+            st.legacy_marked = marked.iter().filter_map(Value::as_str).map(str::to_string).collect();
         }
         Ok(st)
     }
@@ -218,11 +348,17 @@ impl State {
         !self.mirror_keys.contains(key)
     }
 
-    pub fn absorb_user_edits(&mut self, path: &Path) -> io::Result<()> {        if !path.exists() {
+    pub fn absorb_user_edits(&mut self, path: &Path) -> io::Result<()> {
+        if !path.exists() {
             return Ok(());
         }
         let disk = State::load(path)?;
-        self.marked = disk.marked;
+        // Shares are the user's: take them whole. A legacy `marked` list on disk (an older
+        // binary's save) is folded in by the caller once the machine's teams are known.
+        self.shares = disk.shares.clone();
+        if self.legacy_marked.is_empty() {
+            self.legacy_marked = disk.legacy_marked.clone();
+        }
         for (key, dsrc) in &disk.sources {
             if let Some(s) = self.sources.get_mut(key) {
                 s.chosen_targets = dsrc.chosen_targets.clone();
@@ -243,7 +379,7 @@ impl State {
     /// the daemon does is added so the choice is not lost.
     pub fn save_user(&self, path: &Path) -> io::Result<()> {
         let mut disk = State::load(path)?;
-        disk.marked = self.marked.clone();
+        disk.shares = self.shares.clone();
         for (key, mine) in &self.sources {
             let d = disk.sources.entry(key.clone())
                 .or_insert_with(|| Source::new(&mine.fmt, &mine.key));
@@ -274,7 +410,7 @@ impl State {
             "sources": sources,
             "mirror_keys": self.mirror_keys.iter().collect::<Vec<_>>(),
             "subagents": self.subagents,
-            "marked": self.marked.iter().collect::<Vec<_>>(),
+            "shares": self.shares.iter().map(|(c, spaces)| (c.clone(), serde_json::json!(spaces.iter().collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
             "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at}))).collect::<serde_json::Map<_, _>>(),
             "team_seen": self.team_seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
         });

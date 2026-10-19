@@ -38,7 +38,7 @@ fn fixture(name: &str) -> (PathBuf, App) {
     let _b = write_session(&sb, SID_B, "Find me");
     let c = write_session(&sb, SID_C, "Failing one");
     let mut state = State::default();
-    state.mark(SID_B);
+    state.share(SID_B, "team-a");
     let mut src = sesync::state::Source::new("omp", c.to_str().unwrap());
     src.chosen_targets.insert("claude".to_string());
     src.failures = 1;
@@ -201,8 +201,8 @@ fn the_team_mark_survives_a_real_turn() {
         target_updated: 0.0,
     });
     state.sources.insert(key.clone(), src);
-    state.mark("conversation-uuid-1");
-    state.record_team_push("conversation-uuid-1", "hash-before", 100.0);
+    state.share("conversation-uuid-1", "team-a");
+    state.record_team_push("team-a", "conversation-uuid-1", "hash-before", 100.0);
     state.mirror_keys.insert(mirror.display().to_string());
 
     // The user answers in the claude copy: the next pass turns the session to it.
@@ -214,11 +214,11 @@ fn the_team_mark_survives_a_real_turn() {
     let new_src = &state.sources[&new_key];
     assert_eq!(new_src.conv, "conversation-uuid-1", "the conversation id moves with the turn");
     assert!(state.sources.get(&key).is_none(), "the old source entry is gone");
-    assert!(state.is_marked("conversation-uuid-1"), "the share survives the turn");
+    assert!(state.is_shared("conversation-uuid-1"), "the share survives the turn");
     assert_eq!(state.team_id_of(&new_key), "conversation-uuid-1");
     assert_eq!(state.key_of_team_id("conversation-uuid-1").as_deref(), Some(new_key.as_str()),
         "the team pass finds the new source by the stable id");
-    assert_eq!(state.team_hash("conversation-uuid-1"), Some("hash-before".to_string()),
+    assert_eq!(state.team_hash("team-a", "conversation-uuid-1"), Some("hash-before".to_string()),
         "the pushed hash is keyed on the conversation, so the next push sees the change");
     let _ = fs::remove_dir_all(&sb);
 }
