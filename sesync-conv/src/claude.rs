@@ -58,6 +58,21 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
         Uuid::new_v5(&NS, format!("{}|{}|{}", o.session_id, rid, n).as_bytes()).to_string()
     };
 
+    // The turns a compaction archived are not in `msgs` any more: its summary is the only record
+    // of them, so it is carried as the first message. Without this a compacted journal exports a
+    // conversation that simply starts mid-thread.
+    if let (Some(text), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
+        let uuid = uid("compaction-summary");
+        let rec = json!({
+            "parentUuid": parent, "isSidechain": false, "userType": "external",
+            "cwd": o.cwd, "sessionId": o.session_id, "version": o.cli_version, "gitBranch": "",
+            "uuid": uuid, "timestamp": ts, "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+        });
+        out.push(serde_json::to_string(&rec).unwrap());
+        parent = Some(uuid);
+    }
+
     for m in &msgs {
         let ts = iso_from_ms(m.timestamp_ms);
         let (typ, message): (&str, Value) = match m.role {
@@ -380,5 +395,22 @@ mod tests {
         assert!(id.starts_with("toolu_") && id.len() == 30, "got {id}");
         let res = blocks.iter().find(|b| b["type"] == "tool_result").expect("tool_result");
         assert_eq!(res["tool_use_id"], id, "the result answers the mapped call");
+    }
+
+    /// Same compacted journal as every other target's test: the live window is exported, the
+    /// archive is dropped, and the summary is carried as a message because Claude has no
+    /// compaction record of its own to replace those turns.
+    #[test]
+    fn a_compacted_journal_exports_only_the_live_window() {
+        let j = crate::journal::fixture::compacted_journal("claude");
+        let out = to_lines(&j, &Options { session_id: "sid", cwd: "/tmp/c", cli_version: "2.1.245", title: "" });
+        let text = out.join("\n");
+        for kept in [crate::journal::fixture::KEPT_ONE, crate::journal::fixture::KEPT_TWO, crate::journal::fixture::NEWEST] {
+            assert!(text.contains(kept), "the live window is exported: {kept}");
+        }
+        for archived in [crate::journal::fixture::ARCHIVED_ONE, crate::journal::fixture::ARCHIVED_TWO] {
+            assert!(!text.contains(archived), "turns archived by the compaction must not be exported: {archived}");
+        }
+        assert!(text.contains(crate::journal::fixture::SUMMARY), "the compaction summary stands in for them");
     }
 }

@@ -77,6 +77,45 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
     let mut first_ts = i64::MAX;
     let mut last_ts = 0i64;
 
+    // The compaction's summary is the only record of the turns it archived, and those turns are
+    // no longer exported. Without it a compacted journal would simply start mid-thread. (The
+    // module doc has always claimed this mapping; the code never had it, which only became
+    // visible once the archive stopped being exported.)
+    if let (Some(note), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
+        let t = crate::journal::parse_iso_ms(ts).unwrap_or(0);
+        first_ts = first_ts.min(t);
+        last_ts = last_ts.max(t);
+        let mid = next("msg", t);
+        let mk = |typ: &str, extra: Value, id: String| {
+            let mut p = match extra { Value::Object(m) => m, _ => Map::new() };
+            p.insert("type".into(), typ.into());
+            p.insert("id".into(), id.into());
+            p.insert("sessionID".into(), o.session_id.into());
+            p.insert("messageID".into(), mid.clone().into());
+            Value::Object(p)
+        };
+        let parts = vec![
+            mk("step-start", json!({}), next("prt", t)),
+            mk("text", json!({"text": note}), next("prt", t)),
+            mk("step-finish", json!({"reason": "stop", "tokens": {"total": 0, "input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}}), next("prt", t)),
+        ];
+        let mut info = Map::new();
+        info.insert("id".into(), mid.clone().into());
+        info.insert("sessionID".into(), o.session_id.into());
+        info.insert("role".into(), "assistant".into());
+        info.insert("time".into(), json!({"created": t, "completed": t}));
+        info.insert("modelID".into(), model.1.clone().into());
+        info.insert("providerID".into(), model.0.clone().into());
+        info.insert("mode".into(), "build".into());
+        info.insert("agent".into(), "build".into());
+        info.insert("path".into(), json!({"cwd": o.directory, "root": o.directory}));
+        info.insert("cost".into(), 0.into());
+        info.insert("tokens".into(), json!({"total":0,"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}));
+        info.insert("finish".into(), "stop".into());
+        out_msgs.push(json!({"info": Value::Object(info), "parts": parts}));
+        last_id = Some(mid);
+    }
+
     for m in &msgs {
         match m.role {
             "user" | "assistant" => {}
@@ -236,5 +275,33 @@ mod untimed_tests {
         let _ = std::fs::remove_file(&path);
         let created = v["info"]["time"]["created"].as_i64().unwrap();
         assert!(created > 1_700_000_000_000, "epoch leaked into the O-penCode session time: {created}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::fixture::*;
+
+    /// Same compacted journal as every other target's test: the live window is exported and the
+    /// summary that replaced the archive is carried (here as a compaction part).
+    #[test]
+    fn a_compacted_journal_exports_only_the_live_window() {
+        let j = compacted_journal("opencode");
+        let b = to_bundle(&j, &Options {
+            session_id: "ses_000000000000aaaaaaaaaaaaaa",
+            title: "t",
+            directory: "/tmp/c",
+            cli_version: "1.19.0",
+            include_thinking: true,
+        });
+        let text = serde_json::to_string(&b).unwrap();
+        for kept in [KEPT_ONE, KEPT_TWO, NEWEST] {
+            assert!(text.contains(kept), "the live window is exported: {kept}");
+        }
+        for archived in [ARCHIVED_ONE, ARCHIVED_TWO] {
+            assert!(!text.contains(archived), "turns archived by the compaction must not be exported: {archived}");
+        }
+        assert!(text.contains(SUMMARY), "the compaction summary stands in for them");
     }
 }

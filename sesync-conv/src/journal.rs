@@ -150,6 +150,23 @@ impl Journal {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0));
+        self.live_records()
+            .into_iter()
+            .filter(|r| r.get("type").and_then(Value::as_str) == Some("message"))
+            .filter_map(|r| Msg::from_record(r, fallback_ms))
+            .collect()
+    }
+
+    /// The records of the live window, oldest first: the active branch cut at the last
+    /// compaction. Everything before that was archived into the compaction's summary, and the
+    /// engines resume without it - an omp session compacted down to ~30k tokens was exported to
+    /// OpenCode as 3.4M tokens because the walk crossed the compaction and kept the archive.
+    ///
+    /// The compaction record itself stays inside the window, so a target that drops the archive
+    /// can still carry the summary that replaced it. Targets that read the journal directly
+    /// (`to-pi`, `to-omp`) copy the whole file instead: the format is theirs, and they apply
+    /// their own compaction.
+    pub fn live_records(&self) -> Vec<&Map<String, Value>> {
         let by_id: std::collections::HashMap<&str, &Map<String, Value>> =
             self.records.iter().filter_map(|r| r.get("id").and_then(Value::as_str).map(|id| (id, r))).collect();
         let leaf = self
@@ -170,11 +187,39 @@ impl Journal {
             cur = r.get("parentId").and_then(Value::as_str);
         }
         chain.reverse();
+        if let Some(cut) = chain.iter().rposition(|r| r.get("type").and_then(Value::as_str) == Some("compaction")) {
+            let kept = chain[cut].get("firstKeptEntryId").and_then(Value::as_str);
+            let start = kept
+                .and_then(|id| chain[..cut].iter().rposition(|r| r.get("id").and_then(Value::as_str) == Some(id)))
+                .unwrap_or(cut);
+            chain.drain(..start);
+        }
         chain
-            .into_iter()
-            .filter(|r| r.get("type").and_then(Value::as_str) == Some("message"))
-            .filter_map(|r| Msg::from_record(r, fallback_ms))
-            .collect()
+    }
+
+    /// The last compaction in this journal, as `(summary, timestamp)`.
+    ///
+    /// The turns it archived are outside the live window, so the summary is the only record of
+    /// them. Every target that exports the live window has to carry it, or the copy silently
+    /// loses that history: an OpenCode export maps it to a compaction part, and Claude and the
+    /// others get it as a message.
+    pub fn live_compaction(&self) -> Option<(&str, &str)> {
+        let r = self
+            .records
+            .iter()
+            .rev()
+            .find(|r| r.get("type").and_then(Value::as_str) == Some("compaction"))?;
+        let summary = r.get("summary").and_then(Value::as_str)?;
+        let ts = r.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        Some((summary, ts))
+    }
+
+    /// The last compaction's summary as a note for targets that have no compaction concept of
+    /// their own. Without it, dropping the archive would lose those turns silently; OpenCode gets
+    /// the compaction record itself instead, as a compaction part.
+    pub fn compaction_note(&self) -> Option<String> {
+        self.live_compaction()
+            .map(|(s, _)| format!("Earlier turns of this conversation were compacted. Their summary:\n\n{s}"))
     }
 
     /// omp title-slot line: exactly TITLE_SLOT_BYTES-1 bytes of JSON + "\n".
@@ -374,4 +419,106 @@ pub fn journal_filename(timestamp_iso: &str, id: &str) -> String {
 pub fn blobs_dir_for(journal_path: &Path) -> Option<PathBuf> {
     // <agent>/sessions/<bucket>/<file> -> <agent>/blobs
     journal_path.parent()?.parent()?.parent().map(|a| a.join("blobs"))
+}
+
+#[cfg(test)]
+pub mod fixture {
+    use super::*;
+
+    /// One compacted conversation for every target's test: two turns archived by the compaction,
+    /// a kept window starting at `firstKeptEntryId`, the compaction with its summary, and one
+    /// turn after it. Shared so the harnesses are tested on exactly the same input.
+    pub const ARCHIVED_ONE: &str = "archived one";
+    pub const ARCHIVED_TWO: &str = "archived two";
+    pub const KEPT_ONE: &str = "kept one";
+    pub const KEPT_TWO: &str = "kept two";
+    pub const NEWEST: &str = "newest";
+    pub const SUMMARY: &str = "WHAT CAME BEFORE";
+
+    pub fn compacted_journal(name: &str) -> Journal {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("sesync-conv-{name}-{}-{n}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let msg = |id: &str, parent: &str, t: &str, text: &str| {
+            let p = if parent.is_empty() { String::new() } else { format!(r#","parentId":"{parent}""#) };
+            format!(
+                r#"{{"type":"message","id":"{id}"{p},"timestamp":"{t}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        let lines = vec![
+            r#"{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z"}"#.to_string(),
+            msg("a1", "", "2026-01-01T00:00:01.000Z", ARCHIVED_ONE),
+            msg("a2", "a1", "2026-01-01T00:00:02.000Z", ARCHIVED_TWO),
+            msg("k1", "a2", "2026-01-01T00:00:03.000Z", KEPT_ONE),
+            msg("k2", "k1", "2026-01-01T00:00:04.000Z", KEPT_TWO),
+            format!(
+                r#"{{"type":"compaction","id":"c1","parentId":"k2","timestamp":"2026-01-01T00:00:05.000Z","summary":"{SUMMARY}","firstKeptEntryId":"k1"}}"#
+            ),
+            msg("n1", "c1", "2026-01-01T00:00:06.000Z", NEWEST),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let j = Journal::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        j
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Everything before the last compaction's kept window was archived into that compaction's
+    /// summary, and the engines resume without it. Exporting it anyway is what turned a session
+    /// compacted to ~32k tokens into a 3.4M-token OpenCode copy.
+    #[test]
+    fn messages_stop_at_the_last_compactions_kept_window() {
+        let dir = std::env::temp_dir().join(format!("sesync-conv-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let msg = |id: &str, parent: &str, t: &str, text: &str| {
+            let p = if parent.is_empty() { String::new() } else { format!(r#","parentId":"{parent}""#) };
+            format!(
+                r#"{{"type":"message","id":"{id}"{p},"timestamp":"{t}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            )
+        };
+        writeln!(f, r#"{{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z"}}"#).unwrap();
+        writeln!(f, "{}", msg("a1", "", "2026-01-01T00:00:01.000Z", "archived one")).unwrap();
+        writeln!(f, "{}", msg("a2", "a1", "2026-01-01T00:00:02.000Z", "archived two")).unwrap();
+        writeln!(f, "{}", msg("k1", "a2", "2026-01-01T00:00:03.000Z", "kept one")).unwrap();
+        writeln!(f, "{}", msg("k2", "k1", "2026-01-01T00:00:04.000Z", "kept two")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"compaction","id":"c1","parentId":"k2","timestamp":"2026-01-01T00:00:05.000Z","summary":"what came before","firstKeptEntryId":"k1"}}"#
+        )
+        .unwrap();
+        writeln!(f, "{}", msg("n1", "c1", "2026-01-01T00:00:06.000Z", "newest")).unwrap();
+        drop(f);
+
+        let j = Journal::read(&path).unwrap();
+        let texts: Vec<&str> = j.messages().iter().map(|m| m.first_text().unwrap_or("")).collect();
+        assert_eq!(texts, vec!["kept one", "kept two", "newest"], "archived turns must not be exported");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A journal with no compaction is unchanged: the whole chain is the live context.
+    #[test]
+    fn without_a_compaction_the_whole_chain_is_exported() {
+        let dir = std::env::temp_dir().join(format!("sesync-conv-nocompact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"type":"session","id":"s1","timestamp":"2026-01-01T00:00:00.000Z"}}"#).unwrap();
+        writeln!(f, r#"{{"type":"message","id":"a1","timestamp":"2026-01-01T00:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"first"}}]}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"message","id":"a2","parentId":"a1","timestamp":"2026-01-01T00:00:02.000Z","message":{{"role":"user","content":[{{"type":"text","text":"second"}}]}}}}"#).unwrap();
+        drop(f);
+        let j = Journal::read(&path).unwrap();
+        let texts: Vec<&str> = j.messages().iter().map(|m| m.first_text().unwrap_or("")).collect();
+        assert_eq!(texts, vec!["first", "second"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
