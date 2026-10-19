@@ -225,6 +225,10 @@ fn promote(state: &mut State, edit: &MirrorEdit) -> Option<String> {
     chosen.insert(old.fmt.clone());
     let mut new = Source::new(&edit.target, &edit.path);
     new.title = old.title.clone();
+    // The conversation's stable id moves with the turn: the team keys the mark, the pushed
+    // hash and the server conversation on it, so the promoted copy keeps pushing as the SAME
+    // conversation on the server, and the server keeps holding the newest version.
+    new.conv = old.conv.clone();
     new.last_seen_change = edit.mtime;
     new.last_hash = edit.hash.clone();
     new.chosen_targets = chosen;

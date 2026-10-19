@@ -106,6 +106,25 @@ impl State {
         self.team.insert(session.to_string(), TeamPush { hash: hash.to_string(), pushed_at: at });
     }
     pub fn marked_sessions(&self) -> Vec<String> { self.marked.iter().cloned().collect() }
+
+    /// The stable team id for a source key: the conversation's origin id (`Source::conv`) when
+    /// the scan has pinned it, else the key's own session id. Everything the team keys on —
+    /// the mark, the pushed hash, the server conversation, the seen floors — uses THIS id, so
+    /// a turn-taking promotion (which changes the key) never changes the conversation.
+    pub fn team_id_of(&self, key: &str) -> String {
+        self.sources.get(key)
+            .map(|s| s.conv.clone())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| crate::manage::session_id_of(key))
+    }
+
+    /// The source key currently holding a team conversation id: the entry whose `conv` is it,
+    /// else the old id rule (the key's own session id).
+    pub fn key_of_team_id(&self, id: &str) -> Option<String> {
+        self.sources.iter()
+            .find(|(_, s)| s.conv == id || crate::manage::session_id_of(&s.key) == id || s.key == id)
+            .map(|(k, _)| k.clone())
+    }
 }
 
 fn invalid(e: impl std::fmt::Display) -> io::Error {

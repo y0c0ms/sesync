@@ -176,3 +176,49 @@ fn a_stale_failure_counter_without_mirror_intent_is_not_failing() {
     a2.handle(Ev::Char('f'), Instant::now()); // scope: failing
     assert_eq!(titles(&a2).len(), 1, "with intent and a failing count it is failing again");
 }
+
+#[test]
+fn the_team_mark_survives_a_real_turn() {
+    // The bug: the mark was keyed on the source file's uuid, which changes when a mirror copy
+    // is promoted — so a shared session silently stopped pushing after a turn. The id is now
+    // the conversation's stable one and moves with the turn.
+    let sb = sandbox("team-turn");
+    let p = write_session(&sb, SID_A, "Keep me");
+    let key = p.to_string_lossy().to_string();
+    let mirror = sb.join("claude-mirror.jsonl");
+    fs::write(&mirror, "installed by the daemon\n").unwrap();
+    let mut state = State::default();
+    let mut src = sesync::state::Source::new("omp", p.to_str().unwrap());
+    src.conv = "conversation-uuid-1".to_string();
+    src.chosen_targets.insert("claude".to_string());
+    src.mirrors.insert("claude".to_string(), sesync::state::Mirror {
+        target: "claude".into(),
+        path: mirror.display().to_string(),
+        source_hash: "old".into(),
+        installed_hash: sesync::mirror::file_hash(&mirror).unwrap(),
+        diverged: false,
+        edit_stamp: String::new(),
+        target_updated: 0.0,
+    });
+    state.sources.insert(key.clone(), src);
+    state.mark("conversation-uuid-1");
+    state.record_team_push("conversation-uuid-1", "hash-before", 100.0);
+    state.mirror_keys.insert(mirror.display().to_string());
+
+    // The user answers in the claude copy: the next pass turns the session to it.
+    fs::write(&mirror, "installed by the daemon\nthe user's answer\n").unwrap();
+    let promoted = sesync::turn::promote_changed(&mut state, &[]);
+    assert_eq!(promoted, vec![mirror.display().to_string()], "the copy with the answer wins");
+
+    let new_key = mirror.display().to_string();
+    let new_src = &state.sources[&new_key];
+    assert_eq!(new_src.conv, "conversation-uuid-1", "the conversation id moves with the turn");
+    assert!(state.sources.get(&key).is_none(), "the old source entry is gone");
+    assert!(state.is_marked("conversation-uuid-1"), "the share survives the turn");
+    assert_eq!(state.team_id_of(&new_key), "conversation-uuid-1");
+    assert_eq!(state.key_of_team_id("conversation-uuid-1").as_deref(), Some(new_key.as_str()),
+        "the team pass finds the new source by the stable id");
+    assert_eq!(state.team_hash("conversation-uuid-1"), Some("hash-before".to_string()),
+        "the pushed hash is keyed on the conversation, so the next push sees the change");
+    let _ = fs::remove_dir_all(&sb);
+}
