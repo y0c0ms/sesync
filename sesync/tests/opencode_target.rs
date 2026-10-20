@@ -172,3 +172,50 @@ fn a_claude_source_is_converted_to_a_real_journal_for_the_pi_mirror() {
     assert!(body.contains("\"type\":\"message\""), "the mirror is a journal:\n{body}");
     assert!(!body.contains("\"parentUuid\""), "the raw Claude transcript must not be copied through:\n{body}");
 }
+
+/// Un-choosing a target removes the mirror on the next pass. Nothing else did: the cleanup command
+/// only plans what is still recorded and declines for OpenCode by design, so an un-ticked OpenCode
+/// row kept its session (and kept showing in the TUI's MIRRORS column) with no way to drop it.
+#[test]
+fn un_choosing_a_target_removes_the_mirror_on_the_next_pass() {
+    let sb = sandbox("unchosen-removal");
+    let fake = fake_opencode(&sb);
+    let src = omp_session(&sb);
+    let key = src.display().to_string();
+    let sid = "ses_003220097fe04c7bvvm4CnHYO6";
+
+    // The user chose opencode once, which is why a mirror exists, and has now un-chosen it:
+    // the record is there, `chosen_targets` is empty.
+    fs::create_dir_all(sb.join("state")).unwrap();
+    let mut state = State::default();
+    let mut s = Source::new("omp", &key);
+    s.mirrors.insert(
+        "opencode".into(),
+        sesync::state::Mirror {
+            target: "opencode".into(),
+            // For OpenCode the record's path is the session id: there is no file to remove.
+            path: sid.into(),
+            source_hash: String::new(),
+            installed_hash: String::new(),
+            diverged: false,
+            edit_stamp: String::new(),
+            target_updated: 0.0,
+        },
+    );
+    state.sources.insert(key.clone(), s);
+    state.save(&sb.join("state").join("state.json")).unwrap();
+
+    let out = run(&sb, &fake);
+    assert!(out.status.success(), "pass failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let log = fs::read_to_string(sb.join("oc.log")).unwrap_or_default();
+    assert!(
+        log.contains(&format!("session delete {sid}")),
+        "the copy is removed through the CLI, never by file: {log:?}"
+    );
+
+    let after = State::load(&sb.join("state").join("state.json")).unwrap();
+    let s = after.sources.get(&key).expect("the source survives the pass");
+    assert!(s.mirrors.is_empty(), "the mirror record is gone");
+    assert!(!after.mirror_keys.contains(&sid.to_string()), "and so is its mirror_keys entry");
+}
