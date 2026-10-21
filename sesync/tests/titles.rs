@@ -111,3 +111,56 @@ fn gemini_tool_results_are_not_a_user_turn() {
     assert_eq!(title, "");
     assert!(!has_user);
 }
+
+// ---- the title reader must find a rename wherever it sits -----------------------------------
+//
+// A rename made inside the harness appends only a `title_change`; the 256-byte slot keeps the old
+// name until the harness saves again. In a long journal that record can sit far from both ends, so
+// reading one window at each end missed it, the caller fell back to the stale slot, and the TUI
+// could then write that stale name back over the real one.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+fn long_journal(name: &str, slot: &str, before_kb: usize, rename: Option<&str>, after_kb: usize) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("sesync-titles-{}-{name}.jsonl", std::process::id()));
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, r#"{{"type":"title","v":1,"title":"{slot}","source":"user","updatedAt":"2026-08-18T13:59:45.153Z"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"session","version":3,"id":"s1","timestamp":"2026-07-27T10:00:00.000Z","cwd":"/tmp/p"}}"#).unwrap();
+    let mut n = 0usize;
+    let mut filler = |f: &mut std::fs::File, kb: usize, n: &mut usize| {
+        for _ in 0..(kb * 1024 / 120) {
+            *n += 1;
+            writeln!(
+                f,
+                r#"{{"type":"message","id":"m{n}","timestamp":"2026-09-01T10:00:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"filler line padding out the journal to push records away from both ends of the file"}}]}}}}"#
+            )
+            .unwrap();
+        }
+    };
+    filler(&mut f, before_kb, &mut n);
+    if let Some(t) = rename {
+        writeln!(f, r#"{{"type":"title_change","id":"tc1","timestamp":"2026-10-19T11:25:46.576Z","source":"user","title":"{t}"}}"#).unwrap();
+    }
+    filler(&mut f, after_kb, &mut n);
+    path
+}
+
+#[test]
+fn a_rename_far_from_both_ends_is_found() {
+    // ~600 KB before and ~300 KB after: the record is deeper than one window from either end.
+    let p = long_journal("far", "Old name", 600, Some("PC Config"), 300);
+    let text = sesync::titles::read_title_text(&p).expect("readable");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(sesync::titles::omp_title_from_lines(&lines).0, "PC Config");
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn without_a_rename_the_slot_still_names_the_session() {
+    let p = long_journal("slot-only", "Old name", 700, None, 0);
+    let text = sesync::titles::read_title_text(&p).expect("readable");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(sesync::titles::omp_title_from_lines(&lines).0, "Old name");
+    let _ = std::fs::remove_file(&p);
+}
