@@ -2,23 +2,20 @@
 //! Modes: `--status` prints the mirror view; `--once` runs one sync pass.
 //! Continuous polling is the same pass repeated on an interval (not yet wired).
 
-use sesync::mirror::file_hash;
+use sesync::harness::{self, Harness, Kind, Locations, Row, Tools};
+use sesync::mirror::{copy_hash, copy_mtime, copy_stamp};
 use sesync::pass::{format_status, PassSource};
 use sesync::scan::{should_sync, ScanInput, MIN_BYTES};
 use sesync::state::{Mirror, Source, State};
-use sesync::{discovery, titles};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Env {
     state_dir: PathBuf,
     home: PathBuf,
-    omp: PathBuf,
-    pi: PathBuf,
-    claude: PathBuf,
-    gemini: PathBuf,
-    opencode_db: PathBuf,
-    opencode_bin: PathBuf,
+    /// Every harness's store and command, each read from that harness's own variables.
+    locations: Locations,
     sesync_conv: PathBuf,
     sesync_lock: PathBuf,
     quiet_secs: f64,
@@ -34,7 +31,7 @@ impl Env {
         // Look there first, so the defaults match what is installed rather than a ~/bin that may not exist.
         // Windows binaries carry `.exe`, so the bare name is not the file that exists.
         let beside_me = |name: &str| -> PathBuf {
-            let candidates: Vec<PathBuf> = executable_candidates(Path::new(name));
+            let candidates: Vec<PathBuf> = harness::executable_candidates(Path::new(name));
             std::env::current_exe().ok()
                 .and_then(|e| e.parent().map(|d| candidates.iter().map(|c| d.join(c)).collect::<Vec<_>>()))
                 .and_then(|ps| ps.into_iter().find(|p| p.exists()))
@@ -43,12 +40,7 @@ impl Env {
         Env {
             state_dir: get("SESYNC_DIR", home.join(".local/share/sesync")),
             home: home.clone(),
-            omp: get("OMP_AGENT_DIR", home.join(".omp/agent")),
-            pi: get("PI_AGENT_DIR", home.join(".pi/agent")),
-            claude: get("CLAUDE_CONFIG_DIR", home.join(".claude")),
-            gemini: get("GEMINI_CLI_HOME", home.join(".gemini")),
-            opencode_db: get("OPENCODE_DB", home.join(".local/share/opencode/opencode.db")),
-            opencode_bin: get("OPENCODE_BIN", PathBuf::from("opencode")),
+            locations: Locations::from_env(&home),
             sesync_conv: get("SESYNC_CONV", beside_me("sesync-conv")),
             sesync_lock: get("SESYNC_LOCK", beside_me("sesync-lock")),
             quiet_secs: num("SESYNC_QUIET", 20.0),
@@ -57,6 +49,9 @@ impl Env {
     }
     fn state_file(&self) -> PathBuf {
         self.state_dir.join("state.json")
+    }
+    fn tools(&self) -> Tools<'_> {
+        Tools { home: &self.home, sesync_conv: &self.sesync_conv }
     }
     fn lock_dir(&self) -> PathBuf {
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
@@ -87,66 +82,79 @@ fn duration_from_env(key: &str, default_secs: f64) -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs_f64(default_secs))
 }
 
-fn mtime_secs(p: &Path) -> f64 {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
 /// Mirrors the daemon created, so a change to them is never treated as a source.
 fn is_mirror(state: &State, key: &str) -> bool {
     state.mirror_keys.contains(key)
+}
+
+/// What sesync lets go of at every load and after every merge with the TUI's file. The records of
+/// harnesses it no longer syncs (`harness::RETIRED`): their sources move to their best surviving
+/// copy (one its own harness still has), their targets are released, and none of their files is
+/// ever touched. And the sessions the user deleted in the TUI (`State::forget_deleted`): the
+/// record goes and the copies are released. Cheap and idempotent.
+fn release_records(locations: &Locations, state: &mut State) -> Vec<String> {
+    let exists = |target: &str, key: &str| harness::get(target).is_some_and(|h| h.copy_exists(locations.of(target), key));
+    let mut log = Vec::new();
+    for retired in harness::RETIRED {
+        log.extend(state.retire_harness(retired, &exists));
+    }
+    log.extend(state.forget_deleted(now_secs()));
+    log
+}
+
+/// `release_records`, reporting each change on stderr (the daemon and the CLI modes; the TUI's
+/// screen would be garbled by it).
+fn release_records_logged(locations: &Locations, state: &mut State) {
+    for line in release_records(locations, state) {
+        eprintln!("sesync: {line}");
+    }
 }
 
 /// Find sources that need a sync, and the title to give their mirror.
 fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
     let now = now_secs();
     let mut out = Vec::new();
-    // One OpenCode store read per pass: the rows are scan_opencode's input, and the id set
-    // tells whether a recorded OpenCode mirror still exists (its store moved to SQLite).
-    let opencode_sessions = if env.opencode_db.exists() {
-        sesync::opencode::sessions(&env.opencode_db)
-    } else {
-        Vec::new()
-    };
+    // One database read per store harness per pass: the rows are scan_store's input, and the ids
+    // tell whether a copy recorded there still exists.
+    let stores: Vec<(&'static dyn Harness, Vec<Row>)> = harness::ALL.iter()
+        .filter(|h| h.kind() == Kind::Store)
+        .map(|h| (*h, h.rows(env.locations.of(h.id()))))
+        .collect();
     // Turn-taking first: a mirror the user answered in becomes the session's source, and the
-    // promoted source is synced in this same pass, without the quiet window — the whole point
-    // is that the other harnesses hold the updated copy by the time the user opens them.
-    let rows: Vec<(String, f64)> = opencode_sessions.iter().map(|s| (s.id.clone(), s.updated)).collect();
-    for key in sesync::turn::promote_changed(state, &rows) {
+    // promoted source is synced in this same pass, without the quiet window: the whole point
+    // is that the other harnesses hold the updated copy by the time the user opens them. An
+    // answer is a user prompt newer than every prompt of the source, read by each harness from
+    // its own records.
+    let rows: sesync::turn::StoreRows = stores.iter()
+        .map(|(h, rows)| (h.id().to_string(), rows.iter().map(|r| (r.id.clone(), r.updated)).collect()))
+        .collect();
+    let locations = &env.locations;
+    let prompt_of = |fmt: &str, key: &str| -> Option<f64> { harness::get(fmt)?.newest_prompt(locations.of(fmt), key) };
+    for key in sesync::turn::promote_changed(state, &rows, &prompt_of) {
         let title = state.sources.get(&key).map(|s| s.title.clone()).unwrap_or_default();
         eprintln!("sesync: '{}' answered elsewhere; it becomes the source now", title);
         out.push(PassSource { key, title, urgent: true });
     }
-    let opencode_ids: Option<std::collections::BTreeSet<String>> = if opencode_sessions.is_empty() {
-        None
-    } else {
-        Some(opencode_sessions.iter().map(|s| s.id.clone()).collect())
-    };
+    // Every copy recorded on some source, files and store ids alike. A copy is never a source,
+    // even when an older binary's record left it out of `mirror_keys`.
+    let recorded = state.mirror_paths();
+    // A store that listed nothing was not read: none of its copies is called stale.
+    let store_ids: BTreeMap<String, BTreeSet<String>> = stores.iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .map(|(h, rows)| (h.id().to_string(), rows.iter().map(|r| r.id.clone()).collect()))
+        .collect();
     let home = env.home.to_string_lossy().to_string();
-    // Claude sessions are sources too (the Python daemon synced them; the Rust port had
-    // dropped this path). Each format lists its own main sessions.
-    let claude_root = env.claude.clone();
-    let mut sources: Vec<(&str, Vec<PathBuf>)> = vec![
-        ("omp", if env.omp.is_dir() { discovery::jsonl_sessions(&env.omp) } else { Vec::new() }),
-        ("pi", if env.pi.is_dir() { discovery::jsonl_sessions(&env.pi) } else { Vec::new() }),
-        ("claude", discovery::claude_sessions(&claude_root)),
-        ("gemini", if env.gemini.is_dir() { discovery::gemini_sessions(&env.gemini) } else { Vec::new() }),
-    ];
-    for (fmt, paths) in sources.drain(..) {
-        if paths.is_empty() {
-            continue;
-        }
-        for path in paths {
+    for h in harness::ALL.iter().filter(|h| h.kind() == Kind::Files) {
+        let fmt = h.id();
+        for path in h.sessions(env.locations.of(fmt)) {
             let key = path.display().to_string();
-            if is_mirror(state, &key) {
+            if is_mirror(state, &key) || recorded.contains(&key) {
                 continue;
             }
             let Ok(meta) = std::fs::metadata(&path) else { continue };
-            let mtime = mtime_secs(&path);
+            // A conversation of several files (a database and its WAL) changes in any of them:
+            // its time, stamp and hash cover them together.
+            let mtime = copy_mtime(fmt, &path);
             let src = state.sources.entry(key.clone()).or_insert_with(|| Source::new(fmt, &key));
             if src.conv.is_empty() {
                 src.conv = sesync::manage::conversation_id(&key);
@@ -154,11 +162,11 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             if mtime > src.last_seen_change {
                 src.last_seen_change = mtime;
             }
-            let stamp = format!("{}:{}", meta.len(), mtime);
+            let stamp = copy_stamp(fmt, &path);
             let hash = if stamp == src.last_stamp && !src.last_hash.is_empty() {
                 src.last_hash.clone()
             } else {
-                let h = file_hash(&path).unwrap_or_default();
+                let h = copy_hash(fmt, &path).unwrap_or_default();
                 src.last_stamp = stamp;
                 h
             };
@@ -167,16 +175,16 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             let live_current = live.iter().all(|m| m.source_hash == hash);
             // Mirrors are wanted only for targets the user chose for this session. A source
             // with no choice is "changed" only when its content changed, and writes nothing.
-            // A chosen target with no mirror — or one recorded where its harness will never
-            // list it (mirror_stale) — forces a pass. Repeated failures put the retries into
-            // backoff (mirror_demand), so a transcript that can never convert is not
-            // attempted every pass forever.
+            // A chosen target with no mirror, or one recorded where its harness will never list
+            // it (mirror_stale), forces a pass. Repeated failures put the retries into backoff
+            // (mirror_demand), so a transcript that can never convert is not attempted every
+            // pass forever.
             let needs_cwd = src.chosen_targets.iter()
-                .any(|t| (t == "omp" || t == "pi") && src.mirrors.contains_key(t));
-            let cwd = if needs_cwd { sesync::buckets::cwd_from_head(fmt, &path) } else { None };
+                .any(|t| harness::get(t).is_some_and(|t| t.placed_by_cwd()) && src.mirrors.contains_key(t));
+            let cwd = if needs_cwd { h.cwd(&path) } else { None };
             let missing = src.chosen_targets.iter().any(|t| match src.mirrors.get(t) {
                 None => true,
-                Some(m) => sesync::scan::mirror_stale(t, &m.path, cwd.as_deref(), &home, opencode_ids.as_ref()),
+                Some(m) => sesync::scan::mirror_stale(t, &m.path, cwd.as_deref(), &home, &store_ids),
             });
             let (wanted, needs_mirror) = sesync::scan::mirror_demand(
                 missing, src.chosen_targets.len(), src.mirrors.len(),
@@ -197,37 +205,26 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             if !should_sync(&input) || meta.len() < MIN_BYTES {
                 continue;
             }
-            let title = titles::read_title_text(&path)
-                .map(|text| {
-                    let lines: Vec<&str> = text.lines().collect();
-                    if fmt == "claude" {
-                        titles::claude_title_from_lines(&lines).0
-                    } else if fmt == "gemini" {
-                        titles::gemini_title_from_lines(&lines).0
-                    } else {
-                        titles::omp_title_from_lines(&lines).0
-                    }
-                })
-                .unwrap_or_default();
+            let title = h.title(&path);
             src.last_hash = hash;
             out.push(PassSource { key, title: if title.is_empty() { "untitled".into() } else { title }, urgent: false });
         }
     }
-    out.extend(scan_opencode(env, state, now, &opencode_sessions));
+    for (h, rows) in &stores {
+        out.extend(scan_store(env, state, now, *h, rows, &store_ids));
+    }
     record_subagents(env, state);
     out
 }
 
 /// Record every subagent transcript under its parent session, so the TUI can show it there.
-/// Claude and Gemini keep subagent files next to their parent; OpenCode child sessions are
-/// rows with a parent_id and are handled by the source filter, not here.
+/// Harnesses that keep subagent files beside their parent list them (`Harness::subagents`).
 fn record_subagents(env: &Env, state: &mut State) {
-    let mut found: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for (parent, path) in discovery::claude_subagents(&env.claude)
-        .into_iter()
-        .chain(discovery::gemini_subagents(&env.gemini))
-    {
-        found.entry(parent).or_default().push(path.display().to_string());
+    let mut found: BTreeMap<String, Vec<String>> = Default::default();
+    for h in harness::ALL {
+        for (parent, path) in h.subagents(env.locations.of(h.id())) {
+            found.entry(parent).or_default().push(path.display().to_string());
+        }
     }
     let store = env.state_dir.join("archive");
     for (parent, files) in found.iter_mut() {
@@ -243,40 +240,36 @@ fn record_subagents(env: &Env, state: &mut State) {
     state.subagents = found;
 }
 
-/// O-penCode sessions that changed. Same rules as the Python: live sessions only,
-/// no sessions older than the window, wait for quiet, and re-sync only when
-/// time_updated moved. The title is the store's title, or the first prompt when the
-/// store has only the default name.
-fn scan_opencode(env: &Env, state: &mut State, now: f64, sessions: &[sesync::opencode::Session]) -> Vec<PassSource> {
+/// The conversations of a store harness that changed. The same rules as for files: live sessions
+/// only, none older than the window, wait for quiet, and re-sync only when the row's update time
+/// moved. The title is the harness's (`Harness::row_title`).
+fn scan_store(env: &Env, state: &mut State, now: f64, h: &dyn Harness, rows: &[Row],
+              store_ids: &BTreeMap<String, BTreeSet<String>>) -> Vec<PassSource> {
     let mut out = Vec::new();
     let home = env.home.to_string_lossy().to_string();
-    let ids: Option<std::collections::BTreeSet<String>> = if sessions.is_empty() {
-        None
-    } else {
-        Some(sessions.iter().map(|s| s.id.clone()).collect())
-    };
-    for s in sessions {
+    let loc = env.locations.of(h.id());
+    for s in rows {
         if state.mirror_keys.contains(&s.id) {
             continue;
         }
-        // A row recorded as an O-penCode mirror of another session's copy — turn-taking moved
-        // the source away — is a mirror, never a source.
-        if state.sources.values().any(|v| v.mirrors.get("opencode").map_or(false, |m| m.path == s.id)) {
+        // A row recorded as a copy of another session's conversation (turn-taking moved the
+        // source away) is a mirror, never a source.
+        if state.sources.values().any(|v| v.mirrors.get(h.id()).map_or(false, |m| m.path == s.id)) {
             continue;
         }
         // A choice whose mirror has not been written yet outranks the age window, exactly as
-        // for the file-backed sources. A mirror recorded in the wrong bucket (or an OpenCode
-        // id that no longer exists after its store migration) counts as unwritten.
+        // for the file sources. A mirror recorded in the wrong folder (or a store id that no
+        // longer exists) counts as unwritten.
         let pending = state.sources.get(&s.id)
             .map(|src| src.chosen_targets.iter().any(|t| match src.mirrors.get(t) {
                 None => true,
-                Some(m) => sesync::scan::mirror_stale(t, &m.path, Some(&s.directory), &home, ids.as_ref()),
+                Some(m) => sesync::scan::mirror_stale(t, &m.path, Some(&s.directory), &home, store_ids),
             }))
             .unwrap_or(false);
         if !pending && now - s.updated > env.max_age_secs {
             continue;
         }
-        let src = state.sources.entry(s.id.clone()).or_insert_with(|| Source::new("opencode", &s.id));
+        let src = state.sources.entry(s.id.clone()).or_insert_with(|| Source::new(h.id(), &s.id));
         if src.conv.is_empty() {
             src.conv = sesync::manage::conversation_id(&s.id);
         }
@@ -291,14 +284,8 @@ fn scan_opencode(env: &Env, state: &mut State, now: f64, sessions: &[sesync::ope
             continue;
         }
         src.last_hash = stamp;
-        let title = sesync::opencode::clean_title(&s.title);
-        let title = if title.is_empty() {
-            let p = sesync::opencode::first_prompt(&env.opencode_db, &s.id);
-            if p.is_empty() { "untitled session".to_string() } else { p }
-        } else {
-            title
-        };
-        // Keep the name on the source, so the TUI can show it without re-reading the database.
+        let title = h.row_title(loc, s);
+        // Keep the name on the source, so the TUI can show it without reading the database.
         if let Some(src) = state.sources.get_mut(&s.id) {
             src.title = title.clone();
         }
@@ -315,6 +302,9 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
+    // A choice saved by an older TUI can still name a retired harness, and the TUI may have
+    // deleted a session since the last pass.
+    release_records_logged(&env.locations, state);
     let changed = scan(env, state);
     let attempted = changed.len();
     // Un-choosing a target has to drop the copy, and that is not a content change, so it runs on
@@ -325,24 +315,53 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     for s in &changed {
         sync_chosen(env, state, s);
     }
+    settle_sync_records(state);
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
+    release_records_logged(&env.locations, state);
     if let Err(e) = state.save(&env.state_file()) {
         eprintln!("sesync: cannot save state: {e}");
     }
     attempted
 }
 
+/// Keep the per-target records true for the TUI on every pass, not only for sources that
+/// changed: a target the user no longer chose loses its record (an un-chosen failure stops being
+/// reported at once), and a file copy written before the record existed gets its write time once
+/// from its modified time. A copy in a store harness gets none: its row time is the imported
+/// conversation's, not the moment sesync wrote it, so it waits for its next write. A copy that
+/// does not hold what sesync wrote (diverged, or bytes sesync did not write) gets none either:
+/// its time is not a sync.
+fn settle_sync_records(state: &mut State) {
+    for src in state.sources.values_mut() {
+        let chosen = &src.chosen_targets;
+        src.sync.retain(|t, _| chosen.contains(t));
+        let missing: Vec<String> = src.chosen_targets.iter()
+            .filter(|t| **t != src.fmt && !harness::is_store(t) && !src.sync.contains_key(*t))
+            .cloned()
+            .collect();
+        for t in missing {
+            let Some(m) = src.mirrors.get(&t) else { continue };
+            if m.diverged || m.installed_hash.is_empty() {
+                continue;
+            }
+            let at = copy_mtime(&t, Path::new(&m.path));
+            if at > 0.0 {
+                src.sync.insert(t, sesync::state::TargetSync { ok_at: at, ..Default::default() });
+            }
+        }
+    }
+}
+
 /// Drop the mirrors the user no longer wants. Un-choosing a target is how a session stops being
 /// mirrored there, and nothing else removes the copy: `sesync mirrors` only plans what is still
-/// recorded, and it declines for OpenCode by design ("remove it through OpenCode"). File mirrors
-/// go through the same safety rule and logging as that command; an OpenCode mirror is removed by
-/// asking the CLI to delete the session, never by touching a file.
+/// recorded, and it declines for store harnesses by design ("remove it through the harness"). File
+/// mirrors go through the same safety rule and logging as that command; a copy in a store harness
+/// is removed through the harness itself, never by touching a file.
 fn drop_unchosen(env: &Env, state: &mut State) -> Vec<String> {
     let planned = sesync::mirror_cleanup::plan_unchosen(state);
-    let (opencode, rest): (Vec<_>, Vec<_>) =
-        planned.into_iter().partition(|p| p.target == "opencode");
+    let (stored, rest): (Vec<_>, Vec<_>) = planned.into_iter().partition(|p| harness::is_store(&p.target));
     // Only the copies that provably lose nothing are deleted; the rest are released, so the record
     // stops claiming a mirror sesync will never update again while the copy itself stays.
     let (removable, releasable): (Vec<_>, Vec<_>) = rest
@@ -350,21 +369,45 @@ fn drop_unchosen(env: &Env, state: &mut State) -> Vec<String> {
         .partition(|p| matches!(p.verdict, sesync::mirror_cleanup::Verdict::Remove));
     let mut log = sesync::mirror_cleanup::apply(state, &removable, &env.lock_dir(), &env.sesync_lock);
     log.extend(sesync::mirror_cleanup::release(state, &releasable));
-    for p in &opencode {
-        // `opencode session delete` is scoped to the directory it runs in: from the wrong cwd it
-        // answers "Session not found" and the copy would silently stay behind. Use the
-        // conversation's own cwd, the same way the import does.
-        let fmt = state.sources.get(&p.source).map(|s| s.fmt.clone()).unwrap_or_default();
-        let cwd = sesync::buckets::cwd_from_head(&fmt, std::path::Path::new(&p.source)).unwrap_or_default();
-        match sesync::install::remove_opencode_session(&env.opencode_bin, &p.path, &cwd, None) {
-            Ok(()) => {
+    for p in &stored {
+        let Some(h) = harness::get(&p.target) else { continue };
+        let loc = env.locations.of(&p.target);
+        // The same rule as for files: only a copy that still holds exactly what sesync imported
+        // is deleted. A session somebody continued, or the old source a promotion demoted (the
+        // user's own conversation), is released and kept.
+        let Some(now) = h.fingerprint(loc, &p.path) else {
+            sesync::mirror_cleanup::forget(state, p);
+            log.push(format!("cleared {} {} (already gone)", p.target, p.path));
+            continue;
+        };
+        if p.installed_hash.is_empty() || now != p.installed_hash {
+            sesync::mirror_cleanup::forget(state, p);
+            log.push(format!("released {} {} (kept the session: sesync did not write what it holds)", p.target, p.path));
+            continue;
+        }
+        match h.remove(loc, &p.path) {
+            Ok(()) if h.fingerprint(loc, &p.path).is_none() => {
                 sesync::mirror_cleanup::forget(state, p);
-                log.push(format!("removed opencode {}", p.path));
+                log.push(format!("removed {} {}", p.target, p.path));
             }
-            Err(e) => log.push(format!("kept    opencode {}: {e}", p.path)),
+            Ok(()) => log.push(format!("kept    {} {}: the harness reported success but the session is still there", p.target, p.path)),
+            Err(e) => log.push(format!("kept    {} {}: {e}", p.target, p.path)),
         }
     }
     log
+}
+
+/// A failure that stops the whole source (a conversion error, an empty export): count it on the
+/// source and record the same message on every chosen target.
+fn fail_source(state: &mut State, key: &str, targets: &[String], msg: &str) {
+    let now = now_secs();
+    if let Some(src) = state.sources.get_mut(key) {
+        src.failures += 1;
+        src.last_failure = now;
+        for t in targets {
+            src.record_sync(t, Err(msg), now);
+        }
+    }
 }
 
 /// Write mirrors for one changed source, only into the targets the user chose for it. A source
@@ -376,74 +419,80 @@ fn sync_chosen(env: &Env, state: &mut State, s: &PassSource) {
     if chosen.is_empty() {
         return;
     }
-    // An O-penCode source has no file to hand the converter: export it with its own CLI and
-    // convert once, then install the same journal into every chosen target. A Claude
-    // transcript or a Gemini session log is not a journal either: convert it the same way,
-    // or the target converter would pass the raw records through unchanged.
-    let mut journal: Option<std::path::PathBuf> = None;
-    if fmt == "opencode" || fmt == "claude" || fmt == "gemini" {
-        let scratch = env.state_dir.join("mirror-scratch");
-        let converted = if fmt == "opencode" {
-            sesync::opencode::export_and_convert(&env.opencode_bin, &env.sesync_conv, &s.key, &scratch)
-        } else if fmt == "gemini" {
-            sesync::team_sync::canonical_bytes(
-                sesync::team_sync::Canonical::Gemini(Path::new(&s.key)),
-                &env.sesync_conv,
-                &scratch,
-            )
-            .map(|_| scratch.join("canonical.jsonl"))
-        } else {
-            sesync::team_sync::canonical_bytes(
-                sesync::team_sync::Canonical::Claude(Path::new(&s.key)),
-                &env.sesync_conv,
-                &scratch,
-            )
-            .map(|_| scratch.join("canonical.jsonl"))
-        };
-        match converted {
-            Ok(j) => journal = Some(j),
-            Err(e) => {
-                if let Some(src) = state.sources.get_mut(&s.key) {
-                    src.failures += 1;
-                    src.last_failure = now_secs();
-                }
-                eprintln!("mirror {} failed: {e}", s.key);
-                return;
-            }
+    // A source whose files are not canonical journals (a store harness's session, a transcript,
+    // a database) is converted once by its harness, then the same journal is installed into
+    // every chosen target; otherwise the target converter would pass the raw records through.
+    let scratch = env.state_dir.join("mirror-scratch");
+    let converted = match harness::get(&fmt) {
+        Some(h) => h.to_journal(env.locations.of(&fmt), &env.tools(), &s.key, &scratch),
+        None => Err(format!("no harness named '{fmt}'")),
+    };
+    let journal: Option<PathBuf> = match converted {
+        Ok(j) => j,
+        Err(e) => {
+            fail_source(state, &s.key, &chosen, &format!("conversion failed: {e}"));
+            eprintln!("mirror {} failed: {e}", s.key);
+            return;
         }
+    };
+    // Nothing replaces a copy with an empty conversation. An export with no message (today: an
+    // OpenCode session a failed import had emptied) would otherwise overwrite every copy that
+    // still holds the conversation. Counted as a failure, so the retry backs off.
+    let content = journal.clone().unwrap_or_else(|| PathBuf::from(&s.key));
+    if !sesync::scan::journal_has_messages(&content) {
+        fail_source(state, &s.key, &chosen, "the source holds no messages");
+        eprintln!("sesync: '{}' holds no messages; its copies were left as they are", s.title);
+        if let Some(j) = journal {
+            let _ = std::fs::remove_file(j);
+        }
+        return;
     }
+    let archive = env.state_dir.join("archive");
+    let lock_dir = env.lock_dir();
     let stores = sesync::mirror_write::Stores {
+        locations: &env.locations,
         home: &env.home,
-        omp: &env.omp,
-        pi: &env.pi,
-        claude: &env.claude,
-        gemini: &env.gemini,
-        opencode_bin: &env.opencode_bin,
-        opencode_db: &env.opencode_db,
         sesync_conv: &env.sesync_conv,
         sesync_lock: &env.sesync_lock,
+        archive: &archive,
+        lock_dir: &lock_dir,
     };
-    let conv = sesync::discovery::parse_omp_name(
-        Path::new(&s.key).file_name().and_then(|n| n.to_str()).unwrap_or(""),
-    ).unwrap_or_else(|| s.key.clone());
+    // Every write claims the conversation's stable id, the name every copy's alias points at, so
+    // a turn in any harness and this write exclude each other. The source's own session id is
+    // aliased too (an OpenCode id keeps its `ses_` prefix, the conversation id does not).
+    let conv = state.team_id_of(&s.key);
+    if env.sesync_lock.exists() {
+        if let Err(e) = sesync::lock::write_alias(&lock_dir, &sesync::manage::session_id_of(&s.key), &conv) {
+            eprintln!("sesync: cannot record the lock alias for {}: {e}", s.key);
+        }
+    }
+    if let Some(src) = state.sources.get_mut(&s.key) {
+        // Targets the user no longer chose keep no record.
+        src.sync.retain(|t, _| chosen.contains(t));
+    }
     let mut failed = false;
     for target in chosen {
         if target == fmt {
             continue;
         }
-        let written = match &journal {
-            Some(j) => sesync::mirror_write::write_mirror_from_journal(
-                &stores, state, &s.key, &conv, &s.title, &target, j),
-            None => sesync::mirror_write::write_mirror(
-                &stores, state, &s.key, &fmt, &conv, &s.title, &target),
-        };
-        if let Err(e) = written {
-            failed = true;
-            if let Some(src) = state.sources.get_mut(&s.key) {
-                src.failures += 1;
-                src.last_failure = now_secs();
+        let written = sesync::mirror_write::write_mirror(&stores, state, &s.key, &conv, &s.title, &target, &content);
+        let now = now_secs();
+        match written {
+            Ok(_) => {
+                if let Some(src) = state.sources.get_mut(&s.key) {
+                    src.record_sync(&target, Ok(()), now);
+                }
             }
-            eprintln!("mirror {} -> {target} failed: {e}", s.key);
+            Err(e) => {
+                failed = true;
+                let msg = e.to_string();
+                if let Some(src) = state.sources.get_mut(&s.key) {
+                    src.failures += 1;
+                    src.last_failure = now;
+                    src.record_sync(&target, Err(msg.as_str()), now);
+                }
+                eprintln!("mirror {} -> {target} failed: {e}", s.key);
+            }
         }
     }
     if !failed {
@@ -521,6 +570,7 @@ fn run_mirrors(env: &Env, state: &mut State, apply: bool) -> i32 {
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
+    release_records_logged(&env.locations, state);
     if let Err(e) = state.save(&env.state_file()) {
         eprintln!("sesync: cannot save state: {e}");
         return 1;
@@ -543,17 +593,20 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Released before any mode reads the records: the retired Gemini CLI (so neither the daemon,
+    // the TUI nor `sesync mirrors` ever acts on a Gemini copy, never deleted, only released), and
+    // the sessions the user deleted.
+    release_records_logged(&env.locations, &mut state);
     if args.first().map(String::as_str) == Some("mirrors") {
         std::process::exit(run_mirrors(&env, &mut state, args.iter().any(|a| a == "--apply")));
     }
     if args.iter().any(|a| a == "--tui") {
         let roots = sesync::manage::Roots {
-            omp: env.omp.join("sessions"),
-            pi: env.pi.join("sessions"),
-            claude: env.claude.join("projects"),
-            gemini: env.gemini.join("tmp"),
+            locations: env.locations.clone(),
+            home: env.home.clone(),
+            sesync_conv: env.sesync_conv.clone(),
         };
-        if let Err(e) = run_tui(roots, state, env.lock_dir(), env.sesync_lock.clone(), team_config_dir(), env.state_file(), env.opencode_bin.clone()) {
+        if let Err(e) = run_tui(roots, state, env.lock_dir(), env.sesync_lock.clone(), team_config_dir(), env.state_file()) {
             eprintln!("sesync: tui failed: {e}");
             std::process::exit(1);
         }
@@ -584,9 +637,11 @@ fn main() {
         let poll = std::time::Duration::from_secs_f64(
             std::env::var("SESYNC_POLL").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0));
         let mut passes = 0u64;
-        // The team side is optional: configured only by the team environment (see team_watch).
-        // A machine can belong to more than one team; every one of them is pulled and pushed.
-        let teams = sesync::team_watch::teams_from_env(&team_config_dir());
+        // The team side is optional: configured by a joined credential or the team environment (see
+        // team_watch). A machine can belong to more than one team; every one of them is pulled and
+        // pushed. The teams are read again at every team step, after renewing any token about to
+        // run out, so a renewal, a new join or a `sesync team renew` is used without a restart.
+        let mut teams = sesync::team_watch::teams_from_env(&team_config_dir());
         state.migrate_legacy_team_state(&teams.iter().map(|t| t.space.clone()).collect::<Vec<_>>());
         // The team pull and push run on their own interval: SESYNC_POLL at first, doubling while the
         // team has nothing new, capped at SESYNC_TEAM_POLL_MAX (team_backoff). The local pass is not
@@ -594,25 +649,77 @@ fn main() {
         let mut team_backoff = sesync::team_backoff::TeamBackoff::new(
             poll, duration_from_env("SESYNC_TEAM_POLL_MAX", 60.0));
         let mut next_team_at: Option<std::time::Instant> = None;
-        // Conversations the last pull showed or skipped as unchanged; None before the first pull.
-        let mut visible_before: Option<usize> = None;
+        // Per team, the conversations its last pull showed or skipped as unchanged; absent before
+        // that team's first pull. Per team, so one team's count is never compared with another's.
+        let mut visible_before: std::collections::BTreeMap<String, usize> = Default::default();
+        // The last renewal error reported per team, so a lasting refusal is logged once.
+        let mut renew_errors: std::collections::BTreeMap<String, String> = Default::default();
+        // The last line reported per waiting join, so "waiting for the admin" is logged once per
+        // team per run, not on every team step.
+        let mut join_notes: std::collections::BTreeMap<String, String> = Default::default();
         loop {
             one_pass(&env, &mut state);
             let team_due = next_team_at.map_or(true, |t| std::time::Instant::now() >= t);
             if team_due {
-                // Set when a pull accepts a record or a push succeeds: the team interval resets.
+                // Set when a pull accepts a new record, a push succeeds or the admin approves a
+                // waiting join: the team interval resets.
                 let mut activity = false;
+                let mut waiting = false;
+                for (space, r) in sesync::team_join::check_all_waiting(&team_config_dir()) {
+                    let note = match &r {
+                        Ok(a) => a.describe(&space),
+                        Err(e) => format!("team [{space}]: cannot check the join request: {e}"),
+                    };
+                    match r {
+                        Ok(sesync::team_join::Approval::Approved { .. }) => activity = true,
+                        _ => waiting = true,
+                    }
+                    if join_notes.get(&space) != Some(&note) {
+                        eprintln!("sesync: {note}");
+                        join_notes.insert(space, note);
+                    }
+                }
+                for (space, r) in sesync::team_join::renew_all_due(&team_config_dir(), now_secs() as u64) {
+                    match r {
+                        Ok(true) => { renew_errors.remove(&space); eprintln!("sesync: team [{space}]: token renewed"); }
+                        Ok(false) => { renew_errors.remove(&space); }
+                        Err(e) => {
+                            if renew_errors.get(&space) != Some(&e) {
+                                eprintln!("sesync: team [{space}]: cannot renew the token: {e}");
+                                renew_errors.insert(space, e);
+                            }
+                        }
+                    }
+                }
+                teams = sesync::team_watch::teams_from_env(&team_config_dir());
                 if !teams.is_empty() {
                     // Display-only: the pull verifies and counts. Nothing is written into a harness;
                     // importing a shown session stays a separate, confirmed action.
                     let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &state.floors_all());
                     let before = state.team_seen.clone();
+                    // A newer member list a pull verified is kept, so the list held here only
+                    // moves forward (a revoke stays in force whatever a server sends later).
+                    for (space, kept) in sesync::team_watch::TeamWatch::keep_newer_lists(&team_config_dir(), &pulls) {
+                        match kept {
+                            Ok(v) => eprintln!("sesync: team [{space}]: member list v{v} kept"),
+                            Err(e) => eprintln!("sesync: team [{space}]: cannot keep the newer member list: {e}"),
+                        }
+                    }
                     for p in &pulls {
-                        eprintln!("sesync: team pull [{}]: {} shown, {} dropped, {} rolled back",
-                            p.space, p.out.shown.len(), p.out.dropped, p.out.rolled_back);
+                        match &p.out.error {
+                            Some(e) => eprintln!("sesync: team pull [{}]: {e}", p.space),
+                            None => eprintln!("sesync: team pull [{}]: {} shown, {} dropped, {} rolled back",
+                                p.space, p.out.shown.len(), p.out.dropped, p.out.rolled_back),
+                        }
                         let visible = p.out.shown.len() + p.out.unchanged;
-                        activity |= !sesync::team_backoff::pull_is_idle(p.out.accepted.len(), visible, visible_before);
-                        visible_before = Some(visible);
+                        // The pull fetches every record each time, so only a sequence above the
+                        // floor already held is new; a record read again unchanged is not activity.
+                        let new_records = p.out.accepted.iter()
+                            .filter(|(conv, seq)| **seq > state.seen_floor(&p.space, conv))
+                            .count();
+                        activity |= !sesync::team_backoff::pull_is_idle(
+                            new_records, visible, visible_before.get(&p.space).copied());
+                        visible_before.insert(p.space.clone(), visible);
                         // The floor only rises, and it is per team: a record received under one
                         // team never raises another team's floor for the same conversation.
                         for (conv, seq) in &p.out.accepted {
@@ -623,16 +730,16 @@ fn main() {
                         if let Err(e) = state.absorb_user_edits(&env.state_file()) {
                             eprintln!("sesync: cannot read user choices from state: {e}");
                         }
+                        release_records_logged(&env.locations, &mut state);
                         if let Err(e) = state.save(&env.state_file()) {
                             eprintln!("sesync: cannot save state: {e}");
                         }
                     }
                 }
                 // Team push: marked sessions quiet for the team period, sealed and pushed. Nothing runs
-                // unless a team is configured. O-penCode-origin sessions are skipped and reported.
+                // unless a team is configured. Each session is sent as a canonical journal, made by its
+                // own harness.
                 let now = now_secs();
-                let conv = env.sesync_conv.clone();
-                let opencode_bin = env.opencode_bin.clone();
                 let scratch = env.state_dir.join("team-scratch");
                 let paths: std::collections::HashMap<String, (String, f64)> = state.shared_sessions().into_iter()
                     .filter_map(|id| {
@@ -647,7 +754,7 @@ fn main() {
                 let content_of = |id: &str| -> Result<Vec<u8>, String> {
                     let (tagged, _) = paths.get(id).ok_or("session is not on disk")?;
                     let (fmt, key) = tagged.split_once('\u{1f}').ok_or("bad source record")?;
-                    sesync::team_sync::canonical_for_source(fmt, key, &conv, &opencode_bin, &scratch)
+                    sesync::team_sync::canonical_for_source(fmt, key, &env.locations, &env.tools(), &scratch)
                 };
                 let last_change = |id: &str| paths.get(id).map(|(_, t)| *t);
                 match sesync::team_pass::run(&team_config_dir(), &mut state, now, content_of, last_change) {
@@ -660,9 +767,9 @@ fn main() {
                     Err(sesync::team_pass::NotRun::NoTeam) => {}
                     Err(e) => eprintln!("sesync: team push not run: {e:?}"),
                 }
-                // Only a configured team backs off. Without one the team step returns at once, so it
-                // keeps running on every tick, as it always has.
-                if !teams.is_empty() {
+                // Only a configured team, or a join waiting for the admin, backs off. Without one the
+                // team step returns at once, so it keeps running on every tick, as it always has.
+                if !teams.is_empty() || waiting {
                     let before_interval = team_backoff.interval();
                     team_backoff = team_backoff.next(activity);
                     if team_backoff.interval() != before_interval {
@@ -688,32 +795,77 @@ fn main() {
 /// live. Keep only what the signed member list vouches for; the team server is configured by
 /// SESYNC_TEAM_* (see team_watch); without them the refresh says so, nothing else changes.
 
-/// The pull in flight, checked between key events.
+/// What a pull worker sends back: one verified outcome per team, and one line per join still
+/// waiting or just approved. The teams to share with are read from disk when it is applied.
+struct PullDone {
+    pulls: Vec<sesync::team_watch::TeamPull>,
+    notes: Vec<String>,
+}
+
+/// The pull in flight, collected on every loop turn.
 enum TeamPull {
     /// The request was refused before starting (not configured, or one already running).
     None,
-    /// A worker is pulling; the receiver returns one verified outcome per team.
-    Running(std::sync::mpsc::Receiver<Vec<sesync::team_watch::TeamPull>>),
+    /// A worker is pulling.
+    Running(std::sync::mpsc::Receiver<PullDone>),
 }
 
 /// Put the result on the app: the verified sessions (one entry per conversation, the newest
-/// across the teams) and the refuse count. Runs on the main thread after the worker sent it.
-fn apply_pull(app: &mut sesync::app::App, pulls: Vec<sesync::team_watch::TeamPull>) {
-    let shown = sesync::team_watch::TeamWatch::newest_per_conversation(&pulls);
+/// across the teams), the refuse count and each team the server would not list, then any waiting
+/// or approved join, which the status line shows instead of the pull count. A team left while
+/// the pull ran is dropped from it, so it is neither shown nor offered again. Runs on the main
+/// thread after the worker sent it.
+fn apply_pull(app: &mut sesync::app::App, done: PullDone, config_dir: &std::path::Path) {
+    let current: Vec<String> = sesync::team_watch::teams_from_env(config_dir).into_iter().map(|t| t.space).collect();
+    let pulls: Vec<_> = done.pulls.into_iter().filter(|p| current.contains(&p.space)).collect();
+    let copies = sesync::team_watch::TeamWatch::copies(&pulls);
     let refused: usize = pulls.iter().map(|p| p.out.dropped).sum();
     let floors: Vec<(String, String, u64)> = pulls.iter()
         .flat_map(|p| p.out.accepted.iter().map(|(c, s)| (p.space.clone(), c.clone(), *s)))
         .collect();
-    app.set_pull_result(shown, refused);
+    let problems: std::collections::BTreeMap<String, String> = pulls.iter()
+        .filter_map(|p| p.out.error.clone().map(|e| (p.space.clone(), e)))
+        .collect();
+    app.set_pull_result(copies, refused);
     app.absorb_pull_floors(&floors);
+    app.set_teams(current);
+    // The worker asked whether a waiting join was approved and stored the list when it was.
+    app.set_team_cards(sesync::team_join::team_cards(config_dir));
+    let mut notes = done.notes;
+    // A team the server refused to list reads as empty otherwise; its card says it too.
+    notes.extend(problems.iter().map(|(space, e)| format!("team [{space}]: {e}")));
+    let failed = !problems.is_empty();
+    app.set_team_problems(problems);
+    if failed {
+        app.set_error(&notes.join("; "));
+    } else if !notes.is_empty() {
+        app.set_status(&notes.join("; "));
+    }
 }
 
-/// Start a `TeamPull::Running` worker, or explain why not.
+/// Apply the pull in flight once its worker has answered (or died); otherwise leave it running.
+fn collect_pull(app: &mut sesync::app::App, pending: &mut TeamPull, config_dir: &std::path::Path) {
+    let TeamPull::Running(rx) = &*pending else { return };
+    match rx.try_recv() {
+        Ok(out) => {
+            apply_pull(app, out, config_dir);
+            *pending = TeamPull::None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            app.pull_failed();
+            *pending = TeamPull::None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+/// Start a `TeamPull::Running` worker, or explain why not. The worker first asks whether any
+/// waiting join was approved (storing the list when it was), renews any token about to run out,
+/// and reads the credentials again before pulling, so a long-open TUI keeps working.
 fn request_team_pull(app: &mut sesync::app::App, config_dir: &std::path::Path) -> TeamPull {
-    let teams = sesync::team_watch::teams_from_env(config_dir);
-    if teams.is_empty() {
+    if sesync::team_watch::teams_from_env(config_dir).is_empty() && sesync::team_join::waiting_teams(config_dir).is_empty() {
         app.set_error(
-            "team server not configured: set SESYNC_TEAM_URL and join a team, or set SESYNC_TEAM_TOKEN, SESYNC_TEAM_MACHINE and SESYNC_TEAM_SPACE",
+            "team server not configured: join a team (or set SESYNC_TEAM_URL for an older credential), or set SESYNC_TEAM_URL, SESYNC_TEAM_TOKEN, SESYNC_TEAM_MACHINE and SESYNC_TEAM_SPACE",
         );
         return TeamPull::None;
     }
@@ -724,97 +876,158 @@ fn request_team_pull(app: &mut sesync::app::App, config_dir: &std::path::Path) -
     // its list with what this pull shows, so every conversation is fetched, not only the ones
     // that changed since the daemon's last pull.
     let floors = app.state().floors_all();
+    let config_dir = config_dir.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let mut notes: Vec<String> = sesync::team_join::check_all_waiting(&config_dir).into_iter()
+            .map(|(space, r)| match r {
+                Ok(a) => a.describe(&space),
+                Err(e) => format!("team [{space}]: cannot check the join request: {e}"),
+            })
+            .collect();
+        let _ = sesync::team_join::renew_all_due(&config_dir, now_secs() as u64);
+        let teams = sesync::team_watch::teams_from_env(&config_dir);
         let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &floors);
-        let _ = tx.send(pulls);
+        // A newer member list is kept here too, so the Team card shows the version in force.
+        for (space, kept) in sesync::team_watch::TeamWatch::keep_newer_lists(&config_dir, &pulls) {
+            if let Err(e) = kept {
+                notes.push(format!("team [{space}]: cannot keep the newer member list: {e}"));
+            }
+        }
+        let _ = tx.send(PullDone { pulls, notes });
     });
     TeamPull::Running(rx)
 }
 
-/// A team dialog was submitted: do the network step and report. Enrollment (join) saves the
-/// credential itself; starting a team (create) leads into the one-time authenticator QR.
-fn perform_setup(app: &mut sesync::app::App, req: sesync::app::SetupRequest, config_dir: &std::path::Path) {
-    let v = |name: &str| req.value_of(name);
-    match req.kind {
-        sesync::app::Kind::Enroll => {
-            let result = sesync::team_join::join(&v("server url"), &v("team"),
-                &v("member"), &v("machine"), &v("code"), config_dir);
-            match result {
-                Ok(path) => {
-                    app.finish_setup(Ok(format!(
-                        "joined team '{}' as '{}' on '{}'; the credential is in {}",
-                        v("team"), v("member"), v("machine"), path.display())));
-                    // The new credential may be enough for pulls now.
-                    app.set_team_configured(sesync::team_watch::TeamWatch::from_env(config_dir).is_some());
+/// A dialog's network step or an admin job, run on a worker thread so the terminal keeps drawing.
+/// `run_tui` ticks these on every loop turn, so a result shows without a keypress.
+type SetupRx = std::sync::mpsc::Receiver<sesync::team_actions::SetupDone>;
+type AdminRx = std::sync::mpsc::Receiver<Result<sesync::team_actions::AdminDone, String>>;
+
+#[derive(Default)]
+struct TeamJobs {
+    setup: Option<SetupRx>,
+    admin: Option<AdminRx>,
+}
+
+impl TeamJobs {
+    /// Start the job the app asked for, and collect a finished one.
+    fn tick(&mut self, app: &mut sesync::app::App, config_dir: &std::path::Path) {
+        if let Some(req) = app.take_setup_request() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = config_dir.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(sesync::team_actions::setup(&req, &dir));
+            });
+            self.setup = Some(rx);
+        }
+        if let Some(job) = app.take_admin_request() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dir = config_dir.to_path_buf();
+            std::thread::spawn(move || {
+                let _ = tx.send(sesync::team_actions::admin(&job, &dir));
+            });
+            self.admin = Some(rx);
+        }
+        if let Some(outcome) = self.setup.as_ref().map(|rx| rx.try_recv()) {
+            match outcome {
+                Ok(done) => {
+                    self.setup = None;
+                    apply_setup(app, done, config_dir);
                 }
-                Err(e) => app.finish_setup(Err(format!("not joined: {e}"))),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.setup = None;
+                    app.finish_setup(sesync::team_actions::SetupDone {
+                        result: Err("the team step stopped unexpectedly".into()),
+                        created: None,
+                        joined: false,
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
-        sesync::app::Kind::Register => {
-            let base = match std::env::var("SESYNC_TEAM_URL") {
-                Ok(u) => u,
-                Err(_) => {
-                    app.finish_setup(Err("the team server is not configured: set SESYNC_TEAM_URL".into()));
-                    return;
+        if let Some(outcome) = self.admin.as_ref().map(|rx| rx.try_recv()) {
+            match outcome {
+                Ok(result) => {
+                    self.admin = None;
+                    app.finish_admin(result);
                 }
-            };
-            let token = match sesync::team_cli::read_admin_token(std::path::Path::new(&v("admin token file"))) {
-                Ok(t) => t,
-                Err(e) => {
-                    app.finish_setup(Err(format!("not created: {e}")));
-                    return;
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.admin = None;
+                    app.finish_admin(Err("the admin step stopped unexpectedly".into()));
                 }
-            };
-            let members: Vec<String> = v("members").split(',')
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty())
-                .collect();
-            let cmd = sesync::team_cli::Command::Create { name: v("team"), members };
-            match sesync::team_cli::run_detailed(&cmd, &base, &token, config_dir) {
-                Ok((_, Some(uri))) => {
-                    app.finish_setup(Ok(format!("team '{}' created", v("team"))));
-                    app.show_qr(&v("team"), &uri);
-                }
-                Ok((_, None)) => app.finish_setup(Ok(format!("team '{}' created", v("team")))),
-                Err(e) => app.finish_setup(Err(format!("not created: {e}"))),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
     }
 }
 
-/// Whether a tool can be run: an explicit path is checked directly, a bare name is looked up
-/// on PATH. Used for the installed-harness probe, which must not start the tool.
-///
-/// Windows executables carry `.exe`, and the configured name is usually bare (`opencode`), so
-/// every candidate is also tried with the platform's executable suffixes. Without this, a
-/// harness whose CLI is plainly installed is never offered as a mirror target.
-fn executable_candidates(tool: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = vec![tool.to_path_buf()];
-    if tool.extension().is_none() {
-        for ext in ["exe", "cmd", "bat"] {
-            out.push(tool.with_extension(ext));
-        }
-    }
-    out
+/// Report a finished dialog, then read the team records again: a join adds a team to share into
+/// (a waiting join is listed for its refresh but not offered for sharing yet), and the admin flag
+/// follows the key files, which a create may have just written.
+fn apply_setup(app: &mut sesync::app::App, done: sesync::team_actions::SetupDone, config_dir: &std::path::Path) {
+    app.finish_setup(done);
+    reload_team_records(app, config_dir);
 }
 
-fn command_available(tool: &Path) -> bool {
-    let candidates = executable_candidates(tool);
-    if tool.parent().map_or(false, |d| !d.as_os_str().is_empty()) {
-        return candidates.iter().any(|c| c.is_file());
-    }
-    std::env::var_os("PATH").map_or(false, |paths| {
-        std::env::split_paths(&paths)
-            .any(|d| candidates.iter().any(|c| d.join(c).is_file()))
-    })
+/// Read this machine's team records again (memberships, waiting joins, teams managed here)
+/// after a dialog or a leave changed them.
+fn reload_team_records(app: &mut sesync::app::App, config_dir: &std::path::Path) {
+    let teams = sesync::team_watch::teams_from_env(config_dir);
+    let waiting = sesync::team_join::waiting_teams(config_dir);
+    app.set_team_configured(!teams.is_empty() || !waiting.is_empty());
+    app.set_teams(teams.into_iter().map(|t| t.space).collect());
+    app.set_admin(sesync::team_cli::has_admin_key(config_dir));
+    app.set_admin_teams(sesync::team_cli::administered(config_dir));
+    app.set_team_cards(sesync::team_join::team_cards(config_dir));
 }
+
 
 /// (mtime, size) of the state file. The TUI reloads the daemon's fields and re-lists the
 /// sessions only when this changes, so an idle keystroke and an idle second cost a stat.
 fn state_stamp(path: &Path) -> Option<(u128, u64)> {
     let m = std::fs::metadata(path).ok()?;
     Some((m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos(), m.len()))
+}
+
+/// The modification time of the state file, in seconds since the epoch, for the tab bar.
+fn file_mtime_secs(path: &Path) -> Option<f64> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs_f64())
+}
+
+/// Mouse on the sessions list: the wheel moves the selection; a left click selects the row, and a
+/// second click on the same row within half a second opens its session menu (the Enter key).
+/// Clicks while a dialog is open do nothing.
+fn handle_mouse(
+    app: &mut sesync::app::App,
+    m: crossterm::event::MouseEvent,
+    screen: ratatui::layout::Rect,
+    last_click: &mut Option<(usize, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use sesync::app::{Ev, Mode};
+    if !matches!(app.mode(), Mode::Browse) {
+        return;
+    }
+    match m.kind {
+        // The wheel over the details pane scrolls the preview; anywhere else it moves the list.
+        MouseEventKind::ScrollUp if sesync::ui::details_pane_at(app, screen, m.column, m.row) => app.handle(Ev::PreviewUp, now),
+        MouseEventKind::ScrollDown if sesync::ui::details_pane_at(app, screen, m.column, m.row) => app.handle(Ev::PreviewDown, now),
+        MouseEventKind::ScrollUp => app.handle(Ev::Up, now),
+        MouseEventKind::ScrollDown => app.handle(Ev::Down, now),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(idx) = sesync::ui::session_row_at(app, screen, m.column, m.row) else { return };
+            let double = matches!(last_click, Some((i, at)) if *i == idx && now.duration_since(*at) < std::time::Duration::from_millis(500));
+            app.select_row(idx);
+            *last_click = if double { None } else { Some((idx, now)) };
+            if double {
+                app.handle(Ev::Enter, now);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn run_tui(
@@ -824,9 +1037,8 @@ fn run_tui(
     sesync_lock: PathBuf,
     config_dir: PathBuf,
     state_file: PathBuf,
-    opencode_bin: PathBuf,
 ) -> std::io::Result<()> {
-    use crossterm::event::{self, Event};
+    use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
     use crossterm::ExecutableCommand;
     use sesync::app::App;
@@ -837,6 +1049,7 @@ fn run_tui(
     impl Drop for Restore {
         fn drop(&mut self) {
             let _ = disable_raw_mode();
+            let _ = std::io::stdout().execute(DisableMouseCapture);
             let _ = std::io::stdout().execute(LeaveAlternateScreen);
         }
     }
@@ -844,6 +1057,7 @@ fn run_tui(
     enable_raw_mode()?;
     let _restore = Restore;
     std::io::stdout().execute(EnterAlternateScreen)?;
+    std::io::stdout().execute(EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     // Optional startup/event trace for CI debugging: SESYNC_TRACE names a file this process
     // appends to. Off in normal use; the pty test prints it when a wait fails.
@@ -857,24 +1071,37 @@ fn run_tui(
         }
     };
     tr("tui start", &mut trace);
-    // Only harnesses installed on this machine are offered as mirror targets. O-penCode is
-    // offered when its CLI can be run: the mirror is an `opencode import`, not a file.
-    let mut installed = Vec::new();
-    if roots.omp.parent().map_or(false, |p| p.is_dir()) { installed.push("omp".to_string()); }
-    if roots.pi.parent().map_or(false, |p| p.is_dir()) { installed.push("pi".to_string()); }
-    if roots.claude.parent().map_or(false, |p| p.is_dir()) { installed.push("claude".to_string()); }
-    if roots.gemini.parent().map_or(false, |p| p.is_dir()) { installed.push("gemini".to_string()); }
-    if command_available(&opencode_bin) { installed.push("opencode".to_string()); }
+    // Only harnesses installed on this machine are offered as mirror targets; each harness says
+    // what installed means for it (its folder exists, or its command can be run).
+    let installed: Vec<String> = harness::ALL.iter()
+        .filter(|h| h.present(roots.locations.of(h.id())))
+        .map(|h| h.id().to_string())
+        .collect();
+    // The daemon's file is merged in while the TUI runs; retired harnesses are released from it
+    // with the same locations the TUI was started with.
+    let locations = roots.locations.clone();
+    // The details pane previews the highlighted session; a worker reads its last turns, so the
+    // list never waits on a large transcript or a conversion.
+    let preview = sesync::preview::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
     // The Team tab and "Refresh team" exist before the first pull; without configuration they
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
         .map(|t| t.space.clone()).collect();
-    let mut state = state;
-    state.migrate_legacy_team_state(&teams);
     let mut app = App::new(roots, state, lock_dir, sesync_lock);
+    app.migrate_legacy_team_state(&teams);
     app.set_installed_targets(installed);
-    app.set_team_configured(!teams.is_empty());
+    // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
+    app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
     app.set_teams(teams);
+    app.set_team_cards(sesync::team_join::team_cards(&config_dir));
+    // The team server and the admin token file are the dialogs' defaults; the admin flag says
+    // whether this machine can run the admin actions at all.
+    app.set_team_defaults(&std::env::var("SESYNC_TEAM_URL").unwrap_or_default(),
+        &std::env::var("SESYNC_ADMIN_TOKEN_FILE").unwrap_or_default());
+    app.set_admin(sesync::team_cli::has_admin_key(&config_dir));
+    app.set_admin_teams(sesync::team_cli::administered(&config_dir));
+    // crossterm drops every colour when NO_COLOR is set, so the QR cannot be black on white.
+    app.set_monochrome(std::env::var_os("NO_COLOR").map_or(false, |v| !v.is_empty()));
     // Restore last-run taste (theme, tab) from this user's configuration directory.
     let prefs = sesync::app::prefs::load(&config_dir);
     app.restore_prefs(prefs.theme, prefs.view);
@@ -883,9 +1110,25 @@ fn run_tui(
     // rewrites it on every pass, and a keystroke must not pay for a reload that shows
     // nothing new.
     let mut seen_state = state_stamp(&state_file);
+    app.set_state_written(file_mtime_secs(&state_file));
+    let mut last_click: Option<(usize, Instant)> = None;
     let mut last_merge = Instant::now();
     let mut pending_pull = TeamPull::None;
+    let mut jobs = TeamJobs::default();
     loop {
+        jobs.tick(&mut app, &config_dir);
+        // A pull that finished while the terminal sat idle is applied now, not at the next key.
+        collect_pull(&mut app, &mut pending_pull, &config_dir);
+        // A newly highlighted session goes to the worker; whatever it has read since is shown.
+        if let Some((fmt, key)) = app.preview_wanted() {
+            if app.preview().key != key {
+                preview.select(&fmt, &key);
+                app.preview_requested(&key);
+            }
+        }
+        if let Some(loaded) = preview.take() {
+            app.apply_preview(loaded);
+        }
         term.draw(|f| sesync::ui::draw(f, &app))?;
         if !event::poll(Duration::from_millis(200))? {
             tr("poll timeout", &mut trace);
@@ -896,18 +1139,34 @@ fn run_tui(
                 let stamp = state_stamp(&state_file);
                 if stamp != seen_state {
                     seen_state = stamp;
-                    if let Ok(disk) = State::load(&state_file) {
+                    if let Ok(mut disk) = State::load(&state_file) {
+                        let _ = release_records(&locations, &mut disk);
                         app.absorb_daemon_state(&disk);
+                        app.set_state_written(file_mtime_secs(&state_file));
                         app.refresh_rows();
                         tr("absorbed daemon state", &mut trace);
                     }
                 }
+                // The daemon may have seen the admin approve a waiting join; the cards are a
+                // few small local files, read only while the Team tab is on screen.
+                if app.view() == sesync::app::View::Team {
+                    app.set_team_cards(sesync::team_join::team_cards(&config_dir));
+                }
             }
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            tr("poll non-key event", &mut trace);
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Mouse(m) => {
+                let size = term.size()?;
+                let screen = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                handle_mouse(&mut app, m, screen, &mut last_click, Instant::now());
+                continue;
+            }
+            _ => {
+                tr("poll non-key event", &mut trace);
+                continue;
+            }
         };
         tr(&format!("key {} {:?}", key.code, key.modifiers), &mut trace);
         if key.kind != crossterm::event::KeyEventKind::Press {
@@ -918,57 +1177,37 @@ fn run_tui(
         // Every key goes through the app, so every key cancels a pending delete the same way.
         // Ctrl+R on the Team tab asks for a network refresh; the local list refreshes in the app.
         app.handle(ev, Instant::now());
-        // The dialogs that ask for server inputs get the environment's defaults once, so
-        // nothing secret is typed and the admin token stays on disk where it belongs.
-        match app.mode() {
-            sesync::app::Mode::Form => {
-                if app.form_value("server url").is_empty() {
-                    if let Ok(u) = std::env::var("SESYNC_TEAM_URL") {
-                        app.set_form_value("server url", &u);
-                    }
-                }
-                if app.form_value("admin token file").is_empty() {
-                    if let Ok(p) = std::env::var("SESYNC_ADMIN_TOKEN_FILE") {
-                        app.set_form_value("admin token file", &p);
-                    }
-                }
-            }
-            _ => {}
+        // A team the user chose to leave goes now (a few local files), and the team records are
+        // read again, so neither the share picker nor the Team tab offers it any more.
+        if let Some(req) = app.take_leave_request() {
+            let outcome = sesync::team_actions::leave(&req, &config_dir);
+            app.left_team(&req, outcome);
+            reload_team_records(&mut app, &config_dir);
         }
-        if let Some(req) = app.take_setup_request() {
-            perform_setup(&mut app, req, &config_dir);
-        }
-        // A pull the app asked for (ctrl+r on the team tab): start it or collect the outcome of
-        // the one already running. The terminal keeps ticking either way.
+        // A pull the app asked for (ctrl+r on the team tab). A request refused because one is
+        // still running must not drop that one: its result would never arrive, and every later
+        // ctrl+r would be refused for the rest of the run.
         if app.take_refresh_request() {
-            pending_pull = request_team_pull(&mut app, &config_dir);
-        }
-        if let TeamPull::Running(rx) = &pending_pull {
-            match rx.try_recv() {
-                Ok(out) => {
-                    apply_pull(&mut app, out);
-                    pending_pull = TeamPull::None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.pull_failed();
-                    pending_pull = TeamPull::None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            if let started @ TeamPull::Running(_) = request_team_pull(&mut app, &config_dir) {
+                pending_pull = started;
             }
         }
+        collect_pull(&mut app, &mut pending_pull, &config_dir);
         // The app owns choices (mirror targets, marks) that must survive the process. Take
         // the daemon's fields when it wrote them, then save only when this key changed a
         // user-owned field: a save from the app must never roll back a mirror record or a
         // team floor the daemon just wrote, and an unrelated key costs no disk I/O.
         let stamp = state_stamp(&state_file);
         if stamp != seen_state {
-            if let Ok(disk) = State::load(&state_file) {
+            if let Ok(mut disk) = State::load(&state_file) {
+                let _ = release_records(&locations, &mut disk);
                 app.absorb_daemon_state(&disk);
+                app.set_state_written(file_mtime_secs(&state_file));
             }
             seen_state = stamp;
         }
         if app.take_user_dirty() {
-            if let Err(e) = app.state().save_user(&state_file) {
+            if let Err(e) = app.save_user(&state_file) {
                 eprintln!("sesync: cannot save state: {e}");
             } else {
                 seen_state = state_stamp(&state_file);
@@ -1047,25 +1286,30 @@ fn run_join(args: &[String]) -> i32 {
         return 1;
     }
     match join(&base, &name, &member, &machine, code.trim(), &config) {
-        Ok(path) => { println!("joined team '{name}' as '{member}'. Credential saved to {}", path.display()); 0 }
+        Ok(j) if j.pending => {
+            println!("asked to join team '{name}' as '{member}' on '{machine}'. Credential saved to {}.", j.path.display());
+            println!("The admin must approve this machine before it syncs. Give them this fingerprint, out of band:");
+            println!("  {}", j.fingerprint);
+            println!("The daemon starts syncing on its own once the admin has approved it.");
+            0
+        }
+        Ok(j) => { println!("joined team '{name}' as '{member}'. Credential saved to {}", j.path.display()); 0 }
         Err(msg) => { eprintln!("sesync team join: {msg}"); 1 }
     }
 }
 
 /// `sesync team renew <name>`: renews the stored member token while its enrolment is within
-/// the 7-day window. After the window the code is needed again, via `sesync team join`.
+/// the 7-day window. After the window the code is needed again, via `sesync team join`. The
+/// request goes to the server the team was joined on; SESYNC_TEAM_URL serves older credentials.
 fn run_renew(args: &[String]) -> i32 {
     use sesync::team_join::renew;
     let name = match args.first() {
         Some(n) => n.clone(),
         None => { eprintln!("usage: sesync team renew <name>"); return 2; }
     };
-    let base = match std::env::var("SESYNC_TEAM_URL") {
-        Ok(u) => u,
-        Err(_) => { eprintln!("set SESYNC_TEAM_URL to the team server address"); return 2; }
-    };
+    let fallback = std::env::var("SESYNC_TEAM_URL").ok();
     let config = team_config_dir();
-    match renew(&base, &config, &name) {
+    match renew(fallback.as_deref(), &config, &name) {
         Ok(()) => { println!("renewed team '{name}'."); 0 }
         Err(msg) => { eprintln!("sesync team renew: {msg}"); 1 }
     }

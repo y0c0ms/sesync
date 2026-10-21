@@ -18,12 +18,7 @@ fn app() -> App {
     std::fs::create_dir_all(d.join("pi")).unwrap();
     std::fs::create_dir_all(d.join("claude")).unwrap();
     App::new(
-        sesync::manage::Roots {
-            omp: d.join("omp").join("sessions"),
-            pi: d.join("pi"),
-            claude: d.join("claude"),
-            gemini: d.join("gemini"),
-        },
+        sesync::manage::Roots::under(&d, d.join("no-sesync-conv")),
         sesync::state::State::default(),
         d.join("locks"),
         d.join("no-sesync_lock"),

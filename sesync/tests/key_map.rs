@@ -48,6 +48,12 @@ fn navigation_and_editing_keys_map() {
     assert_eq!(key_to_ev(KeyCode::F(1), KeyModifiers::NONE), None);
 }
 
+#[test]
+fn shift_arrows_scroll_the_preview_not_the_list() {
+    assert_eq!(key_to_ev(KeyCode::Up, KeyModifiers::SHIFT), Some(Ev::PreviewUp));
+    assert_eq!(key_to_ev(KeyCode::Down, KeyModifiers::SHIFT), Some(Ev::PreviewDown));
+}
+
 /// An app with one session on disk, so rename has a row to act on.
 fn empty_app() -> App {
     let d: PathBuf = std::env::temp_dir().join(format!("sesync-keymap-{}", std::process::id()));
@@ -59,7 +65,7 @@ fn empty_app() -> App {
     let sid = "aaaaaaaa-1111-2222-3333-444444444444";
     std::fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"one\"}}\n")).unwrap();
-    let roots = Roots { omp: d.join("omp").join("sessions"), pi: d.join("pi"), claude: d.join("claude"), gemini: d.join("gemini") };
+    let roots = Roots::under(&d, d.join("no-sesync-conv"));
     App::new(roots, State::default(), d.join("locks"), d.join("no-sesync_lock"))
 }
 
@@ -93,7 +99,7 @@ fn ctrl_c_copies_nothing_when_the_list_is_empty() {
     std::fs::create_dir_all(sb.join("omp").join("sessions").join("-tmp")).unwrap();
     std::fs::create_dir_all(sb.join("pi")).unwrap();
     std::fs::create_dir_all(sb.join("claude")).unwrap();
-    let roots = Roots { omp: sb.join("omp").join("sessions"), pi: sb.join("pi"), claude: sb.join("claude"), gemini: sb.join("gemini") };
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
     let mut a = App::new(roots, State::default(), sb.join("locks"), sb.join("no-sesync_lock"));
     a.handle(Ev::CtrlC, Instant::now());
     assert!(!a.should_quit());

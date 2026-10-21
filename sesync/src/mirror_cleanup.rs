@@ -6,10 +6,8 @@
 //! Anything else is kept, with the reason. Planning reads and changes nothing.
 
 use crate::lock::{with_claim, ClaimOutcome};
-use crate::manage::conversation_id;
-use crate::mirror::file_hash;
+use crate::mirror::{copy_hash, remove_copy};
 use crate::state::State;
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, PartialEq)]
@@ -51,8 +49,8 @@ pub fn plan(state: &State) -> Vec<Planned> {
 }
 
 fn verdict_for(source: &str, target: &str, path: &str, installed_hash: &str) -> Verdict {
-    if target == "opencode" {
-        return Verdict::Keep("OpenCode session: remove it through OpenCode, not by file".into());
+    if crate::harness::is_store(target) {
+        return Verdict::Keep(format!("{target} keeps this session in its own store: remove it through {target}, not by file"));
     }
     let p = Path::new(path);
     if !p.exists() {
@@ -61,7 +59,7 @@ fn verdict_for(source: &str, target: &str, path: &str, installed_hash: &str) -> 
     if installed_hash.is_empty() {
         return Verdict::Keep("no recorded hash, so it cannot be shown unchanged".into());
     }
-    match file_hash(p) {
+    match copy_hash(target, p) {
         Err(e) => Verdict::Keep(format!("cannot read: {e}")),
         Ok(h) if h != installed_hash => Verdict::Keep("changed since sesync wrote it: it has a newer version".into()),
         Ok(_) if !Path::new(source).exists() => Verdict::Keep("source is missing: this may be the only copy".into()),
@@ -81,12 +79,13 @@ pub fn apply(state: &mut State, planned: &[Planned], lock_dir: &Path, sesync_loc
                 log.push(format!("cleared {} {} (already gone)", p.target, p.path));
             }
             Verdict::Remove => {
-                let conv = conversation_id(&p.source);
+                // The conversation's stable id: the name every copy's lock alias points at.
+                let conv = state.team_id_of(&p.source);
                 let path = Path::new(&p.path);
                 let recorded = p.installed_hash.clone();
                 let outcome = with_claim(sesync_lock, Some(lock_dir), &conv, "cleanup", std::process::id(), &p.source, || {
-                    match file_hash(path) {
-                        Ok(h) if h == recorded => fs::remove_file(path).map_err(|e| e.to_string()),
+                    match copy_hash(&p.target, path) {
+                        Ok(h) if h == recorded => remove_copy(&p.target, path).map_err(|e| e.to_string()),
                         Ok(_) => Err("changed since it was planned".to_string()),
                         Err(e) => Err(format!("cannot read: {e}")),
                     }
@@ -107,12 +106,13 @@ pub fn apply(state: &mut State, planned: &[Planned], lock_dir: &Path, sesync_loc
 
 /// The mirrors the user no longer wants: every recorded mirror whose target has left
 /// `chosen_targets`. Un-choosing a target is how a session stops being mirrored somewhere, and
-/// nothing else drops that copy — `plan()` only sees what is still recorded, and for OpenCode it
-/// declines anyway ("remove it through OpenCode, not by file").
+/// nothing else drops that copy: `plan()` only sees what is still recorded, and for a harness
+/// that keeps its conversations in its own database it declines anyway (remove it through the
+/// harness, not by file).
 ///
 /// Verdicts are the same ones `plan()` uses, so a file that changed since sesync wrote it, or
-/// whose source is gone, is still kept. The OpenCode verdict is the signal for the caller to
-/// remove the copy through the CLI and forget the record.
+/// whose source is gone, is still kept. The store-harness verdict is the signal for the caller to
+/// remove the copy through the harness and forget the record.
 pub fn plan_unchosen(state: &State) -> Vec<Planned> {
     let mut out: Vec<Planned> = Vec::new();
     for (key, src) in &state.sources {

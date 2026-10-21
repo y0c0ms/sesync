@@ -6,10 +6,11 @@ You can start a conversation in oh-my-pi (omp), continue it in Pi, pick it up in
 
 ## How it works
 
-Three parts cooperate:
+Three parts cooperate (diagrams of the whole flow, with any harnesses X, Y and Z:
+[docs/ARCHITECTURE.md, How the main logic works](docs/ARCHITECTURE.md#how-the-main-logic-works)):
 
-1. **A canonical journal.** omp and Pi session files are the source of truth. Every other harness gets a converted copy, called a *mirror*. Mirrors are derived data: deleting one and letting the daemon rebuild it is safe.
-2. **A converter (`sesync-conv`, Rust).** Converts between the omp/Pi journal format and the OpenCode and Claude Code formats. Images are inlined when moved to Pi. Reasoning content is kept for omp, Pi and OpenCode, and dropped for Claude Code, which signs its reasoning blocks and cannot accept ours.
+1. **One source, copies elsewhere.** A conversation's source is the harness where it is live; every harness the user chose for it gets a converted copy, called a *mirror*. Answering inside a copy moves the source there (turn-taking), and the other copies follow. Mirrors are derived data, and bytes sesync did not write are archived before anything replaces them.
+2. **A converter (`sesync-conv`, Rust).** The omp/Pi journal is the interchange format; the converter reads and writes the OpenCode, Claude Code and Antigravity formats through it. Images are inlined when moved to Pi. Reasoning content is kept for omp, Pi, OpenCode and Antigravity, and dropped for Claude Code, which signs its reasoning blocks and cannot accept ours.
 3. **A lock (`sesync-lock`, Rust) and a sync daemon (`sesync`, Rust).** A conversation is locked while a harness is taking a turn. The lock is claimed when the turn starts and released when it ends, so an idle conversation holds nothing. The daemon rebuilds mirrors when their sources change and skips any conversation that is currently locked.
 
 The lock is enforced inside each harness:
@@ -19,6 +20,7 @@ The lock is enforced inside each harness:
 | omp and Pi | `hooks/omp-lock-shim.ts`, a thin omp extension that forwards events to `sesync-lock hook`. Claims on `turn_start`, releases on `turn_end` and session lifecycle events. |
 | Claude Code | `hooks/claude-hook.sh`, wired to `UserPromptSubmit` (claim, block on refusal) and `Stop` / `SessionEnd` (release). |
 | OpenCode | A plugin that claims on `chat.message` and releases on `session.idle` and `session.deleted`. |
+| Antigravity CLI (`agy`) | None yet (sesync ships no agy hook). The daemon still claims the conversation's lock for every write, refuses to refresh a copy agy holds open (retried later), and archives any agy turn it would replace. |
 
 A refused claim blocks the prompt and names the holder, so two harnesses never write the same conversation at once.
 
@@ -26,7 +28,7 @@ A refused claim blocks the prompt and names the holder, so two harnesses never w
 
 ```
 sesync-lock/   sesync-lock: claim / release / check / resolve / sweep / list
-sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude / to-gemini
+sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-claude / to-antigravity / from-*
 sesync/        the sync daemon and manage TUI
 sesync-team/   team sync core (sealed records, leases, member list) and team-server
 hooks/         per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
@@ -44,7 +46,9 @@ docs/          architecture, status, research notes
 ## Requirements
 
 - Rust (stable) to build `sesync-lock` and `sesync-conv`.
-- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code, Gemini CLI.
+- The harnesses you want to sync: omp, Pi, OpenCode, Claude Code, Antigravity CLI (`agy`).
+  Gemini CLI was retired on 2026-06-18 in favour of Antigravity: sesync moves Gemini-era records
+  to a surviving copy on its first start and never touches a Gemini file.
 
 ## Build
 
@@ -65,9 +69,11 @@ The daemon reads these environment variables. All are optional.
 | `OMP_AGENT_DIR` | `~/.omp/agent` | omp data |
 | `PI_AGENT_DIR` | `~/.pi/agent` | Pi data |
 | `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | OpenCode database |
+| `ANTIGRAVITY_CLI_HOME` | `~/.gemini/antigravity-cli` | Antigravity CLI store (`conversations/<id>.db`) |
+| `AGY_BIN` | `%LOCALAPPDATA%\agy\bin\agy.exe`, else `agy` on PATH | Only decides whether Antigravity is offered as a target; never run |
 | `SESYNC_CONV` | `~/bin/sesync-conv.exe` | Path to the converter |
 | `SESYNC_CONFIG_DIR` | `~/.config/sesync` | Team credentials, device key and admin key |
-| `SESYNC_TEAM_URL` | unset | Team server; team sync is off without it |
+| `SESYNC_TEAM_URL` | unset | Team server for `team create`/`join`; a joined team remembers its own server |
 
 The full table, including the team trigger and poll settings, is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -81,15 +87,78 @@ sesync --status    # show current state
 sesync --tui       # manage sessions: list, rename, delete
 ```
 
-Team commands (create/publish/forget additionally need `SESYNC_ADMIN_TOKEN_FILE`):
+The TUI lists sessions with TITLE, MIRRORS, SYNCED, TEAM and UPDATED columns, the harness shown as
+omp, pi, claude, opencode or agy. MIRRORS shows each chosen copy: `pi` once it is written, `pi?`
+while it waits for its first write, `pi~` while the conversation is open in that harness (the
+daemon retries by itself), and `pi!` when its last write failed. SYNCED shows the age of the oldest
+good write to every chosen copy (`ok` until that time is known), or `waiting` or `failing`. On a
+narrow terminal the columns go in this order: TEAM, UPDATED, MIRRORS, SYNCED. At 120 columns or
+more a details pane shows the selected session and, per copy, when it was last written or why it
+failed. Below that it previews the session's last messages, newest at the bottom, and updates by
+itself when the session changes, so a new message shows up without a key press; shift+up/down or
+the wheel over the pane scrolls back. The tab bar says when the daemon last ran a pass and how many copies are in place or
+failing. Deleting a session (ctrl+d twice opens a dialog naming what goes and what stays; ctrl+d,
+Enter or `y` there deletes) removes its file and its row; its copies in other
+harnesses stay and are listed as sessions of their own. A session gone outside sesync (its file
+deleted, or its OpenCode row) is listed by its name with `(missing)`, and deleting that row only
+forgets it. Emoji and icon glyphs
+in titles are left out of the display, because terminals draw them at different widths; the stored
+title is unchanged. The mouse selects a row, the wheel scrolls the list (or the preview, over the
+details pane), and a double-click works like Enter. Two TUIs can be open at once (two terminals):
+each saves only the choices made in it (shares, mirror targets, deletes), so neither overwrites
+the other, and each shows the other's choices as soon as the state file changes.
+
+Team commands. `join` and `renew` run on a member's machine; every other command runs on the
+admin's machine (the one that created the team, which holds the admin key) and also needs
+`SESYNC_ADMIN_TOKEN_FILE`:
 
 ```sh
 sesync team create <name> [--member <m>]
-sesync team join <name> --member <m>
+sesync team invite <name> <member>
+sesync team join <name> --member <m>        # a new device waits for the admin; prints its fingerprint
 sesync team renew <name>
-sesync team publish <name>
-sesync team forget <name> <machine>
+sesync team roster <name>                   # listed devices and waiting requests, with fingerprints
+sesync team approve <name> <member> <machine> [--fingerprint <fp>]
+sesync team decline <name> <member> <machine>
+sesync team revoke <name> <member> <machine>
+sesync team remove <name> <member>          # every device of the member; refused until invited again
 ```
+
+Only the admin admits a device: a join with the team code asks, and `approve` (after comparing the
+fingerprint the member reads from their own `join`) signs the device into the member list. The
+daemon starts syncing on its own once the device is approved. `revoke` and `remove` take effect at
+once and the revoked key is refused at every later join, so nobody re-scans the QR when someone
+leaves.
+
+The same work is available in the TUI (`sesync --tui`) on the command list (ctrl+p), with no
+environment needed. "Start a team" asks for the team, its members (the people allowed to join,
+comma-separated: include yourself to sync this machine too, and invite others later), the admin
+token file and the server. An empty field shows a made-up example; it is never used as a value,
+so Enter on an empty required field is refused. It then shows the one-time authenticator QR on a screen of its own, black on white, with the
+setup key below it for typing. An 80 by 24 terminal holds the code; a smaller one says the size it
+needs and shows the key. With `NO_COLOR` set the code is drawn in the terminal's own colours with
+the light modules painted, which reads the right way round on a dark terminal. The machine that
+started a team remembers it (team, server and token file path in `config/admin/teams.json`), so
+"Team members" and "Invite a member" work there from then on, before it joins the team itself.
+"Join a team" asks for the server, the team, your member name, this machine's name and the 6-digit
+code, and shows the fingerprint to read to the admin. The Team tab shows, per team, where this
+machine stands: listed, waiting for the admin with its fingerprint, or refused by the server (the
+device was revoked or its member removed) with the server's reason. "Leave a team" removes this
+machine's membership: a revoked one, or a join the admin declined (the server answers a declined
+key exactly as a pending one, so that join keeps saying it waits). It unshares every session from
+that team and takes the sessions only that team's pulls brought over off the Team list (one
+another team holds too stays, as that team's copy); the team and its sessions on the server are
+untouched. The
+same picker can stop managing a team started here. Enter twice confirms. On the Team tab, `i`
+imports the selected session into omp, in the folder omp lists for the session's project, unless
+omp already holds that session. The share picker also lists a team a session is still shared
+with after this machine left it, so that share can be untied.
+
+In the members dialog, `a` approves the selected waiting request, `d` refuses it, `r` revokes a
+listed device and `m` removes a member. Every change takes two presses on the same row; moving the
+cursor or pressing another key cancels it. Approval sends the fingerprint the member read, so the
+server refuses a request that changed. The admin's own key cannot be revoked or removed from the
+dialog. `t` switches between teams when more than one is configured.
 
 Inspect the lock and converter directly:
 

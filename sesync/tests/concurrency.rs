@@ -89,7 +89,8 @@ fn two_daemons_on_the_same_stores_record_each_session_once() {
 
 #[test]
 fn a_conversation_held_by_another_harness_is_not_mirrored() {
-    let hs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-lock/target/debug/sesync-lock");
+    let hs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../sesync-lock/target/debug/sesync-lock{}", std::env::consts::EXE_SUFFIX));
     let _ = Command::new("cargo").args(["build", "--quiet", "--manifest-path"])
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-lock/Cargo.toml")).status();
     if !hs.exists() {

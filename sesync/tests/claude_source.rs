@@ -3,7 +3,7 @@
 //! each other ("ancestry cycle"). The cut must leave a readable transcript and
 //! must not touch the original file.
 
-use sesync::claude_source::{cut_compaction_cycles, sanitize_claude};
+use sesync::harness::claude::compaction::{cut_compaction_cycles, sanitize_claude};
 use std::fs;
 use std::path::PathBuf;
 

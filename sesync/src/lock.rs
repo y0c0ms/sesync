@@ -11,6 +11,37 @@ pub fn lock_dir_for(home: &Path, override_dir: Option<PathBuf>) -> PathBuf {
     override_dir.unwrap_or_else(|| home.join(".local").join("share").join("harness-sync").join("locks"))
 }
 
+/// The characters sesync-lock keeps in an id; it drops the rest, so an alias must be named the
+/// same way or the lock binary never finds it.
+fn lock_name(id: &str) -> String {
+    id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
+}
+
+/// Point a copy's own session id at its conversation's lock name. A harness hook inside a copy
+/// claims the copy's id, and sesync-lock follows `map/<id>` one hop; without the alias the hook
+/// and the daemon's write each took a lock of their own and never excluded each other. A no-op
+/// when the id already is the conversation's name or the alias is in place. The conversation's
+/// own name is never aliased away, or every claim on it would resolve somewhere else.
+pub fn write_alias(lock_dir: &Path, id: &str, conv: &str) -> std::io::Result<()> {
+    let (id, conv) = (lock_name(id), lock_name(conv));
+    if id.is_empty() || conv.is_empty() || id == conv {
+        return Ok(());
+    }
+    let dir = lock_dir.join("map");
+    std::fs::create_dir_all(&dir)?;
+    let own = dir.join(&conv);
+    if own.exists() {
+        std::fs::remove_file(&own)?;
+    }
+    let path = dir.join(&id);
+    if std::fs::read_to_string(&path).map(|s| s.trim() == conv).unwrap_or(false) {
+        return Ok(());
+    }
+    let tmp = dir.join(format!(".{id}.tmp"));
+    std::fs::write(&tmp, &conv)?;
+    std::fs::rename(&tmp, &path)
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ClaimOutcome<T> {
     /// The claim was taken, the work ran, and the claim was released.

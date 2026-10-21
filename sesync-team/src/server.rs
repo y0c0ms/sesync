@@ -92,47 +92,53 @@ async fn admin_create<S: Store + Send + 'static>(State(s): State<Shared<S>>, hea
     }
     let body: CreateBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
     let r = run(s.clone(), move |svc, _| {
-        let members: Vec<&str> = body.members.iter().map(String::as_str).collect();
-        match svc.create_space(&body.space, &members) {
-            Ok(()) => {
-                if let Some(admin_hex) = &body.admin_public {
-                    let Some(admin) = from_hex(admin_hex) else {
-                        return (400, json!({"error": "admin key is not hex"}));
-                    };
-                    if svc.pin_admin_key(&body.space, &admin).is_err() {
-                        return (500, json!({"error": "could not pin the admin key"}));
-                    }
-                    // The first list is version 1 and is signed by the admin key; it is stored as
-                    // the trust root. The admin signs it on the admin machine, so the server holds
-                    // a list it cannot forge.
-                    let entries: Option<Vec<Vec<u8>>> = body.devices.iter().map(|h| from_hex(h)).collect();
-                    let Some(entries) = entries else {
-                        return (400, json!({"error": "device entry is not hex"}));
-                    };
-                    let list = crate::membership::MemberList::new(1, entries);
-                    let signed_bytes = match body.signed_list.as_deref().and_then(from_hex) {
-                        Some(b) => b,
-                        None => return (400, json!({"error": "signed list is required with an admin key"})),
-                    };
-                    let signed = match crate::membership::SignedList::from_bytes(&signed_bytes) {
-                        Ok(s) => s,
-                        Err(_) => return (400, json!({"error": "signed list is malformed"})),
-                    };
-                    if signed.list != list {
-                        return (400, json!({"error": "signed list does not match the devices"}));
-                    }
-                    let mut v = crate::membership::Verifier::new(admin.clone());
-                    if v.accept(&signed).is_err() {
-                        return (400, json!({"error": "signed list is not signed by the admin key"}));
-                    }
-                    let _ = svc.store_trust_list(&body.space, &signed_bytes);
+        // Check the whole trust root before anything is created: a refused request must leave
+        // nothing behind, or the name would be taken by a team nobody holds the secret of.
+        let root = match &body.admin_public {
+            None => None,
+            Some(admin_hex) => {
+                let Some(admin) = from_hex(admin_hex) else {
+                    return (400, json!({"error": "admin key is not hex"}));
+                };
+                // The first list is version 1 and is signed by the admin key; it is stored as
+                // the trust root. The admin signs it on the admin machine, so the server holds
+                // a list it cannot forge.
+                let entries: Option<Vec<Vec<u8>>> = body.devices.iter().map(|h| from_hex(h)).collect();
+                let Some(entries) = entries else {
+                    return (400, json!({"error": "device entry is not hex"}));
+                };
+                let list = crate::membership::MemberList::new(1, entries);
+                let signed_bytes = match body.signed_list.as_deref().and_then(from_hex) {
+                    Some(b) => b,
+                    None => return (400, json!({"error": "signed list is required with an admin key"})),
+                };
+                let signed = match crate::membership::SignedList::from_bytes(&signed_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return (400, json!({"error": "signed list is malformed"})),
+                };
+                if signed.list != list {
+                    return (400, json!({"error": "signed list does not match the devices"}));
                 }
-                let secret = svc.space_secret(&body.space).unwrap_or_default();
-                let uri = crate::totp::otpauth_uri(&secret, &body.space);
-                (200, json!({"space": body.space, "otpauth_uri": uri}))
+                let mut v = crate::membership::Verifier::new(admin.clone());
+                if v.accept(&signed).is_err() {
+                    return (400, json!({"error": "signed list is not signed by the admin key"}));
+                }
+                Some((admin, signed_bytes))
             }
-            Err(e) => crate::http::error_response(&e),
+        };
+        let members: Vec<&str> = body.members.iter().map(String::as_str).collect();
+        if let Err(e) = svc.create_space(&body.space, &members) {
+            return crate::http::error_response(&e);
         }
+        if let Some((admin, signed_bytes)) = root {
+            if svc.pin_admin_key(&body.space, &admin).is_err() {
+                return (500, json!({"error": "could not pin the admin key"}));
+            }
+            let _ = svc.store_trust_list(&body.space, &signed_bytes);
+        }
+        let secret = svc.space_secret(&body.space).unwrap_or_default();
+        let uri = crate::totp::otpauth_uri(&secret, &body.space);
+        (200, json!({"space": body.space, "otpauth_uri": uri}))
     }).await;
     counted(&s, "admin", r)
 }
@@ -240,9 +246,16 @@ async fn list_trust<S: Store + Send + 'static>(State(s): State<Shared<S>>, heade
 
 /// Publish a newer admin-signed member list. Admin only. The server enforces a strictly
 /// increasing version and an admin signature over the pinned key, so revocation cannot be
-/// rolled back. The admin key itself never reaches the server.
+/// rolled back. The admin key itself never reaches the server. Storing the list applies it:
+/// keys it drops are tombstoned and their machines unbound, keys it adds bind the machines that
+/// asked for them, and `removed_members` leave the team's member set.
 #[derive(Deserialize)]
-struct AdminListBody { space: String, signed_list: String }
+struct AdminListBody {
+    space: String,
+    signed_list: String,
+    #[serde(default)]
+    removed_members: Vec<String>,
+}
 
 async fn admin_list<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = auth_header(&headers);
@@ -253,42 +266,43 @@ async fn admin_list<S: Store + Send + 'static>(State(s): State<Shared<S>>, heade
     let Some(bytes) = from_hex(&body.signed_list) else {
         return counted(&s, "admin", respond((400, json!({"error": "signed list is not hex"}))));
     };
-    let r = run(s.clone(), move |svc, _| match svc.publish_trust_list(&body.space, &bytes) {
+    let r = run(s.clone(), move |svc, now| match svc.publish_trust_list(&body.space, &bytes, &body.removed_members, now) {
         Ok(version) => (200, json!({"space": body.space, "version": version})),
         Err(e) => crate::http::error_response(&e),
     }).await;
     counted(&s, "admin", r)
 }
 
-/// The enrolled devices and current list version, for the admin to build the next list.
 #[derive(Deserialize)]
-struct AdminDevicesBody { space: String }
+struct AdminSpaceBody { space: String }
 
-async fn admin_devices<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+/// The roster, for the admin to decide on join requests and build the next list: the current
+/// signed list, who each listed key belongs to, and the open requests.
+async fn admin_roster<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = auth_header(&headers);
     if !is_admin(&s, auth.as_deref()) {
         return counted(&s, "admin", respond((403, json!({"error": "admin only"}))));
     }
-    let body: AdminDevicesBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
-    let r = run(s.clone(), move |svc, _| http::list_devices(svc, &body.space)).await;
+    let body: AdminSpaceBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let r = run(s.clone(), move |svc, now| http::roster(svc, &body.space, now)).await;
     counted(&s, "admin", r)
 }
 
-/// Forget a machine's device. Its token dies at once, and the next published list no longer
-/// names it: forget, then publish, is how a device is revoked.
+/// Decline a join request: its key is refused at every later join.
 #[derive(Deserialize)]
-struct AdminForgetBody { space: String, machine: String }
+struct AdminDeclineBody { space: String, member: String, machine: String }
 
-async fn admin_forget<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn admin_decline<S: Store + Send + 'static>(State(s): State<Shared<S>>, headers: HeaderMap, body: Bytes) -> Response {
     let auth = auth_header(&headers);
     if !is_admin(&s, auth.as_deref()) {
         return counted(&s, "admin", respond((403, json!({"error": "admin only"}))));
     }
-    let body: AdminForgetBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
-    let r = run(s.clone(), move |svc, _| {
-        svc.forget_device(&body.space, &body.machine);
-        (200, json!({"space": body.space, "machine": body.machine, "forgotten": true,
-                     "note": "the device is out at once; run publish to sign it out of the list"}))
+    let body: AdminDeclineBody = match parse(&body) { Ok(b) => b, Err(r) => return r };
+    let r = run(s.clone(), move |svc, now| match svc.decline(&body.space, &body.member, &body.machine, now) {
+        Ok(()) => (200, json!({"space": body.space, "member": body.member, "machine": body.machine, "declined": true})),
+        Err(crate::service::ServiceError::NoSpace(_)) => (404, json!({"error":
+            format!("no join request from '{}' for machine '{}' in team '{}'", body.member, body.machine, body.space)})),
+        Err(e) => crate::http::error_response(&e),
     }).await;
     counted(&s, "admin", r)
 }
@@ -400,8 +414,8 @@ pub fn router<S: Store + Send + 'static>(state: Shared<S>) -> Router {
         .route("/sessions", post(sessions::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/list", post(list_trust::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/admin/list", post(admin_list::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
-        .route("/admin/devices", post(admin_devices::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
-        .route("/admin/forget", post(admin_forget::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/admin/roster", post(admin_roster::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
+        .route("/admin/decline", post(admin_decline::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/record/read", post(read_record::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))
         .route("/record", post(write_record::<S>).layer(DefaultBodyLimit::max(MAX_SESSION_BODY)))
         .route("/record/sealed/read", post(read_sealed::<S>).layer(DefaultBodyLimit::max(MAX_CONTROL_BODY)))

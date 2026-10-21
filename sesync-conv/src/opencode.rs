@@ -87,7 +87,14 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
     // parentless one makes the whole import fail with "Missing key at [parentID]" - which creates
     // the session row and then leaves it empty, the exact symptom seen on a real mirror.
     if let (Some(note), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
-        let t = crate::journal::parse_iso_ms(ts).unwrap_or(0);
+        // OpenCode orders a session by its time-derived message ids, and a compaction is usually
+        // recorded after the turns it keeps: stamped with its own time, the summary of what came
+        // before showed up as the LAST message. It belongs first, just before the oldest kept one.
+        let compacted = crate::journal::parse_iso_ms(ts).unwrap_or(0);
+        let t = match msgs.iter().map(|m| m.timestamp_ms).min() {
+            Some(first_kept) => compacted.min(first_kept - 1),
+            None => compacted,
+        };
         first_ts = first_ts.min(t);
         last_ts = last_ts.max(t);
         let mid = next("msg", t);
@@ -207,9 +214,22 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
             let finish = if tool_calls > 0 { "tool-calls" } else { "stop" };
             parts.push(part("step-finish", map(json!({"reason": finish, "tokens": {"total":0,"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}, "cost": 0})), next("prt", t)));
             info.insert("time".into(), json!({"created": t, "completed": t}));
-            if let Some(p) = &last_id {
-                info.insert("parentID".into(), p.clone().into());
-            }
+            // OpenCode's importer requires a STRING parentID on every assistant message: an absent
+            // key fails with "Missing key at [parentID]", null with "Expected string, got null",
+            // and any string not starting with "msg" is refused too. A conversation that opens
+            // with an assistant turn (a converted transcript that starts with the model, or a
+            // live window cut there) has no predecessor, so it points at a message-shaped id
+            // derived from the session. The field lives inside the message data, not in a
+            // foreign key, so a sentinel is enough to open the tree.
+            info.insert(
+                "parentID".into(),
+                match &last_id {
+                    Some(p) => p.clone().into(),
+                    // Must look like a message id ("Expected a string starting with \"msg\""),
+                    // so the session id with its prefix swapped keeps it unique per session.
+                    None => o.session_id.replacen("ses_", "msg_", 1).into(),
+                },
+            );
             info.insert("modelID".into(), model.1.clone().into());
             info.insert("providerID".into(), model.0.clone().into());
             info.insert("mode".into(), "build".into());
@@ -306,11 +326,50 @@ mod tests {
             first["parts"][0]["text"].as_str().unwrap_or("").contains(SUMMARY),
             "the summary text is the first part"
         );
+        // OpenCode shows a session in id and time order, not in bundle order. The compaction is
+        // recorded after the turns it keeps, and stamped with that time the summary showed up as
+        // the last message of the imported session.
+        let note_id = first["info"]["id"].as_str().unwrap();
+        let note_at = first["info"]["time"]["created"].as_i64().unwrap();
+        for m in &msgs[1..] {
+            assert!(m["info"]["id"].as_str().unwrap() > note_id, "the summary's id sorts first: {}", m["info"]);
+            assert!(m["info"]["time"]["created"].as_i64().unwrap() > note_at, "the summary is the oldest message");
+        }
         for m in msgs {
             let info = &m["info"];
             if info["role"] == "assistant" {
                 assert!(info.get("parentID").is_some(), "every assistant message needs a parentID: {info}");
             }
         }
+    }
+
+    /// A conversation whose first turn is an assistant message still needs a well-formed parent:
+    /// the importer rejects an absent key ("Missing key at [parentID]"), a null one ("Expected
+    /// string, got null") and any string not starting with "msg". On 2026-10-21 this failed every
+    /// pass, and each failed import had already deleted the session it was meant to replace.
+    #[test]
+    fn an_assistant_first_conversation_gets_a_message_shaped_parent() {
+        let dir = std::env::temp_dir().join(format!("sesync-conv-assist-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"session\",\"id\":\"s1\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"}\n",
+            "{\"type\":\"message\",\"id\":\"a1\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"primeiro\"}]}}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"parentId\":\"a1\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"resposta\"}]}}\n",
+        )).unwrap();
+        let j = Journal::read(&path).unwrap();
+        let b = to_bundle(&j, &Options {
+            session_id: "ses_abc0000000000000000000000",
+            title: "t",
+            directory: "/tmp/c",
+            cli_version: "1.19.0",
+            include_thinking: true,
+        });
+        let first = &b["messages"][0]["info"];
+        assert_eq!(first["role"], "assistant", "the conversation still opens with the assistant turn");
+        let parent = first["parentID"].as_str().expect("a string parentID, not null");
+        assert!(parent.starts_with("msg"), "the importer requires a msg-prefixed id, got {parent}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

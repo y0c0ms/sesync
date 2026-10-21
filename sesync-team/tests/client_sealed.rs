@@ -26,9 +26,9 @@ fn app() -> (axum::Router, Arc<AppState<MemoryStore>>) {
 fn credentials(state: &Arc<AppState<MemoryStore>>, machine: &str, conv: &str, device: &Device) -> (String, u64) {
     let mut svc = state.service.lock().unwrap();
     let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
-    let token = svc.enrol("personal", "writer", machine, &code, T0).unwrap();
-    // Device-bound auth: the machine's device key must be named by the trust list.
-    svc.bind_device("personal", machine, device_entry(device));
+    // Device-bound auth: the machine joins with a key the trust list names, so it is bound.
+    let token = svc.enrol("personal", "writer", machine, &code, Some(&device_entry(device)), T0)
+        .map(|a| a.token().to_string()).unwrap();
     let lease = svc.acquire("personal", conv, machine, T0).unwrap();
     (format!("Bearer {token}"), lease.version)
 }

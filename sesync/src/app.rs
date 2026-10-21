@@ -9,6 +9,9 @@ use crate::state::State;
 use crate::tui::{Key, Model};
 use std::path::PathBuf;
 use std::time::Instant;
+use crate::members::{Act, Members, Step};
+use crate::team_actions::{AdminDone, AdminJob, SetupDone};
+use crate::team_cli::Command;
 
 /// How long an informational status message stays before the view fades it. Failures stay.
 pub const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
@@ -85,6 +88,10 @@ pub enum Mode {
     DeleteConfirm,
     /// The share picker: one row per team this machine belongs to, space ticks.
     SharePick,
+    /// The leave picker: one row per team record on this machine; Enter twice leaves it.
+    LeavePick,
+    /// The team members dialog: the roster and the approve, refuse, revoke and remove keys.
+    Members,
 }
 
 /// Which dialog the form serves: joining a team or starting one (admin side).
@@ -106,6 +113,16 @@ impl SetupRequest {
     }
 }
 
+/// What the caller removes on this machine when the user leaves a team (`App::take_leave_request`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveRequest {
+    pub team: String,
+    /// Remove the member credential: this machine stops syncing and pulling the team.
+    pub membership: bool,
+    /// Forget the administered-team record: the members and invite dialogs stop offering it.
+    pub admin: bool,
+}
+
 /// What the form dialog shows to the drawing code.
 #[derive(Debug, Clone)]
 pub struct FormView {
@@ -114,6 +131,10 @@ pub struct FormView {
     pub cursor: usize,
     /// One entry per field: (label, value).
     pub fields: Vec<(String, String)>,
+    /// One entry per field: the example drawn, dimmed, while the field is empty. Never a value.
+    pub examples: Vec<&'static str>,
+    /// What the field under the cursor is for.
+    pub help: &'static str,
 }
 
 impl FormView {
@@ -179,6 +200,10 @@ pub enum Ev {
     OpenEnroll,
     /// Open the start-a-team dialog (from the command list).
     OpenRegister,
+    /// Open the invite dialog (from the command list, admin only).
+    OpenInvite,
+    /// Open the team members dialog (from the command list, admin only).
+    OpenMembers,
     Esc,
     /// Move the selection in the session list.
     Up,
@@ -187,6 +212,11 @@ pub enum Ev {
     PageDown,
     Home,
     End,
+    /// Scroll the preview of the highlighted session (shift+up/down, the wheel over the pane).
+    PreviewUp,
+    PreviewDown,
+    /// Open the leave-a-team picker (from the command list).
+    OpenLeave,
 }
 
 /// One row of the command list as the view draws it.
@@ -215,6 +245,9 @@ pub struct App {
     /// Team sessions from the last pull, as (id, bytes). Shown for display; written only when
     /// the user confirms an import.
     team: Vec<(String, Vec<u8>)>,
+    /// Every verified copy the last pull returned, by team. `team` is built from these (the
+    /// newest copy of each conversation), and leaving a team removes only that team's copies.
+    team_copies: Vec<crate::team_watch::TeamCopy>,
     /// Cursor into `team`, kept separate from the session cursor.
     team_index: usize,
     /// Ids imported in this run, in order. Recorded so the result can be shown.
@@ -241,6 +274,9 @@ pub struct App {
     /// The teams this machine belongs to, as space names, set by the caller at start-up.
     /// Empty means no team is configured. One team toggles directly; several open the picker.
     teams: Vec<String>,
+    /// Each joined team with where this machine stands, for the Team tab. Read from the
+    /// credentials by the caller, never from the network.
+    team_cards: Vec<crate::team_join::TeamCard>,
     /// Cursor and ticks of the share picker (one row per configured team).
     share_cursor: usize,
     pick_shares: std::collections::BTreeSet<String>,
@@ -256,6 +292,8 @@ pub struct App {
     /// Cursor and picks for the per-session menu and the mirror-target picker.
     menu_cursor: usize,
     installed_targets: Vec<String>,
+    /// When the state file was last read from disk, in seconds since the epoch. Drawn in the tab bar.
+    state_written: Option<f64>,
     pick_cursor: usize,
     pick_chosen: std::collections::BTreeSet<String>,
     /// The colour scheme name in use. Previewing while browsing is done by writing here.
@@ -285,6 +323,31 @@ pub struct App {
     pulling: bool,
     /// The session key behind the open delete confirmation.
     armed_delete: Option<String>,
+    /// Server address and admin token file the team dialogs and admin jobs use by default.
+    team_server: String,
+    admin_token_file: String,
+    /// The teams this machine administers, each with its server and admin token file (set by
+    /// the caller from `team_cli::administered`).
+    admin_teams: Vec<crate::team_cli::AdminTeam>,
+    /// The terminal draws without colours (see `set_monochrome`).
+    monochrome: bool,
+    /// Whether this machine holds the team admin key (set by the caller).
+    admin: bool,
+    /// The open members dialog, if any.
+    members: Option<Members>,
+    /// True while an admin job runs on the caller's worker; the dialog refuses changes meanwhile.
+    admin_busy: bool,
+    /// Admin work waiting for the caller to run it, once.
+    admin_request: Option<AdminJob>,
+    /// The highlighted session's last turns, read by the caller's preview worker.
+    preview: crate::preview::Preview,
+    /// Why the last pull of a team failed (the server refused this device, or could not be
+    /// reached), by team. Shown on the team's card until a pull of it succeeds.
+    team_problems: std::collections::BTreeMap<String, String>,
+    /// The leave picker: its cursor, the row a first Enter armed, and the choice for the caller.
+    leave_cursor: usize,
+    leave_armed: Option<usize>,
+    leave_request: Option<LeaveRequest>,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -300,6 +363,9 @@ pub const TRANSCRIPT_MAX_LINES: usize = 4000;
 
 impl App {
     pub fn new(roots: Roots, state: State, lock_dir: PathBuf, sesync_lock: PathBuf) -> App {
+        let mut state = state;
+        // A session deleted in an earlier run whose record no daemon has dropped yet.
+        state.forget_deleted(unix_now());
         let mut titles = crate::manage::TitleCache::default();
         let groups = manage::list_groups_cached(&roots, &state, &mut titles);
         let visible: Vec<usize> = (0..groups.len()).collect();
@@ -308,6 +374,7 @@ impl App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
             team: Vec::new(),
+            team_copies: Vec::new(),
             team_index: 0,
             imported: Vec::new(),
             space: None,
@@ -323,6 +390,7 @@ impl App {
             quit: false,
             pending_import: None,
             teams: Vec::new(),
+            team_cards: Vec::new(),
             share_cursor: 0,
             pick_shares: Default::default(),
             refresh_requested: false,
@@ -331,6 +399,7 @@ impl App {
             palette_cursor: 0,
             menu_cursor: 0,
             installed_targets: Vec::new(),
+            state_written: None,
             pick_cursor: 0,
             pick_chosen: Default::default(),
             theme_name: crate::theme::DEFAULT.to_string(),
@@ -347,6 +416,19 @@ impl App {
             prefs_dirty: false,
             pulling: false,
             armed_delete: None,
+            admin: false,
+            team_server: String::new(),
+            admin_token_file: String::new(),
+            admin_teams: Vec::new(),
+            monochrome: false,
+            members: None,
+            admin_busy: false,
+            admin_request: None,
+            preview: Default::default(),
+            team_problems: Default::default(),
+            leave_cursor: 0,
+            leave_armed: None,
+            leave_request: None,
         }
     }
 
@@ -413,9 +495,15 @@ impl App {
         &self.groups
     }
 
-    /// Set the team sessions a pull returned. Display only; nothing is written by this.
+    /// Show these team sessions, with no team behind them (a caller that has rows only). Display
+    /// only; nothing is written by this, and leaving a team does not remove these rows.
     pub fn set_team_sessions(&mut self, sessions: Vec<(String, Vec<u8>)>) {
-        self.team = sessions;
+        self.team_copies.clear();
+        self.show_team_rows(sessions);
+    }
+
+    fn show_team_rows(&mut self, rows: Vec<(String, Vec<u8>)>) {
+        self.team = rows;
         self.clamp_team_index();
     }
 
@@ -454,9 +542,12 @@ impl App {
         self.pulling
     }
 
-    /// Record what a team pull returned: the verified sessions and how many the app refused.
-    pub fn set_pull_result(&mut self, sessions: Vec<(String, Vec<u8>)>, refused: usize) {
-        self.set_team_sessions(sessions);
+    /// Record what a team pull returned: every verified copy, by team (the list shows the newest
+    /// copy of each conversation), and how many records the app refused.
+    pub fn set_pull_result(&mut self, copies: Vec<crate::team_watch::TeamCopy>, refused: usize) {
+        let rows = crate::team_watch::newest_of(&copies);
+        self.team_copies = copies;
+        self.show_team_rows(rows);
         let shown = self.team.len();
         self.pulling = false;
         self.last_pull = Some((Instant::now(), shown, refused));
@@ -550,11 +641,13 @@ impl App {
             Mode::Theme => "up/down preview · enter apply · esc revert".to_string(),
             Mode::Form => "tab next field · enter submit · esc cancel".to_string(),
             Mode::Qr => "scan now · the secret is shown once · esc close".to_string(),
+            Mode::Members => "a approve · d refuse · r revoke · m remove · t next team · esc close".to_string(),
             Mode::Filter => "type to filter · enter keep · esc clear".to_string(),
             Mode::Help => "esc close".to_string(),
             Mode::Transcript => "j/k scroll · esc close".to_string(),
             Mode::DeleteConfirm => "ctrl+d delete · any other key cancels".to_string(),
             Mode::SharePick => "space tick · a all · n none · enter keep · esc cancel".to_string(),
+            Mode::LeavePick => "up/down move · enter twice leaves · esc cancel".to_string(),
             Mode::Browse => match self.view {
                 View::Sessions => {
                     let view_key = match self.filter_scope {
@@ -624,13 +717,22 @@ impl App {
         self.say(if self.filter_text.is_empty() {
             format!("showing {shown} of {total} session(s)")
         } else {
-            format!("filter '{}' — {shown} of {total} session(s)", self.filter_text)
+            format!("filter '{}': {shown} of {total} session(s)", self.filter_text)
         });
     }
 
     /// The teams this machine belongs to (set by the caller at start-up).
     pub fn set_teams(&mut self, teams: Vec<String>) {
         self.teams = teams;
+    }
+
+    /// Each joined team with where this machine stands (set by the caller from the credentials).
+    pub fn set_team_cards(&mut self, cards: Vec<crate::team_join::TeamCard>) {
+        self.team_cards = cards;
+    }
+
+    pub fn team_cards(&self) -> &[crate::team_join::TeamCard] {
+        &self.team_cards
     }
 
     /// Whether a listed group is shared with any team. The view uses this to show the mark.
@@ -658,34 +760,130 @@ impl App {
         let pushed_at = self.state.shares_of(&id).iter()
             .filter_map(|space| self.state.team_pushed_at(space, &id))
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        use crate::session_cols::{is_transient, MirrorState};
+        let src = self.state.sources.get(&g.key);
+        // A target's state comes from the daemon's per-target record: a recorded problem makes it
+        // failing, or busy when the target was only in use. A chosen target with no install and
+        // no record yet (a state written before per-target records) is failing once the daemon
+        // has counted failed attempts on the source.
+        let state_of = |t: &str, base: MirrorState| {
+            match src.and_then(|s| s.sync.get(t)) {
+                Some(e) if !e.problem.is_empty() => {
+                    if is_transient(&e.problem) { MirrorState::Busy } else { MirrorState::Failing }
+                }
+                Some(_) => base,
+                None if base == MirrorState::Pending && src.map_or(false, |s| s.failures > 0) => MirrorState::Failing,
+                None => base,
+            }
+        };
+        let mut mirror_targets: Vec<(String, MirrorState)> =
+            g.mirrors.iter().map(|(t, _)| (t.clone(), state_of(t, MirrorState::Mirrored))).collect();
+        // A chosen target with no install yet is listed too, so a first write that failed shows.
+        // A target the user no longer chose is not, whatever record it still has.
+        if let Some(s) = src {
+            for t in &s.chosen_targets {
+                if !s.mirrors.contains_key(t) {
+                    mirror_targets.push((t.clone(), state_of(t, MirrorState::Pending)));
+                }
+            }
+        }
+        // Unknown write times (0) do not count: they would pin the column to "never".
+        let synced_at = mirror_targets.iter()
+            .filter_map(|(t, _)| src.and_then(|s| s.sync.get(t)).map(|e| e.ok_at).filter(|at| *at > 0.0))
+            .reduce(f64::min)
+            .unwrap_or(0.0);
         crate::session_cols::columns(&crate::session_cols::Input {
             marked: self.state.is_shared(&id),
             pushed_at,
             last_change,
             now,
-            quiet_secs: crate::team_pass::team_quiet_secs(),
-            // A chosen target with no mirror yet shows with a marker so the user can see the
-            // write is still pending ("?") or has been failing ("!").
-            mirror_targets: {
-                use crate::session_cols::MirrorState;
-                let src = self.state.sources.get(&g.key);
-                let failures = src.map_or(0, |s| s.failures);
-                let mut targets: Vec<(String, MirrorState)> =
-                    g.mirrors.iter().map(|(t, _)| (t.clone(), MirrorState::Mirrored)).collect();
-                if let Some(s) = src {
-                    for t in &s.chosen_targets {
-                        if !s.mirrors.contains_key(t) {
-                            targets.push((t.clone(), if failures > 0 { MirrorState::Failing } else { MirrorState::Pending }));
-                        }
-                    }
-                }
-                targets
-            },
+            mirror_targets,
+            synced_at,
         })
     }
 
     pub fn is_selected_marked(&self) -> bool {
         self.selected().map_or(false, |g| self.state.is_shared(&self.state.team_id_of(&g.key)))
+    }
+
+    /// Record when the state file was last read (seconds since the epoch), for the tab bar.
+    pub fn set_state_written(&mut self, at: Option<f64>) {
+        self.state_written = at;
+    }
+
+    /// When the state file was last read, if known.
+    pub fn state_written_at(&self) -> Option<f64> {
+        self.state_written
+    }
+
+    /// The highlighted session, borrowed, for the details pane.
+    pub fn selected_row(&self) -> Option<&Group> {
+        self.visible.get(self.model.selected()).and_then(|i| self.groups.get(*i))
+    }
+
+    /// The conversation the preview should show, as (harness, key): the highlighted session when
+    /// it is on disk. None on the Team tab.
+    pub fn preview_wanted(&self) -> Option<(String, String)> {
+        if self.view != View::Sessions {
+            return None;
+        }
+        let g = self.selected_row().filter(|g| !g.orphan)?;
+        Some((g.fmt.clone(), g.key.clone()))
+    }
+
+    /// The caller asked its worker for `key`: show it as loading until the answer arrives.
+    pub fn preview_requested(&mut self, key: &str) {
+        self.preview = crate::preview::Preview { key: key.to_string(), loading: true, ..Default::default() };
+    }
+
+    /// An answer from the preview worker. One for a conversation no longer highlighted is dropped;
+    /// a later answer for the same one replaces the turns and keeps the scroll.
+    pub fn apply_preview(&mut self, loaded: crate::preview::Loaded) {
+        if loaded.key != self.preview.key {
+            return;
+        }
+        self.preview.loading = false;
+        match loaded.messages {
+            Ok(m) => {
+                self.preview.messages = m;
+                self.preview.error = None;
+            }
+            Err(e) => {
+                self.preview.messages.clear();
+                self.preview.error = Some(e);
+            }
+        }
+    }
+
+    /// The preview the details pane draws.
+    pub fn preview(&self) -> &crate::preview::Preview {
+        &self.preview
+    }
+
+    /// Move the highlight to a visible row, for mouse clicks. Out-of-range rows are ignored.
+    pub fn select_row(&mut self, idx: usize) {
+        if idx < self.visible.len() {
+            let delta = idx as isize - self.model.selected() as isize;
+            self.move_selection(delta);
+        }
+    }
+
+    /// Copy counts over every session, for the tab bar: (copies in place, copies whose last write
+    /// failed). A copy that was only busy (in use, retried by the daemon) counts as in place.
+    pub fn sync_counts(&self) -> (usize, usize) {
+        let mut ok = 0;
+        let mut failing = 0;
+        for s in self.state.sources.values() {
+            for t in s.chosen_targets.iter().filter(|t| **t != s.fmt) {
+                let problem = s.sync.get(t).map_or("", |e| e.problem.as_str());
+                if !problem.is_empty() && !crate::session_cols::is_transient(problem) {
+                    failing += 1;
+                } else if s.mirrors.contains_key(t) {
+                    ok += 1;
+                }
+            }
+        }
+        (ok, failing)
     }
 
     /// Share, or stop sharing, the selected session. With one team on this machine it toggles
@@ -699,7 +897,7 @@ impl App {
             self.say("no team is configured; join a team to share a session");
             return None;
         }
-        if self.teams.len() > 1 {
+        if self.share_rows(&id).len() > 1 {
             self.pick_shares = self.state.shares_of(&id);
             self.share_cursor = 0;
             self.mode = Mode::SharePick;
@@ -733,7 +931,7 @@ impl App {
     }
 
     fn handle_share_pick(&mut self, ev: Ev) {
-        let rows = self.teams.clone();
+        let rows = self.share_picker_rows();
         let last = rows.len().saturating_sub(1);
         match ev {
             Ev::Esc => {
@@ -775,6 +973,146 @@ impl App {
     pub fn share_is_picked(&self, team: &str) -> bool { self.pick_shares.contains(team) }
     pub fn teams(&self) -> &[String] { &self.teams }
 
+    /// The share picker's rows for a conversation: the teams this machine belongs to, and any
+    /// team it is still shared with that is not one of them any more, so that share can be untied.
+    pub fn share_rows(&self, conversation: &str) -> Vec<String> {
+        let mut rows = self.teams.clone();
+        for t in self.state.shares_of(conversation) {
+            if !rows.contains(&t) {
+                rows.push(t);
+            }
+        }
+        rows
+    }
+
+    /// `share_rows` for the highlighted session, as the picker draws them.
+    pub fn share_picker_rows(&self) -> Vec<String> {
+        self.selected().map(|g| self.share_rows(&self.state.team_id_of(&g.key))).unwrap_or_default()
+    }
+
+    /// Why the last pull of `team` failed, if it did.
+    pub fn team_problem(&self, team: &str) -> Option<&str> {
+        self.team_problems.get(team).map(String::as_str)
+    }
+
+    /// The failures of the last pull, by team (set by the caller from the pull's outcome).
+    pub fn set_team_problems(&mut self, problems: std::collections::BTreeMap<String, String>) {
+        self.team_problems = problems;
+    }
+
+    /// Every team record on this machine that can be left, as (label, what leaving removes): each
+    /// membership (listed or waiting) and each team managed here. Leaving a membership never
+    /// gives up managing the team, and the other way round.
+    pub fn leave_rows(&self) -> Vec<(String, LeaveRequest)> {
+        use crate::team_join::Standing;
+        let mut rows: Vec<(String, LeaveRequest)> = self.team_cards.iter().map(|c| {
+            let standing = match &c.standing {
+                Standing::Listed { .. } if self.team_problems.contains_key(&c.space) => "refused by the server",
+                Standing::Listed { .. } => "listed",
+                Standing::Waiting { .. } => "waiting for the admin",
+                Standing::Unreadable(_) => "unreadable",
+            };
+            let who = if c.member.is_empty() { String::new() } else { format!(" as {}@{}", c.member, c.machine) };
+            (format!("{}: leave the team on this machine{who} ({standing})", c.space),
+             LeaveRequest { team: c.space.clone(), membership: true, admin: false })
+        }).collect();
+        rows.extend(self.admin_teams.iter().map(|a| (
+            format!("{}: stop managing it here (the admin key stays)", a.team),
+            LeaveRequest { team: a.team.clone(), membership: false, admin: true },
+        )));
+        rows
+    }
+
+    fn open_leave(&mut self) {
+        if self.leave_rows().is_empty() {
+            self.say("no team on this machine");
+            return;
+        }
+        self.leave_cursor = 0;
+        self.leave_armed = None;
+        self.mode = Mode::LeavePick;
+        self.say("pick the team to leave; Enter twice leaves it, Esc cancels");
+    }
+
+    fn handle_leave_pick(&mut self, ev: Ev) {
+        let rows = self.leave_rows();
+        let last = rows.len().saturating_sub(1);
+        match ev {
+            Ev::Esc => {
+                self.mode = Mode::Browse;
+                self.leave_armed = None;
+                self.say("nothing left");
+            }
+            Ev::Up | Ev::Char('k') => {
+                self.leave_cursor = self.leave_cursor.saturating_sub(1);
+                self.leave_armed = None;
+            }
+            Ev::Down | Ev::Char('j') => {
+                self.leave_cursor = (self.leave_cursor + 1).min(last);
+                self.leave_armed = None;
+            }
+            Ev::Enter => {
+                let Some((label, req)) = rows.get(self.leave_cursor).cloned() else { return };
+                if self.leave_armed == Some(self.leave_cursor) {
+                    self.leave_armed = None;
+                    self.mode = Mode::Browse;
+                    self.say(format!("leaving: {label}"));
+                    self.leave_request = Some(req);
+                } else {
+                    self.leave_armed = Some(self.leave_cursor);
+                    self.say(if req.membership {
+                        format!("press enter again to leave '{}' on this machine; the team and its sessions stay on the server", req.team)
+                    } else {
+                        format!("press enter again to stop managing '{}' here; the team and the admin key stay", req.team)
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The leave picker's cursor and the row a first Enter armed, for drawing.
+    pub fn leave_cursor(&self) -> usize { self.leave_cursor }
+    pub fn leave_armed(&self) -> Option<usize> { self.leave_armed }
+
+    /// A leave the user confirmed, for the caller to carry out (it owns the configuration
+    /// directory), once.
+    pub fn take_leave_request(&mut self) -> Option<LeaveRequest> {
+        self.leave_request.take()
+    }
+
+    /// The caller left (or failed to leave) a team. A membership left drops the team from every
+    /// share, so nothing stays shared into a team this machine can no longer reach.
+    pub fn left_team(&mut self, req: &LeaveRequest, outcome: Result<String, String>) {
+        match outcome {
+            Ok(done) => {
+                let mut msg = done;
+                if req.membership {
+                    self.team_problems.remove(&req.team);
+                    // Only rows this team's pulls brought over leave the list; a conversation
+                    // another team holds too stays, as that team's copy.
+                    if self.team_copies.iter().any(|c| c.space == req.team) {
+                        let before = self.team.len();
+                        self.team_copies.retain(|c| c.space != req.team);
+                        let rows = crate::team_watch::newest_of(&self.team_copies);
+                        self.show_team_rows(rows);
+                        let gone = before - self.team.len();
+                        if gone > 0 {
+                            msg.push_str(&format!("; {gone} of its session(s) left the Team list"));
+                        }
+                    }
+                    let dropped = self.state.drop_team_shares(&req.team);
+                    if dropped > 0 {
+                        self.user_dirty = true;
+                        msg.push_str(&format!("; {dropped} session(s) no longer shared with it"));
+                    }
+                }
+                self.say(msg);
+            }
+            Err(e) => self.fail(format!("not left: {e}")),
+        }
+    }
+
     /// True once the user changed a field the app owns (a mark or a mirror choice), and
     /// clears the flag. The caller saves state only when this returns true.
     pub fn take_user_dirty(&mut self) -> bool {
@@ -806,22 +1144,30 @@ impl App {
         self.team.iter().map(|(id, bytes)| {
             let text = String::from_utf8_lossy(bytes);
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            let (title, found) = crate::titles::omp_title_from_lines(&lines);
+            let (title, found) = crate::harness::journal::omp_title_from_lines(&lines);
             let title = if found && !title.trim().is_empty() { title } else { "untitled".to_string() };
             let short: String = id.chars().take(8).collect();
             format!("{title} · {short}…")
         }).collect()
     }
 
-    /// The command list as the view draws it, filtered by what has been typed.
-    pub fn palette_rows(&self) -> Vec<PaletteRow> {
-        let ctx = palette::Ctx {
+    /// What the command list needs to know about the current state.
+    fn palette_ctx(&self) -> palette::Ctx {
+        palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
             session_shared: self.is_selected_marked(),
             team_selected: self.team.get(self.team_index).is_some(),
             team_configured: self.team_configured,
-        };
+            team_to_manage: !self.manageable_teams().is_empty(),
+            teams_here: !self.team_cards.is_empty() || !self.admin_teams.is_empty(),
+            admin: self.admin,
+        }
+    }
+
+    /// The command list as the view draws it, filtered by what has been typed.
+    pub fn palette_rows(&self) -> Vec<PaletteRow> {
+        let ctx = self.palette_ctx();
         palette::filter(&self.palette_query).into_iter().enumerate().map(|(i, action)| {
             let (why, ok) = match palette::enabled(action, &ctx) {
                 Ok(()) => (String::new(), true),
@@ -875,8 +1221,9 @@ impl App {
     }
 
     /// Take the daemon-owned parts of a state file into this app: mirror records, scan stamps,
-    /// team floors and subagents. The user-owned parts (marks, chosen targets) stay local, so
-    /// a mirror the daemon just wrote becomes visible without a restart.
+    /// team floors and subagents, so a mirror the daemon just wrote becomes visible without a
+    /// restart. The user's choices (shares, chosen targets, deletes) another TUI saved are taken
+    /// too, except the ones changed here and not saved yet (`State::absorb_user_choices`).
     pub fn absorb_daemon_state(&mut self, disk: &State) {
         self.state.mirror_keys = disk.mirror_keys.clone();
         self.state.subagents = disk.subagents.clone();
@@ -888,8 +1235,12 @@ impl App {
                 s.last_hash = dsrc.last_hash.clone();
                 s.last_stamp = dsrc.last_stamp.clone();
                 s.failures = dsrc.failures;
+                s.sync = dsrc.sync.clone();
                 s.mirrors = dsrc.mirrors.clone();
                 if !dsrc.title.is_empty() { s.title = dsrc.title.clone(); }
+                // The daemon holds the entry now; if it later removes it (a promotion turned it
+                // into a mirror), this app must let it go instead of saving it back.
+                s.tui_created = false;
             } else {
                 self.state.sources.insert(key.clone(), dsrc.clone());
             }
@@ -900,6 +1251,36 @@ impl App {
         // binary — which turn-taking would then read as a fresh edit. An entry the TUI itself
         // created (a choice not scanned yet) survives.
         self.state.sources.retain(|key, s| disk.sources.contains_key(key) || s.tui_created);
+        self.state.absorb_user_choices(disk);
+        // A session deleted here stays forgotten even before the daemon has applied it. If its
+        // marker is missing from the file while the record is still there (the daemon saved over
+        // this app's save), the marker is saved again.
+        if self.state.deleted.keys().any(|k| disk.sources.contains_key(k) && !disk.deleted.contains_key(k)) {
+            self.user_dirty = true;
+        }
+        self.state.forget_deleted(unix_now());
+    }
+
+    /// Save the choices made here into the state file: each one made here goes in, every other
+    /// one keeps what the file holds (another TUI's choices, the daemon's records), and this app
+    /// then shows the merged choices.
+    pub fn save_user(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let before = (self.state.user_choices(), self.state.deleted.clone());
+        self.state.save_user(path)?;
+        if (self.state.user_choices(), self.state.deleted.clone()) != before {
+            self.refresh_rows();
+        }
+        Ok(())
+    }
+
+    /// Fold a pre-multi-team `marked` list into shares (`State::migrate_legacy_team_state`). The
+    /// folded shares are this app's own change, so they go out with its next save.
+    pub fn migrate_legacy_team_state(&mut self, teams: &[String]) {
+        let had = !self.state.legacy_marked.is_empty();
+        self.state.migrate_legacy_team_state(teams);
+        if had && self.state.legacy_marked.is_empty() {
+            self.user_dirty = true;
+        }
     }
 
     /// Re-list the local sessions and keep the cursor on the same session, without a status
@@ -943,7 +1324,7 @@ impl App {
         }
         // ctrl+t opens the colour scheme picker from anywhere except the questions and dialogs
         // that own the screen; inside them it stays out of the way.
-        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr) {
+        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members) {
             self.disarm(now);
             self.open_theme();
             return;
@@ -962,11 +1343,13 @@ impl App {
             Mode::Theme => self.handle_theme(ev),
             Mode::Form => self.handle_form(ev),
             Mode::Qr => self.handle_qr(ev),
+            Mode::Members => self.handle_members(ev),
             Mode::Filter => self.handle_filter(ev),
             Mode::Help => self.handle_help(ev),
             Mode::Transcript => self.handle_transcript(ev),
             Mode::DeleteConfirm => self.handle_delete_confirm(ev),
             Mode::SharePick => self.handle_share_pick(ev),
+            Mode::LeavePick => self.handle_leave_pick(ev),
             Mode::Browse => self.handle_browse(ev, now),
         }
     }
@@ -998,6 +1381,9 @@ impl App {
             }
             Ev::OpenEnroll => self.open_form(Kind::Enroll, &[]),
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
+            Ev::OpenInvite => self.open_invite(),
+            Ev::OpenMembers => self.open_members(),
+            Ev::OpenLeave => self.open_leave(),
             Ev::CtrlD => {
                 if self.view != View::Sessions {
                     self.say("delete works on local sessions only; press tab");
@@ -1023,6 +1409,9 @@ impl App {
             Ev::PageDown => self.move_cursor(10),
             Ev::Home => self.move_cursor(isize::MIN / 2),
             Ev::End => self.move_cursor(isize::MAX / 2),
+            // The preview scrolls by a few lines; the drawing measured how far it can go.
+            Ev::PreviewUp => self.preview.scroll = (self.preview.scroll + 3).min(self.preview.max_scroll.get()),
+            Ev::PreviewDown => self.preview.scroll = self.preview.scroll.saturating_sub(3),
             // Enter on a local session opens its options; ctrl+p always opens the command list.
             // Tab switches the pane.
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
@@ -1092,7 +1481,7 @@ impl App {
                 self.recompute_visible();
                 self.rebuild_model_keep(None);
                 self.say(format!(
-                    "view: {} — {} of {} session(s)",
+                    "view: {}, {} of {} session(s)",
                     self.filter_scope.label(), self.visible.len(), self.groups.len()
                 ));
             }
@@ -1249,6 +1638,7 @@ impl App {
                 ("/", "filter the list by title; enter keeps it, esc clears it"),
                 ("f", "cycle what is listed: all, marked, mirrored, failing"),
                 ("ctrl+r", "re-list the files, so harness-side renames show"),
+                ("shift+↑↓", "scroll the last messages in the details pane (wide screens)"),
                 ("ctrl+d", "delete the session's source file (press twice); mirrors stay"),
                 ("ctrl+c", "copy the session's path; runs in every mode"),
                 ("ctrl+t", "change the colour scheme"),
@@ -1477,13 +1867,7 @@ impl App {
     fn run_palette_choice(&mut self, now: Instant) {
         let filtered = palette::filter(&self.palette_query);
         let Some(&action) = filtered.get(self.palette_cursor) else { return };
-        let ctx = palette::Ctx {
-            view: self.view,
-            session_selected: self.selected().is_some(),
-            session_shared: self.is_selected_marked(),
-            team_selected: self.team.get(self.team_index).is_some(),
-            team_configured: self.team_configured,
-        };
+        let ctx = self.palette_ctx();
         if let Err(reason) = palette::enabled(action, &ctx) {
             self.say(format!("{} not available here: {reason}", palette::title_of(action)));
             return;
@@ -1550,6 +1934,8 @@ impl App {
             kind: f.kind,
             cursor: f.cursor,
             fields: f.entries().into_iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+            examples: f.fields.iter().map(|x| x.example).collect(),
+            help: f.current().map_or("", |x| x.help),
         })
     }
 
@@ -1612,10 +1998,18 @@ impl App {
 
     // ----- the team dialogs ----------------------------------------------------------------
 
-    /// Open the join/create dialog, optionally with values prefilled by label.
+    /// Open the join/create/invite dialog, optionally with values prefilled by label. The team
+    /// server and admin token file last used fill in first, so a dialog does not ask twice.
     pub fn open_form(&mut self, kind: Kind, prefill: &[(&str, &str)]) {
         if self.form.is_some() { return; }
-        self.form = Some(crate::form::Form::new(kind, prefill));
+        let mut form = crate::form::Form::new(kind, &[
+            ("server url", self.team_server.as_str()),
+            ("admin token file", self.admin_token_file.as_str()),
+        ]);
+        for (name, value) in prefill {
+            form.set_value(name, value);
+        }
+        self.form = Some(form);
         self.mode = Mode::Form;
         self.say("");
     }
@@ -1641,11 +2035,15 @@ impl App {
         std::mem::take(&mut self.setup)
     }
 
-    /// What the caller reports after performing a request: the message the status shows.
-    pub fn finish_setup(&mut self, result: Result<String, String>) {
-        match result {
+    /// What the caller reports after performing a team dialog: the message the status shows,
+    /// and the authenticator QR when a team was created.
+    pub fn finish_setup(&mut self, done: SetupDone) {
+        match done.result {
             Ok(msg) => self.say(msg),
             Err(e) => self.fail(e),
+        }
+        if let Some((team, uri)) = done.created {
+            self.show_qr(&team, &uri);
         }
     }
 
@@ -1696,11 +2094,25 @@ impl App {
         let values = f.collected();
         self.form = None;
         self.mode = Mode::Browse;
+        self.remember_team_fields(&values);
         self.say(match kind {
             Kind::Enroll => "joining the team…",
             Kind::Register => "starting the team…",
+            Kind::Invite => "inviting…",
         });
         self.setup = Some(SetupRequest { kind, values });
+    }
+
+    /// Keep the server address and admin token file a dialog was given, for the next dialog.
+    fn remember_team_fields(&mut self, values: &[(String, String)]) {
+        for (name, value) in values {
+            if value.is_empty() { continue; }
+            match name.as_str() {
+                "server url" => self.team_server = value.clone(),
+                "admin token file" => self.admin_token_file = value.clone(),
+                _ => {}
+            }
+        }
     }
 
     // ----- the authenticator QR ------------------------------------------------------------
@@ -1722,6 +2134,216 @@ impl App {
         }
     }
 
+    // ----- team members and invites (admin only) -------------------------------------------
+
+    /// Open the members dialog for the first configured team and ask the server for its list.
+    pub fn open_members(&mut self) {
+        if self.members.is_some() { return; }
+        if self.admin_busy {
+            self.fail("the team server is still answering; try again in a moment");
+            return;
+        }
+        let Some(team) = self.manageable_teams().first().cloned() else {
+            self.fail("no team to manage here; start one first");
+            return;
+        };
+        let (server, token_file) = self.admin_target(&team);
+        if server.is_empty() || token_file.is_empty() {
+            self.fail("the team server or admin token file is not known here: start the team from this machine, or set SESYNC_TEAM_URL and SESYNC_ADMIN_TOKEN_FILE");
+            return;
+        }
+        self.members = Some(Members::new(&team));
+        self.mode = Mode::Members;
+        self.queue_roster();
+        self.say(READING_ROSTER);
+    }
+
+    /// Open the invite dialog for the first team this machine manages, with that team's server
+    /// and admin token file (the command list checks admin).
+    fn open_invite(&mut self) {
+        let team = self.manageable_teams().first().cloned().unwrap_or_default();
+        let (server, token_file) = self.admin_target(&team);
+        self.open_form(Kind::Invite, &[
+            ("team", team.as_str()), ("server url", server.as_str()), ("admin token file", token_file.as_str()),
+        ]);
+    }
+
+    /// The teams the admin dialogs can work on: the ones this machine administers, then the
+    /// ones it joined, each once.
+    pub fn manageable_teams(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.admin_teams.iter().map(|t| t.team.clone()).collect();
+        for t in &self.teams {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+
+    /// The server and admin token file for an admin action on `team`: the ones the team was
+    /// created with on this machine, else the dialogs' defaults.
+    fn admin_target(&self, team: &str) -> (String, String) {
+        let rec = self.admin_teams.iter().find(|t| t.team == team);
+        let pick = |own: Option<&String>, default: &String| {
+            own.filter(|v| !v.is_empty()).unwrap_or(default).clone()
+        };
+        (pick(rec.map(|r| &r.server), &self.team_server), pick(rec.map(|r| &r.token_file), &self.admin_token_file))
+    }
+
+    /// The teams this machine administers (set by the caller from `team_cli::administered`).
+    pub fn set_admin_teams(&mut self, teams: Vec<crate::team_cli::AdminTeam>) {
+        self.admin_teams = teams;
+    }
+
+    pub fn admin_teams(&self) -> &[crate::team_cli::AdminTeam] {
+        &self.admin_teams
+    }
+
+    /// Whether the terminal draws without colours (NO_COLOR is set): the QR then paints its light
+    /// modules, since no explicit black-on-white can reach the screen. Set by the caller.
+    pub fn set_monochrome(&mut self, yes: bool) {
+        self.monochrome = yes;
+    }
+
+    pub fn monochrome(&self) -> bool {
+        self.monochrome
+    }
+
+    /// The open members dialog, if any.
+    pub fn members(&self) -> Option<&Members> {
+        self.members.as_ref()
+    }
+
+    /// Whether an admin job is running on the caller's worker.
+    pub fn admin_busy(&self) -> bool {
+        self.admin_busy
+    }
+
+    /// Whether this machine holds the team admin key. Set by the caller.
+    pub fn set_admin(&mut self, yes: bool) {
+        self.admin = yes;
+    }
+
+    /// The team server and admin token file the dialogs and admin jobs use by default.
+    pub fn set_team_defaults(&mut self, server: &str, token_file: &str) {
+        self.team_server = server.to_string();
+        self.admin_token_file = token_file.to_string();
+    }
+
+    /// Take the admin job the caller should run on a worker thread, once.
+    pub fn take_admin_request(&mut self) -> Option<AdminJob> {
+        self.admin_request.take()
+    }
+
+    /// What the caller reports after an admin job: the roster to show, or a message to show.
+    pub fn finish_admin(&mut self, result: Result<AdminDone, String>) {
+        self.admin_busy = false;
+        match result {
+            Ok(AdminDone::Roster(view)) => {
+                if let Some(m) = self.members.as_mut() {
+                    m.set_roster(&view);
+                }
+                // The list is on screen now; a message from the change that led here stays.
+                if self.status() == READING_ROSTER {
+                    self.say("");
+                }
+            }
+            Ok(AdminDone::Message(text)) => {
+                self.say(text);
+                if self.members.is_some() { self.queue_roster(); }
+            }
+            Err(e) => self.fail(e),
+        }
+    }
+
+    fn queue_roster(&mut self) {
+        let Some(team) = self.members.as_ref().map(|m| m.team.clone()) else { return };
+        self.queue_admin(Command::Roster { name: team });
+    }
+
+    fn queue_admin(&mut self, command: Command) {
+        let team = self.members.as_ref().map(|m| m.team.clone()).unwrap_or_default();
+        let (server, token_file) = self.admin_target(&team);
+        self.admin_request = Some(AdminJob { command, server, token_file });
+        self.admin_busy = true;
+    }
+
+    /// Keys in the members dialog. The change keys need two presses on the same row (see
+    /// [`Members::press`]); any other key cancels a pending change.
+    fn handle_members(&mut self, ev: Ev) {
+        let act = match &ev {
+            Ev::Char(c) => Act::from_key(*c),
+            _ => None,
+        };
+        if act.is_none() {
+            if let Some(m) = self.members.as_mut() { m.disarm(); }
+        }
+        match ev {
+            Ev::Esc => {
+                self.members = None;
+                self.mode = Mode::Browse;
+                self.say("");
+            }
+            Ev::Up | Ev::Char('k') => self.members_move(-1),
+            Ev::Down | Ev::Char('j') => self.members_move(1),
+            Ev::CtrlR => {
+                if self.admin_busy {
+                    self.say("the team server is still answering; wait a moment");
+                } else {
+                    self.queue_roster();
+                    self.say(READING_ROSTER);
+                }
+            }
+            Ev::Char('t') => self.next_members_team(),
+            Ev::Char(_) => {
+                if let Some(act) = act { self.members_press(act); }
+            }
+            _ => {}
+        }
+    }
+
+    fn members_move(&mut self, by: isize) {
+        if let Some(m) = self.members.as_mut() { m.move_cursor(by); }
+    }
+
+    fn members_press(&mut self, act: Act) {
+        if self.admin_busy {
+            self.say("the team server is still answering; wait a moment");
+            return;
+        }
+        let step = match self.members.as_mut() {
+            Some(m) => m.press(act),
+            None => return,
+        };
+        match step {
+            Step::Armed(prompt) => self.say(prompt),
+            Step::Refused(why) => self.fail(why),
+            Step::Run(command) => {
+                self.say("working…");
+                self.queue_admin(command);
+            }
+        }
+    }
+
+    /// Move the members dialog to the next configured team, when there is more than one.
+    fn next_members_team(&mut self) {
+        if self.admin_busy {
+            self.say("the team server is still answering; wait a moment");
+            return;
+        }
+        let Some(current) = self.members.as_ref().map(|m| m.team.clone()) else { return };
+        let teams = self.manageable_teams();
+        if teams.len() < 2 {
+            self.say("only one team is managed here");
+            return;
+        }
+        let at = teams.iter().position(|t| *t == current).unwrap_or(0);
+        let next = teams[(at + 1) % teams.len()].clone();
+        self.members = Some(Members::new(&next));
+        self.queue_roster();
+        self.say(READING_ROSTER);
+    }
+
     // ----- confirm and rename -------------------------------------------------------------
 
     /// Confirm or cancel the pending import. Only `y` writes; everything else cancels.
@@ -1731,22 +2353,7 @@ impl App {
                 let pending = self.pending_import.take();
                 self.mode = Mode::Browse;
                 if let Some((id, bytes)) = pending {
-                    // The harness lists only `<timestamp>_<uuid>.jsonl`. A team id that cannot
-                    // be written in that form is refused, so no file is written that nothing shows.
-                    let name = format!("{}_{}.jsonl", "2026-01-01T00-00-00-000Z", id);
-                    if !crate::discovery::is_listed_session_name(&name) {
-                        self.mode = Mode::Browse;
-                        self.say(format!("not imported: team session id {id} is not a harness session id"));
-                        return;
-                    }
-                    let target = self.roots.omp.join(name);
-                    match crate::team_import::import_confirmed(&target, &bytes, true) {
-                        Ok(_) => {
-                            self.imported.push(id.clone());
-                            self.say(format!("imported team session {id}"));
-                        }
-                        Err(e) => self.fail(format!("not imported: {e:?}")),
-                    }
+                    self.import_team_session(&id, &bytes);
                 }
             }
             _ => {
@@ -1754,6 +2361,50 @@ impl App {
                 self.mode = Mode::Browse;
                 self.say("import cancelled");
             }
+        }
+    }
+
+    /// Write a confirmed team session, as it is (a canonical journal), into the first harness
+    /// whose own files are journals, filed the way that harness files its own: in the folder it
+    /// lists for the project directory the session's header records (the home when there is
+    /// none), under the start-time name its listing reads. A session that harness already holds
+    /// is left alone.
+    fn import_team_session(&mut self, id: &str, bytes: &[u8]) {
+        use crate::harness::journal;
+        let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
+            self.fail("not imported: no harness keeps canonical journals");
+            return;
+        };
+        let loc = self.roots.locations.of(h.id());
+        let head = journal::session_head(bytes);
+        let home = self.roots.home.display().to_string();
+        let cwd = head.cwd.clone().unwrap_or_else(|| home.clone());
+        let Some(folder) = h.folder_for_cwd(loc, &home, &cwd) else {
+            self.fail(format!("not imported: {} has no project folder to file it in", h.id()));
+            return;
+        };
+        // The harness lists only `<timestamp>_<uuid>.jsonl`. A header without a usable start time
+        // takes the import's; an id that cannot be written in that form is refused, so no file
+        // is written that nothing shows.
+        let mut name = journal::journal_filename(head.timestamp.as_deref().unwrap_or_default(), id);
+        if !journal::is_listed_session_name(&name) {
+            name = journal::journal_filename(&journal::now_iso_ms(), id);
+        }
+        if !journal::is_listed_session_name(&name) {
+            self.say(format!("not imported: team session id {id} is not a harness session id"));
+            return;
+        }
+        if h.sessions(loc).iter().any(|p| h.id_in(&p.display().to_string()).as_deref() == Some(id)) {
+            self.fail(format!("not imported: {} already holds session {id}", h.id()));
+            return;
+        }
+        match crate::team_import::import_confirmed(&folder.join(name), bytes, true) {
+            Ok(_) => {
+                self.imported.push(id.to_string());
+                self.say(format!("imported team session {id} into {}", h.id()));
+                self.refresh_rows();
+            }
+            Err(e) => self.fail(format!("not imported: {e:?}")),
         }
     }
 
@@ -1774,11 +2425,14 @@ impl App {
                     return;
                 };
                 let title = self.input.clone();
-                match manage::rename_group(&self.roots, &g, &title, &self.lock_dir, &self.sesync_lock) {
-                    Ok(saved) => {
+                match manage::rename_group_noted(&self.roots, &g, &title, &self.lock_dir, &self.sesync_lock) {
+                    Ok((saved, note)) => {
                         self.mode = Mode::Browse;
                         self.input.clear();
-                        self.say(format!("renamed to '{saved}'"));
+                        match note {
+                            Some(note) => self.say(format!("renamed to '{saved}'. {note}")),
+                            None => self.say(format!("renamed to '{saved}'")),
+                        }
                         self.reload();
                     }
                     Err(e) => {
@@ -1792,9 +2446,27 @@ impl App {
     }
 
     fn delete_selected(&mut self, g: &Group) {
-        match manage::delete_group(&self.roots, g, &self.lock_dir, &self.sesync_lock) {
+        // A session already gone (its file, or its row in a harness's store) has nothing left to
+        // delete: only its record goes. Anything else is deleted on disk first.
+        let removed = if g.orphan {
+            Ok(Vec::new())
+        } else {
+            manage::delete_group(&self.roots, g, &self.lock_dir, &self.sesync_lock)
+        };
+        match removed {
             Ok(done) => {
-                self.say(format!("deleted {} item(s) for '{}'", done.len(), g.title));
+                // The record goes with the file, or the session would be listed as missing from
+                // now on; its copies stay and are listed as sessions of their own. The daemon
+                // learns of it through the saved state.
+                let now = unix_now();
+                self.state.deleted.insert(g.key.clone(), now);
+                self.state.forget_deleted(now);
+                self.user_dirty = true;
+                self.say(if g.orphan {
+                    format!("forgot '{}': it was already gone", g.title)
+                } else {
+                    format!("deleted {} item(s) for '{}'", done.len(), g.title)
+                });
                 self.reload();
             }
             Err(e) => self.fail(format!("refused: {e}")),
@@ -1804,3 +2476,11 @@ impl App {
 
 #[allow(dead_code)]
 fn _unused(_: ClaimOutcome<()>) {}
+
+/// Seconds since the epoch, for the records that carry wall time.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// The status while the members dialog waits for the team's list.
+const READING_ROSTER: &str = "reading the team's list…";

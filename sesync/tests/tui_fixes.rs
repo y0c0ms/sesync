@@ -24,12 +24,7 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &Path) -> Roots {
-    Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    }
+    Roots::under(&sb, sb.join("no-sesync-conv"))
 }
 
 fn write_session(sb: &Path, sid: &str, title: &str) -> PathBuf {

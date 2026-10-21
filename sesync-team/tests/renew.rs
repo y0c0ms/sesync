@@ -12,7 +12,7 @@ fn enrolled() -> (Service<MemoryStore>, String) {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("personal", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("personal").unwrap(), T0);
-    let token = s.enrol("personal", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("personal", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     (s, token)
 }
 

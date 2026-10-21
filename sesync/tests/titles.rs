@@ -1,33 +1,35 @@
 //! Title rules, ported from daemon/tests/test_titles.py. These are the spec.
 //! A mirror name must never carry a date that is not the user's.
 
-use sesync::titles::{clean_opencode_title, claude_title_from_lines, gemini_title_from_lines, omp_title_from_lines};
+use sesync::harness::claude::claude_title_from_lines;
+use sesync::harness::journal::omp_title_from_lines;
+use sesync::harness::opencode::store::clean_title;
 
 #[test]
 fn default_timestamp_title_is_untitled() {
-    assert_eq!(clean_opencode_title(Some("New session - 2026-10-14T16:52:39.241Z")), "");
+    assert_eq!(clean_title("New session - 2026-10-14T16:52:39.241Z"), "");
 }
 
 #[test]
 fn default_title_with_other_precision_is_untitled() {
-    assert_eq!(clean_opencode_title(Some("New session - 2026-09-21T16:29:28.123Z")), "");
+    assert_eq!(clean_title("New session - 2026-09-21T16:29:28.123Z"), "");
 }
 
 #[test]
 fn real_title_is_kept() {
-    assert_eq!(clean_opencode_title(Some("Research harness stores")), "Research harness stores");
+    assert_eq!(clean_title("Research harness stores"), "Research harness stores");
 }
 
 #[test]
 fn title_that_mentions_a_date_is_kept() {
     // Only the exact O-penCode default pattern is stripped.
-    assert_eq!(clean_opencode_title(Some("Plan for 2026-10-14")), "Plan for 2026-10-14");
+    assert_eq!(clean_title("Plan for 2026-10-14"), "Plan for 2026-10-14");
 }
 
 #[test]
 fn missing_title_is_empty() {
-    assert_eq!(clean_opencode_title(None), "");
-    assert_eq!(clean_opencode_title(Some("   ")), "");
+    assert_eq!(clean_title(""), "");
+    assert_eq!(clean_title("   "), "");
 }
 
 #[test]
@@ -84,34 +86,6 @@ fn omp_title_change_beats_the_initial_slot() {
     assert_eq!(omp_title_from_lines(&lines).0, "Renamed inside omp");
 }
 
-#[test]
-fn gemini_summary_beats_first_prompt() {
-    let lines = [
-        r#"{"id":"u1","timestamp":"2026-10-01T10:00:00.000Z","type":"user","content":[{"text":"first prompt"}]}"#,
-        r#"{"$set":{"summary":"Chosen later"}}"#,
-    ];
-    let (title, has_user) = gemini_title_from_lines(&lines);
-    assert_eq!(title, "Chosen later");
-    assert!(has_user);
-}
-
-#[test]
-fn gemini_first_prompt_names_the_session_until_a_summary_exists() {
-    let lines = [r#"{"id":"u1","timestamp":"2026-10-01T10:00:00.000Z","type":"user","content":[{"text":"Plan the move\nsecond line"}]}"#];
-    let (title, has_user) = gemini_title_from_lines(&lines);
-    assert_eq!(title, "Plan the move");
-    assert!(has_user);
-}
-
-#[test]
-fn gemini_tool_results_are_not_a_user_turn() {
-    // A functionResponse-only record is a "user" record in the log but carries no text.
-    let lines = [r#"{"id":"u1","timestamp":"2026-10-01T10:00:00.000Z","type":"user","content":[{"functionResponse":{"id":"c1","name":"shell","response":{"output":"ok"}}}]}"#];
-    let (title, has_user) = gemini_title_from_lines(&lines);
-    assert_eq!(title, "");
-    assert!(!has_user);
-}
-
 // ---- the title reader must find a rename wherever it sits -----------------------------------
 //
 // A rename made inside the harness appends only a `title_change`; the 256-byte slot keeps the old
@@ -150,17 +124,30 @@ fn long_journal(name: &str, slot: &str, before_kb: usize, rename: Option<&str>, 
 fn a_rename_far_from_both_ends_is_found() {
     // ~600 KB before and ~300 KB after: the record is deeper than one window from either end.
     let p = long_journal("far", "Old name", 600, Some("PC Config"), 300);
-    let text = sesync::titles::read_title_text(&p).expect("readable");
+    let text = sesync::harness::journal::read_title_text(&p).expect("readable");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(sesync::titles::omp_title_from_lines(&lines).0, "PC Config");
+    assert_eq!(sesync::harness::journal::omp_title_from_lines(&lines).0, "PC Config");
     let _ = std::fs::remove_file(&p);
 }
 
 #[test]
 fn without_a_rename_the_slot_still_names_the_session() {
     let p = long_journal("slot-only", "Old name", 700, None, 0);
-    let text = sesync::titles::read_title_text(&p).expect("readable");
+    let text = sesync::harness::journal::read_title_text(&p).expect("readable");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(sesync::titles::omp_title_from_lines(&lines).0, "Old name");
+    assert_eq!(sesync::harness::journal::omp_title_from_lines(&lines).0, "Old name");
     let _ = std::fs::remove_file(&p);
+}
+
+/// The slot is rewritten when omp saves, so it can be newer than the renames near the head. An
+/// old rename read in the head window must not revive a name the user has replaced since: a 44 MB
+/// session read as its July name, and the rename form offered that name back.
+#[test]
+fn an_old_rename_near_the_head_does_not_override_a_newer_slot() {
+    let lines = [
+        r#"{"type":"title","v":1,"title":"PC Config","source":"user","updatedAt":"2026-10-20T09:47:11.217Z"}"#,
+        r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-07-27T10:35:21.365Z","title":"PC Config"}"#,
+        r#"{"type":"title_change","id":"t1","timestamp":"2026-07-27T10:38:34.575Z","title":"waveterm configuration options","source":"auto"}"#,
+    ];
+    assert_eq!(sesync::harness::journal::omp_title_from_lines(&lines).0, "PC Config");
 }

@@ -1,12 +1,32 @@
 //! Change detection rule. Ported from daemon/sesync.py _scan_journals.
 //! Kept as a pure function so every rule can be tested without a filesystem.
 
-use crate::buckets;
-use std::collections::BTreeSet;
+use crate::harness::{self, Kind};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Files smaller than this are not sessions (a warm-up file, not a conversation).
 pub const MIN_BYTES: u64 = 512;
+
+/// Whether a journal holds a conversation at all: at least one user or assistant message. An
+/// empty export (an OpenCode session a failed import emptied, a file with only a header) must
+/// never replace copies that still hold the conversation.
+pub fn journal_has_messages(path: &Path) -> bool {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if !line.contains("\"message\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if v.get("type").and_then(serde_json::Value::as_str) == Some("message")
+            && matches!(v.pointer("/message/role").and_then(serde_json::Value::as_str), Some("user" | "assistant"))
+        {
+            return true;
+        }
+    }
+    false
+}
 
 pub struct ScanInput {
     pub size: u64,
@@ -82,30 +102,20 @@ pub fn mirror_demand(missing: bool, chosen: usize, mirrors: usize, failures: u32
 }
 
 /// Is a recorded mirror in a place its harness will never list? Older daemons wrote file
-/// mirrors into the wrong bucket (the wrong `--home`, or a dropped cwd), and OpenCode
-/// imports made before its SQLite migration no longer exist in the store. A stale mirror
-/// must count as missing so the next pass rewrites it where it belongs. Conservative by
-/// design: whenever the expected place cannot be known (no cwd, outside home, no id set)
-/// the answer is "not stale".
+/// mirrors into the wrong project folder (the wrong `--home`, or a dropped cwd), and copies in a
+/// store harness can vanish from its database (OpenCode's move to SQLite). A stale mirror must
+/// count as missing so the next pass rewrites it where it belongs. Conservative by design:
+/// whenever the right place cannot be known (no cwd, outside home, a store not read) the answer
+/// is "not stale". `store_ids` holds, per store harness, the session ids its database lists; a
+/// harness missing from it was not read.
 pub fn mirror_stale(target: &str, mirror_path: &str, cwd: Option<&str>, home: &str,
-                    opencode_ids: Option<&BTreeSet<String>>) -> bool {
-    match target {
+                    store_ids: &BTreeMap<String, BTreeSet<String>>) -> bool {
+    let Some(h) = harness::get(target) else { return false };
+    match h.kind() {
         // The record holds the session id, not a path.
-        "opencode" => opencode_ids.is_some_and(|ids| !ids.contains(mirror_path)),
-        "omp" => match cwd.and_then(|c| buckets::omp_home_bucket(c, home)) {
-            Some(expected) => parent_name(mirror_path).as_deref() != Some(expected.as_str()),
-            None => false,
-        },
-        "pi" => match cwd {
-            Some(c) => parent_name(mirror_path).as_deref() != Some(buckets::pi_bucket(c).as_str()),
-            None => false,
-        },
-        _ => false,
+        Kind::Store => store_ids.get(target).is_some_and(|ids| !ids.contains(mirror_path)),
+        Kind::Files => h.misplaced(mirror_path, cwd, home),
     }
-}
-
-fn parent_name(path: &str) -> Option<String> {
-    Path::new(path).parent()?.file_name().map(|n| n.to_string_lossy().to_string())
 }
 
 #[cfg(test)]
@@ -177,35 +187,52 @@ mod tests {
     }
 
     #[test]
-    fn a_file_mirror_in_the_wrong_bucket_is_stale() {
-        // The bug this guards: the daemon passed --home = the store's parent, so a session
-        // with cwd /home/u/proj mirrored to omp landed in --home-u-proj-, a bucket omp
-        // never lists from that project. Older writes dropped the cwd and landed in --.
-        let home = "/home/u";
+    fn a_file_copy_is_stale_where_its_harness_never_lists_it() {
+        // The bug this guards: the daemon passed --home = the store's parent, so a session with
+        // cwd /home/u/proj mirrored to omp landed in --home-u-proj-, a folder omp never lists
+        // from that project. Each harness owns its rule (`Harness::misplaced`).
+        let none = BTreeMap::new();
         let cwd = Some("/home/u/proj");
-        assert!(mirror_stale("omp", "/store/sessions/--/x.jsonl", cwd, home, None));
-        assert!(mirror_stale("omp", "/store/sessions/--home-u-proj-/x.jsonl", cwd, home, None));
-        assert!(!mirror_stale("omp", "/store/sessions/-proj/x.jsonl", cwd, home, None));
-        // Pi's buckets are absolute (verified on disk): --home-u-proj- is right, -- is not.
-        assert!(!mirror_stale("pi", "/store/sessions/--home-u-proj-/x.jsonl", cwd, home, None));
-        assert!(mirror_stale("pi", "/store/sessions/--/x.jsonl", cwd, home, None));
-        // Claude mirrors live under projects/<bucket>; the daemon has no rule to check there.
-        assert!(!mirror_stale("claude", "/claude/projects/-home-u-proj/u.jsonl", cwd, home, None));
+        assert!(mirror_stale("omp", "/store/sessions/--home-u-proj-/x.jsonl", cwd, "/home/u", &none));
+        assert!(!mirror_stale("omp", "/store/sessions/-proj/x.jsonl", cwd, "/home/u", &none));
+        assert!(!mirror_stale("claude", "/claude/projects/-home-u-proj/u.jsonl", cwd, "/home/u", &none),
+            "a harness with no folder rule never calls a copy stale");
+        assert!(!mirror_stale("windsurf", "/x.jsonl", cwd, "/home/u", &none), "nor does a harness sesync does not know");
     }
 
     #[test]
-    fn without_a_cwd_nothing_is_called_stale() {
-        assert!(!mirror_stale("omp", "/store/sessions/--/x.jsonl", None, "/home/u", None));
-        assert!(!mirror_stale("pi", "/store/sessions/--/x.jsonl", None, "/home/u", None));
-        // cwd outside home: omp's fallback encoding is not checked.
-        assert!(!mirror_stale("omp", "/store/sessions/--tmp-/x.jsonl", Some("/tmp"), "/home/u", None));
+    fn a_stored_copy_missing_from_its_store_is_stale() {
+        let ids: BTreeMap<String, BTreeSet<String>> =
+            [("opencode".to_string(), ["ses_a".to_string()].into_iter().collect())].into_iter().collect();
+        assert!(mirror_stale("opencode", "ses_gone", None, "/home/u", &ids));
+        assert!(!mirror_stale("opencode", "ses_a", None, "/home/u", &ids));
+        assert!(!mirror_stale("opencode", "ses_x", None, "/home/u", &BTreeMap::new()), "an unread store must not flag copies");
     }
+}
+
+#[cfg(test)]
+mod journal_content {
+    use super::journal_has_messages;
 
     #[test]
-    fn an_opencode_mirror_missing_from_the_store_is_stale() {
-        let ids: BTreeSet<String> = ["ses_a".to_string()].into_iter().collect();
-        assert!(mirror_stale("opencode", "ses_gone", None, "/home/u", Some(&ids)));
-        assert!(!mirror_stale("opencode", "ses_a", None, "/home/u", Some(&ids)));
-        assert!(!mirror_stale("opencode", "ses_x", None, "/home/u", None), "an unreadable store must not flag mirrors");
+    fn only_a_user_or_assistant_message_makes_a_conversation() {
+        let d = std::env::temp_dir().join(format!("sesync-scan-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let header_only = d.join("empty.jsonl");
+        // What an emptied OpenCode session exports to: a header and bookkeeping, no message.
+        std::fs::write(&header_only, concat!(
+            r#"{"type":"session","id":"s","cwd":"/p","title":"a \"message\" in the title"}"#, "\n",
+            r#"{"type":"model_change","id":"x","model":"m"}"#, "\n",
+        )).unwrap();
+        assert!(!journal_has_messages(&header_only), "a header is not a conversation");
+        let real = d.join("real.jsonl");
+        std::fs::write(&real, concat!(
+            r#"{"type":"session","id":"s","cwd":"/p"}"#, "\n",
+            r#"{"type":"message","id":"m1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#, "\n",
+        )).unwrap();
+        assert!(journal_has_messages(&real));
+        assert!(!journal_has_messages(&d.join("missing.jsonl")), "an unreadable export is not a conversation either");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,11 +1,24 @@
 //! The team trigger's rules: when a marked session is due, what is pushed for each harness, and that
 //! an unchanged or unmarked session is never sent. Uses temp files and an in-memory remote; no real
 //! harness store and no network.
+use sesync::harness::{Location, Locations, Tools};
 use sesync::state::State;
 use sesync::team_push::{PushError, TeamRemote};
-use sesync::team_sync::{canonical_bytes, is_due, push_due, Canonical, DEFAULT_TEAM_QUIET_SECS};
+use sesync::team_sync::{is_due, push_due, DEFAULT_TEAM_QUIET_SECS};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+
+/// The canonical bytes for a `fmt` session, built the way the team pass builds them: `conv` is the
+/// converter, `cli` the harness's own command when the test provides one.
+fn canonical(fmt: &str, key: &Path, conv: &Path, cli: Option<&Path>, scratch: &Path) -> Result<Vec<u8>, String> {
+    let mut locations = Locations::default();
+    if let Some(cli) = cli {
+        locations.set(fmt, Location { root: PathBuf::from("/no/store"), cli: Some(cli.to_path_buf()) });
+    }
+    let home = PathBuf::from("/no/home");
+    let key = key.display().to_string();
+    sesync::team_sync::canonical_for_source(fmt, &key, &locations, &Tools { home: &home, sesync_conv: conv }, scratch)
+}
 
 fn sandbox(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("sesync-team-sync-{}-{name}", std::process::id()));
@@ -119,7 +132,7 @@ fn an_omp_or_pi_session_is_pushed_as_its_own_journal_bytes() {
     let d = sandbox("journal");
     let f = d.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     std::fs::write(&f, b"{\"type\":\"session\"}\n").unwrap();
-    let bytes = canonical_bytes(Canonical::Journal(&f), Path::new("/no/conv"), &d.join("scratch")).unwrap();
+    let bytes = canonical("omp", &f, Path::new("/no/conv"), None, &d.join("scratch")).unwrap();
     assert_eq!(bytes, b"{\"type\":\"session\"}\n", "a journal is sent unchanged");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -127,7 +140,7 @@ fn an_omp_or_pi_session_is_pushed_as_its_own_journal_bytes() {
 #[test]
 fn a_missing_source_is_an_error_not_an_empty_push() {
     let d = sandbox("missing");
-    let err = canonical_bytes(Canonical::Journal(&d.join("gone.jsonl")), Path::new("/no/conv"), &d).unwrap_err();
+    let err = canonical("omp", &d.join("gone.jsonl"), Path::new("/no/conv"), None, &d).unwrap_err();
     assert!(err.contains("cannot read"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -137,7 +150,7 @@ fn a_claude_session_without_the_converter_is_an_error() {
     let d = sandbox("noconv");
     let f = d.join("transcript.jsonl");
     std::fs::write(&f, b"{}\n").unwrap();
-    let err = canonical_bytes(Canonical::Claude(&f), Path::new("/definitely/not/here"), &d.join("s")).unwrap_err();
+    let err = canonical("claude", &f, Path::new("/definitely/not/here"), None, &d.join("s")).unwrap_err();
     assert!(err.contains("cannot run sesync-conv"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -222,12 +235,15 @@ fn the_seal_is_given_the_session_and_the_version_its_lease_was_granted() {
         "the bytes are written under the version the seal was given");
 }
 
+#[cfg(unix)]
 fn converter() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-conv/target/release/sesync-conv");
     p.exists().then_some(p)
 }
 
 /// A stand-in for the O-penCode CLI: prints a fixed export for any `export <id>`, or fails.
+/// A shell script, so Unix only.
+#[cfg(unix)]
 fn fake_opencode(dir: &PathBuf, fail: bool) -> PathBuf {
     let path = dir.join("opencode");
     let body = if fail {
@@ -251,12 +267,13 @@ JSON
     path
 }
 
+#[cfg(unix)]
 #[test]
 fn an_opencode_session_becomes_a_journal_the_team_can_install() {
     let Some(conv) = converter() else { eprintln!("skipped: build sesync-conv first"); return; };
     let d = sandbox("ocx");
     let cli = fake_opencode(&d, false);
-    let bytes = sesync::team_sync::canonical_for_source("opencode", "ses_fake", &conv, &cli, &d.join("scratch")).unwrap();
+    let bytes = canonical("opencode", Path::new("ses_fake"), &conv, Some(&cli), &d.join("scratch")).unwrap();
     let text = String::from_utf8(bytes).unwrap();
     assert!(text.contains("the opencode question"), "the user turn is in the journal: {text}");
     assert!(text.contains("the opencode answer"), "the answer is in the journal: {text}");
@@ -264,12 +281,13 @@ fn an_opencode_session_becomes_a_journal_the_team_can_install() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_opencode_export_that_fails_is_reported_and_nothing_is_pushed() {
     let Some(conv) = converter() else { eprintln!("skipped: build sesync-conv first"); return; };
     let d = sandbox("ocx-fail");
     let cli = fake_opencode(&d, true);
-    let err = sesync::team_sync::canonical_for_source("opencode", "ses_gone", &conv, &cli, &d.join("scratch")).unwrap_err();
+    let err = canonical("opencode", Path::new("ses_gone"), &conv, Some(&cli), &d.join("scratch")).unwrap_err();
     assert!(err.contains("opencode export failed"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -277,9 +295,8 @@ fn an_opencode_export_that_fails_is_reported_and_nothing_is_pushed() {
 #[test]
 fn a_harness_with_no_journal_format_is_refused() {
     let d = sandbox("unknown-fmt");
-    // "cursor" is not a harness this daemon knows, unlike gemini which gained a
-    // canonical format with the Gemini CLI wiring.
-    let err = sesync::team_sync::canonical_for_source("cursor", "x", Path::new("/no"), Path::new("/no"), &d).unwrap_err();
+    // "cursor" is not a harness this daemon knows; a session of an unknown harness is refused.
+    let err = canonical("cursor", Path::new("x"), Path::new("/no"), None, &d).unwrap_err();
     assert!(err.contains("no canonical journal"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }

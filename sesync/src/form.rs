@@ -10,6 +10,8 @@ pub enum Kind {
     /// `sesync team create`: team name, optional member list, and the path to the admin token
     /// file. Never the token itself.
     Register,
+    /// `sesync team invite`: the server, the team, the member to add, and the admin token file.
+    Invite,
 }
 
 pub struct Field {
@@ -18,6 +20,11 @@ pub struct Field {
     pub required: bool,
     /// 6 ascii digits, e.g. the TOTP code.
     pub digits: bool,
+    /// An example drawn, dimmed, while the field is empty. Never a value: an empty field stays
+    /// empty, so Enter on an untouched dialog is refused like any other empty field.
+    pub example: &'static str,
+    /// One line on what the field is for, shown while the cursor is on it.
+    pub help: &'static str,
 }
 
 pub struct Form {
@@ -33,7 +40,10 @@ impl Form {
                 ("server url"), ("team"), ("member"), ("machine"), ("code"),
             ],
             Kind::Register => vec![
-                ("team"), ("members"), ("admin token file"),
+                ("team"), ("members"), ("admin token file"), ("server url"),
+            ],
+            Kind::Invite => vec![
+                ("server url"), ("team"), ("member"), ("admin token file"),
             ],
         };
         let mut form = Form {
@@ -51,13 +61,32 @@ impl Form {
     }
 
     fn field(name: &'static str, kind: Kind) -> Field {
-        Field { name, value: String::new(), required: Form::required(name, kind), digits: name == "code" }
+        let (example, help) = Form::guide(name, kind);
+        Field { name, value: String::new(), required: Form::required(name, kind), digits: name == "code", example, help }
+    }
+
+    /// (example, help) for a field. The examples are made-up names, so none of them is a
+    /// usable default.
+    fn guide(name: &str, kind: Kind) -> (&'static str, &'static str) {
+        match (kind, name) {
+            (_, "server url") => ("http://team-host:30500", "the team server's address"),
+            (Kind::Register, "team") => ("design-team", "a name for the new team; members type it when they join"),
+            (_, "team") => ("design-team", "the team's name, as the admin gave it"),
+            (_, "members") => ("ana, rui", "optional: who may join, comma-separated; you too, to sync this machine"),
+            (Kind::Invite, "member") => ("rui", "the person to add; they join under this name"),
+            (_, "member") => ("ana", "your name, as the admin listed it"),
+            (_, "machine") => ("ana-laptop", "a name for this machine, unique in the team"),
+            (_, "code") => ("123456", "the 6 digits your authenticator app shows for this team"),
+            (_, "admin token file") => ("~/.config/sesync/admin.token", "the file that holds the server's admin token, never the token itself"),
+            _ => ("", ""),
+        }
     }
 
     fn required(name: &str, kind: Kind) -> bool {
         match kind {
             Kind::Enroll => true,
             Kind::Register => name != "members", // members is optional
+            Kind::Invite => true,
         }
     }
 

@@ -1,6 +1,7 @@
 //! The stored member credential: owner-only, round-trips, refuses a file others can read, and
 //! never leaks its token into an error.
 use sesync::team_join::{credential_path, load, save, Credential};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 fn sandbox(name: &str) -> std::path::PathBuf {
@@ -13,7 +14,8 @@ fn sandbox(name: &str) -> std::path::PathBuf {
 fn cred() -> Credential {
     Credential { space: "personal".into(), member: "member-box".into(), machine: "box-2".into(),
                  token: "tok-0123456789abcdef0123456789abcdef".into(),
-                 admin_public: None, signed_list: None, list_version: None }
+                 admin_public: None, signed_list: None, list_version: None,
+                 server: Some("http://127.0.0.1:1".into()) }
 }
 
 #[test]
@@ -21,11 +23,16 @@ fn a_credential_round_trips_and_is_owner_only() {
     let d = sandbox("roundtrip");
     let p = credential_path(&d, "personal");
     save(&p, &cred()).unwrap();
+    #[cfg(unix)]
     assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "mode 600");
     assert_eq!(load(&p).unwrap(), cred());
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Unix only: the credential module has no Windows permission check (a file under the user
+/// profile inherits the profile's owner-only ACL), so there is no "readable by others" state to
+/// provoke there.
+#[cfg(unix)]
 #[test]
 fn a_credential_readable_by_others_is_refused() {
     let d = sandbox("loose");
@@ -52,6 +59,7 @@ fn a_damaged_credential_is_refused_without_echoing_it() {
     let p = credential_path(&d, "personal");
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, "token=tok-secretvalue\n").unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
     let err = load(&p).unwrap_err();
     assert!(err.contains("damaged"), "{err}");

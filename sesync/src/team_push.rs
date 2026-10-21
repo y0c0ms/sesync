@@ -116,9 +116,13 @@ impl HttpTeam {
     /// plaintext route, kept only until the sealed path is the only writer.
     pub fn put_to(&self, route: &str, space: &str, conversation: &str, version: u64, bytes: &[u8]) -> Result<(), PushError> {
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(60)).build();
-        let url = format!("{}{route}?space={space}&conversation={conversation}&machine={}&version={version}",
-                          self.base.trim_end_matches('/'), self.machine);
-        match agent.post(&url).set("Authorization", &format!("Bearer {}", self.token))
+        // Each value is form-encoded by `query`, so a team or machine name holding `&`, `+`, `#`,
+        // `%`, `=` or a space reaches the server as itself.
+        let url = format!("{}{route}", self.base.trim_end_matches('/'));
+        match agent.post(&url)
+            .query("space", space).query("conversation", conversation)
+            .query("machine", &self.machine).query("version", &version.to_string())
+            .set("Authorization", &format!("Bearer {}", self.token))
             .set("Content-Type", "application/octet-stream").send_bytes(bytes) {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(409, _)) => Err(PushError::Refused("stale lease".into())),

@@ -2,7 +2,7 @@
 //! opencode_first_prompt. Reads the real schema (session, message, part) read-only.
 //! Tests use a database built with the same table and column names in a sandbox.
 
-use sesync::opencode::{first_prompt, sessions};
+use sesync::harness::opencode::store::{first_prompt, sessions};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
@@ -82,7 +82,7 @@ fn the_database_is_opened_read_only() {
     make_db(&db);
     // A write through the same path the reader uses must fail, so the reader cannot
     // change the store. This pins the mode=ro open, not just the queries.
-    assert!(sesync::opencode::write_probe(&db).is_err(), "the reader's connection must be read-only");
+    assert!(sesync::harness::opencode::store::write_probe(&db).is_err(), "the reader's connection must be read-only");
 }
 
 /// A store whose session table has a parent_id column, as real OpenCode stores do:

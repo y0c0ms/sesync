@@ -35,9 +35,9 @@ async fn a_session_goes_from_one_listed_device_to_another_without_the_server_rea
     let (version, token) = {
         let mut svc = state.service.lock().unwrap();
         let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
-        let token = svc.enrol("personal", "writer", "box-w", &code, T0).unwrap();
-        // Device-bound auth: the machine's device key must be named by the current list.
-        svc.bind_device("personal", "box-w", device_entry(&writer));
+        // Device-bound auth: the machine joins with a key the current list names, so it is bound.
+        let token = svc.enrol("personal", "writer", "box-w", &code, Some(&device_entry(&writer)), T0)
+            .map(|a| a.token().to_string()).unwrap();
         let lease = svc.acquire("personal", "ses_rt", "box-w", T0).unwrap();
         (lease.version, token)
     };

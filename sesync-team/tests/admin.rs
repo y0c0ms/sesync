@@ -21,8 +21,8 @@ fn an_invited_member_can_enrol_and_others_cannot() {
     s.create_space("personal", &["alice"]).unwrap();
     s.invite("personal", "bob").unwrap();
     let code = code_at(&s.space_secret("personal").unwrap(), T0);
-    assert!(s.enrol("personal", "bob", "laptop-b", &code, T0).is_ok(), "an invited member enrols");
-    assert!(s.enrol("personal", "carol", "laptop-c", &code, T0).is_err(), "a non-member does not");
+    assert!(s.enrol("personal", "bob", "laptop-b", &code, None, T0).is_ok(), "an invited member enrols");
+    assert!(s.enrol("personal", "carol", "laptop-c", &code, None, T0).is_err(), "a non-member does not");
 }
 
 #[test]

@@ -21,16 +21,11 @@ const SID: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 /// One omp session on disk, plus its roots.
 fn fixture(sb: &PathBuf) -> (Roots, PathBuf) {
     // Roots are <agent>/sessions and <claude>/projects, as in the real layout.
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    let dir = roots.omp.join("-tmp");
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
+    let dir = roots.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&roots.pi).unwrap();
-    fs::create_dir_all(&roots.claude).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("pi")).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("claude")).unwrap();
     let path = dir.join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     fs::write(&path, format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{SID}\",\"cwd\":\"/tmp\",\"title\":\"Old\"}}\n")).unwrap();
     (roots, path)
@@ -143,7 +138,7 @@ fn q_quits() {
 fn two_sessions(sb: &PathBuf) -> (Roots, PathBuf, PathBuf) {
     let (roots, first) = fixture(sb);
     let id2 = "bbbbbbbb-1111-2222-3333-444444444444";
-    let second = roots.omp.join("-tmp").join(format!("2026-10-02T10-00-00-000Z_{id2}.jsonl"));
+    let second = roots.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-02T10-00-00-000Z_{id2}.jsonl"));
     fs::write(&second, format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id2}\",\"cwd\":\"/tmp\",\"title\":\"Second\"}}\n")).unwrap();
     (roots, first, second)
 }
@@ -187,13 +182,8 @@ fn moving_the_cursor_cancels_an_armed_delete() {
 const CLAUDE_SID: &str = "dddddddd-1111-2222-3333-444444444444";
 
 fn claude_fixture(sb: &PathBuf) -> (Roots, PathBuf) {
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    let dir = roots.claude.join("-tmp");
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
+    let dir = roots.locations.sessions_dir("claude").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{CLAUDE_SID}.jsonl"));
     fs::write(&path, format!(

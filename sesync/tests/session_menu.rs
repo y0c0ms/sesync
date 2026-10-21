@@ -18,16 +18,11 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn fixture(sb: &PathBuf) -> Roots {
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    let dir = roots.omp.join("-tmp");
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
+    let dir = roots.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&roots.pi).unwrap();
-    fs::create_dir_all(&roots.claude).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("pi")).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("claude")).unwrap();
     fs::write(
         dir.join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl")),
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{SID}\",\"cwd\":\"/tmp\",\"title\":\"Old\"}}\n"),
@@ -88,7 +83,7 @@ fn a_chosen_mirror_with_no_file_yet_is_marked_pending_or_failed() {
     // when the write has been failing — an invisible failure is how a mirror gets forgotten.
     let sb = sandbox("mirror-marks");
     let roots = fixture(&sb);
-    let key = roots.omp.join("-tmp")
+    let key = roots.locations.sessions_dir("omp").join("-tmp")
         .join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"))
         .display().to_string();
     let group = sesync::manage::Group::file("omp", key.clone(), "Old");
@@ -162,17 +157,17 @@ fn mirror_picker_offers_only_installed_harnesses_other_than_the_source() {
 }
 
 #[test]
-fn mirror_picker_offers_gemini_once_installed() {
-    let sb = sandbox("picker-gemini");
+fn mirror_picker_offers_antigravity_once_installed() {
+    let sb = sandbox("picker-agy");
     let mut a = app(&sb, fixture(&sb));
-    a.set_installed_targets(vec!["omp".into(), "gemini".into(), "pi".into()]);
+    a.set_installed_targets(vec!["omp".into(), "antigravity".into(), "pi".into()]);
     press(&mut a, Ev::Enter);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Enter); // row 2: Mirror to harness
     assert_eq!(a.mode(), Mode::MirrorPick);
-    assert_eq!(a.picker_targets(), vec!["gemini".to_string(), "pi".to_string()],
-        "gemini is offered, the source's own format is never offered");
+    assert_eq!(a.picker_targets(), vec!["antigravity".to_string(), "pi".to_string()],
+        "antigravity is offered, the source's own format is never offered");
 }
 
 #[test]
@@ -208,7 +203,7 @@ fn a_fresh_picker_starts_unticked_and_a_then_n_toggle_everything() {
 fn the_picker_starts_from_the_sessions_saved_choice() {
     let sb = sandbox("existing");
     let roots = fixture(&sb);
-    let key = roots.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let key = roots.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     let mut state = State::default();
     let mut src = sesync::state::Source::new("omp", key.to_str().unwrap());
     src.chosen_targets.insert("claude".to_string());
@@ -267,7 +262,7 @@ fn show_transcript_opens_the_file_in_the_tui() {
 fn huge_transcripts_are_cut_to_their_tail() {
     let sb = sandbox("transcript-tail");
     let roots = fixture(&sb);
-    let path = roots.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let path = roots.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     let mut body = String::new();
     for i in 0..(sesync::app::TRANSCRIPT_MAX_LINES + 50) {
         body.push_str(&format!("line-{i}\n"));

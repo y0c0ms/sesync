@@ -224,30 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gemini_tool_call_and_result_survive_a_round_trip_into_claude() {
-        let raw = concat!(
-            r#"{"sessionId":"gs","projectHash":"h","startTime":"2026-10-01T10:00:00.000Z","directories":["/tmp/g"]}"#, "\n",
-            r#"{"id":"u1","timestamp":"2026-10-01T10:00:01.000Z","type":"user","content":[{"text":"list files"}]}"#, "\n",
-            r#"{"id":"g1","timestamp":"2026-10-01T10:00:02.000Z","type":"gemini","content":[{"text":"Listing."},{"functionCall":{"id":"ls__1","name":"list_directory","args":{"path":"."}}}]}"#, "\n",
-            r#"{"id":"r1","timestamp":"2026-10-01T10:00:03.000Z","type":"user","content":[{"functionResponse":{"id":"ls__1","name":"list_directory","response":{"output":"a.txt"}}}]}"#, "\n",
-            r#"{"id":"g2","timestamp":"2026-10-01T10:00:04.000Z","type":"gemini","content":[{"text":"Done."}]}"#, "\n",
-        );
-        let (lines, _) = crate::from_gemini::to_journal_lines(raw).unwrap();
-        let out = to_lines(&journal_of(&lines), &Options { session_id: "s3", cwd: "/tmp/g", cli_version: "2.1.245", title: "" });
-        let blocks: Vec<Value> = out.iter()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap())
-            .flat_map(|r| r["message"]["content"].as_array().cloned().unwrap_or_default())
-            .collect();
-        let call_at = blocks.iter().position(|b| b["type"] == "tool_use").expect("tool_use carried into Claude");
-        let call_id = blocks[call_at]["id"].as_str().unwrap().to_string();
-        assert!(call_id.starts_with("toolu_"), "gemini call ids are remapped too: {call_id}");
-        assert_eq!(blocks[call_at]["name"], "list_directory");
-        let res_at = blocks.iter().position(|b| b["type"] == "tool_result").expect("tool_result carried into Claude");
-        assert_eq!(blocks[res_at]["tool_use_id"], call_id);
-        assert!(res_at > call_at, "result must come after its call");
-    }
-
-    #[test]
     fn every_tool_result_in_the_output_answers_an_earlier_tool_use() {
         // Claude rejects a tool_result with no tool_use before it. Check the output order.
         let (lines, _) = crate::from_claude::to_journal_lines(TOOLS).unwrap();

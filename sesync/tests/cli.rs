@@ -32,6 +32,8 @@ fn run(sb: &Path, extra: &[&str], converter: &Path) -> Output {
         // Point O-penCode at an empty sandbox path. Without this the binary reads the
         // user's real opencode.db and mirrors their live sessions.
         .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        // And never its real CLI: a pass that reached it would import into the user's store.
+        .env("OPENCODE_BIN", sb.join("no-opencode-cli"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
         .env("SESYNC_QUIET", "0")
         .output()
@@ -135,7 +137,7 @@ fn a_corrupt_state_file_stops_the_daemon_instead_of_forgetting_mirrors() {
 
 #[test]
 fn a_title_renamed_in_the_harness_reaches_the_mirror_on_the_next_pass() {
-    use sesync::titles;
+    use sesync::harness::journal as titles;
     let sb = sandbox("rename-fast");
     let src = omp_session(&sb);
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
@@ -214,6 +216,7 @@ fn a_choice_saved_while_the_daemon_runs_is_picked_up_on_the_next_pass() {
         "the daemon's own saves must not erase the choice");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_opencode_session_mirrors_into_the_chosen_harness() {
     let sb = sandbox("opencode-mirror");
@@ -270,4 +273,103 @@ fn an_opencode_session_mirrors_into_the_chosen_harness() {
     let body = fs::read_to_string(&mirrors[0]).unwrap();
     assert!(body.contains("opencode mirror text"), "the conversation must be carried: {body}");
     assert!(body.contains("OC Mirror Title"), "the title must be carried: {body}");
+}
+
+/// The TUI's SYNCED column and details pane read what the daemon records per target: when the
+/// last write landed, and the error when it did not. One pass with one target that can be written
+/// and one that cannot (OpenCode's CLI is missing here, so nothing reaches a real store). An
+/// un-chosen target loses its record on the next pass, changed source or not.
+#[test]
+fn a_pass_records_each_targets_last_write_and_its_error() {
+    let sb = sandbox("per-target");
+    let src = omp_session(&sb);
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    let pass = || Command::new(BIN)
+        .arg("--once")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("SESYNC_CONV", sesync_conv())
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("OPENCODE_BIN", sb.join("no-opencode-cli"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_QUIET", "0")
+        .output()
+        .expect("run sesync");
+    assert!(pass().status.success());
+    let state_path = sb.join("state").join("state.json");
+    let key = src.display().to_string();
+    let mut st = sesync::state::State::load(&state_path).unwrap();
+    st.sources.get_mut(&key).expect("the session is recorded").chosen_targets =
+        ["opencode".to_string(), "pi".to_string()].into_iter().collect();
+    st.save_user(&state_path).unwrap();
+
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    let o = pass();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let st = sesync::state::State::load(&state_path).unwrap();
+    let sync = &st.sources[&key].sync;
+    let pi = sync.get("pi").expect("the written target has a record");
+    assert!(pi.ok_at >= before.floor(), "the pi write is timed: {pi:?}");
+    assert!(pi.problem.is_empty(), "{pi:?}");
+    let oc = sync.get("opencode").expect("the failed target has a record");
+    assert_eq!(oc.ok_at, 0.0, "opencode was never written: {oc:?}");
+    assert!(!oc.problem.is_empty() && oc.problem_at >= before.floor(), "the error and its time are kept: {oc:?}");
+    assert!(!sesync::session_cols::is_transient(&oc.problem), "a missing CLI is a failure, not a busy copy: {oc:?}");
+
+    // Un-choosing the failed target drops its record on the next pass, though the source did
+    // not change: the TUI stops reporting a failure the user no longer asked for.
+    let mut st = sesync::state::State::load(&state_path).unwrap();
+    st.sources.get_mut(&key).unwrap().chosen_targets.remove("opencode");
+    st.save_user(&state_path).unwrap();
+    let o = pass();
+    assert!(o.status.success());
+    assert!(String::from_utf8_lossy(&o.stdout).contains("0 source(s) changed"), "{}", String::from_utf8_lossy(&o.stdout));
+    let st = sesync::state::State::load(&state_path).unwrap();
+    assert!(!st.sources[&key].sync.contains_key("opencode"), "{:?}", st.sources[&key].sync);
+    assert!(st.sources[&key].sync.contains_key("pi"), "the chosen target keeps its record");
+}
+
+/// Copies recorded before the per-target record existed: a file copy is dated once from its own
+/// modified time; an OpenCode copy is not, because its row time is the imported conversation's.
+#[test]
+fn a_pass_dates_an_older_file_copy_from_the_file_and_leaves_an_opencode_copy_undated() {
+    use sesync::state::{Mirror, State};
+    let sb = sandbox("backfill");
+    let src = omp_session(&sb);
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    assert!(run(&sb, &["--once"], &sesync_conv()).status.success());
+    let state_path = sb.join("state").join("state.json");
+    let key = src.display().to_string();
+
+    // The pi copy sits in the session's own bucket and holds what sesync wrote; it is old.
+    let copy = sb.join("pi").join("sessions").join("--tmp-proj--").join("copy.jsonl");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::write(&copy, fs::read(&src).unwrap()).unwrap();
+    let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    fs::File::options().write(true).open(&copy).unwrap().set_modified(written).unwrap();
+    let mut st = State::load(&state_path).unwrap();
+    let s = st.sources.get_mut(&key).expect("the session is recorded");
+    s.chosen_targets = ["opencode".to_string(), "pi".to_string()].into_iter().collect();
+    s.mirrors.insert("pi".into(), Mirror {
+        target: "pi".into(), path: copy.display().to_string(), source_hash: s.last_hash.clone(),
+        installed_hash: sesync::mirror::file_hash(&copy).unwrap(),
+        edit_stamp: sesync::mirror::copy_stamp("pi", &copy), ..Default::default()
+    });
+    s.mirrors.insert("opencode".into(), Mirror {
+        target: "opencode".into(), path: "ses_old".into(), source_hash: s.last_hash.clone(),
+        installed_hash: "fingerprint".into(), target_updated: 1_500_000_000.0, ..Default::default()
+    });
+    st.save(&state_path).unwrap();
+
+    let o = run(&sb, &["--once"], &sesync_conv());
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("0 source(s) changed"),
+        "nothing is rewritten, so the time can only come from the copy: {}", String::from_utf8_lossy(&o.stdout));
+    let st = State::load(&state_path).unwrap();
+    let sync = &st.sources[&key].sync;
+    let pi = sync.get("pi").expect("the file copy is dated");
+    assert!((pi.ok_at - 1_600_000_000.0).abs() < 1.0, "dated from the file, not the pass: {pi:?}");
+    assert!(!sync.contains_key("opencode"), "an OpenCode copy waits for its next write: {sync:?}");
 }

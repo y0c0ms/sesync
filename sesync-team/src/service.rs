@@ -5,8 +5,8 @@
 use crate::backup::{BackupPolicy, Retention};
 use crate::lease::{Lease, LeaseError, LeaseTable};
 use crate::spaces::{Space, SpaceError};
-use crate::totp::{JoinError, JoinGate};
-use std::collections::{BTreeMap, HashMap};
+use crate::totp::{JoinError, JoinGate, MemberAttempts};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServiceError {
@@ -20,6 +20,76 @@ pub enum ServiceError {
     Lease(String),
     Crypto(String),
     Policy(String),
+    /// The request names something the service cannot accept, such as a member name a token
+    /// cannot carry. The message says what to change.
+    Invalid(String),
+    /// The device key was revoked or its join declined: it is refused at every later join.
+    Removed,
+    /// Too many open join requests; the message says which limit.
+    Limit(String),
+}
+
+/// A join waiting for the admin: a device that proved the team code with a key the signed list
+/// does not name. It binds nothing and opens nothing until the admin signs the key into the list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinRequest {
+    pub member: String,
+    pub machine: String,
+    pub entry: Vec<u8>,
+    pub requested_at: u64,
+}
+
+/// What a code-confirmed join led to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// A team without a trust root: the code alone admits (legacy behaviour).
+    Legacy(String),
+    /// The key is in the current signed list and bound to this machine.
+    Listed(String),
+    /// A new key: a join request now waits for the admin. The token opens nothing until then.
+    Pending { token: String, fingerprint: String },
+}
+
+impl Admission {
+    pub fn token(&self) -> &str {
+        match self {
+            Admission::Legacy(t) | Admission::Listed(t) => t,
+            Admission::Pending { token, .. } => token,
+        }
+    }
+}
+
+/// A listed device as the admin sees it: the machine and member bound to the entry, when one is.
+/// The admin's own key, and a listed key no machine has joined with yet, have neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedDevice {
+    pub member: Option<String>,
+    pub machine: Option<String>,
+    pub entry: Vec<u8>,
+}
+
+/// The admin's view of a team: the current signed list, who each listed key belongs to, and the
+/// joins waiting for approval. Admin only; members never see names or requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Roster {
+    pub version: u64,
+    pub signed_list: Vec<u8>,
+    pub listed: Vec<ListedDevice>,
+    pub pending: Vec<JoinRequest>,
+}
+
+/// Member and machine names travel inside a token whose fields are separated by `|`, so a name
+/// holding one would get a token that never authenticates. Empty names and control characters
+/// (a newline would split the line-based credential file) are refused too.
+fn check_name(kind: &str, name: &str) -> Result<(), ServiceError> {
+    if name.is_empty() {
+        return Err(ServiceError::Invalid(format!("the {kind} name is empty")));
+    }
+    if name.contains('|') || name.chars().any(char::is_control) {
+        return Err(ServiceError::Invalid(format!(
+            "the {kind} name '{}' may not contain '|' or control characters", name.escape_debug())));
+    }
+    Ok(())
 }
 
 impl From<LeaseError> for ServiceError {
@@ -58,19 +128,28 @@ pub trait Store {
     fn load_token_key(&self, space: &str) -> Option<[u8; 32]>;
     fn load_owner(&self, space: &str, machine: &str) -> Option<String>;
     fn save_owner(&mut self, space: &str, machine: &str, member: &str);
-    /// When this machine's enrolment was confirmed by the code. Set once; never moved forward.
+    /// When this machine's enrolment was last confirmed by the code: the start of its renewal
+    /// window. Each code-confirmed enrolment moves it to that enrolment; a renewal never does.
     fn load_enrolled_at(&self, space: &str, machine: &str) -> Option<u64>;
     fn save_enrolled_at(&mut self, space: &str, machine: &str, at: u64);
-    /// The device entry (signing and box keys) this machine enrolled with. Set at enrolment;
-    /// the machine's authority comes from the entry being named by the current signed list.
+    /// The device entry (signing and box keys) bound to this machine: set when the machine joins
+    /// with a listed key or the admin approves its request, cleared when the admin signs the key
+    /// out. The machine's authority comes from the entry being named by the current signed list.
     fn load_device(&self, space: &str, machine: &str) -> Option<Vec<u8>>;
     fn save_device(&mut self, space: &str, machine: &str, entry: Vec<u8>);
-    /// Every device entry enrolled for a space, as (machine, entry), sorted by machine. The
-    /// admin reads this to build the next member list.
+    /// Every machine binding of a space, as (machine, entry), sorted by machine.
     fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)>;
-    /// Forget a machine's enrolled device. Its token dies at once (the bound device is gone),
-    /// and the next published list no longer names it.
+    /// Unbind a machine. Its token stops working at once.
     fn remove_device(&mut self, space: &str, machine: &str);
+    /// The open join requests of a space, sorted by machine. One per machine name.
+    fn requests(&self, space: &str) -> Vec<JoinRequest>;
+    /// Record or replace the request for `request.machine`.
+    fn save_request(&mut self, space: &str, request: &JoinRequest);
+    fn remove_request(&mut self, space: &str, machine: &str);
+    /// Whether a device entry was revoked or declined in this space.
+    fn is_tombstoned(&self, space: &str, entry: &[u8]) -> bool;
+    fn save_tombstone(&mut self, space: &str, entry: &[u8]);
+    fn remove_tombstone(&mut self, space: &str, entry: &[u8]);
 }
 
 #[derive(Default)]
@@ -84,6 +163,8 @@ pub struct MemoryStore {
     admin_keys: HashMap<String, Vec<u8>>,
     enrolled_at: HashMap<(String, String), u64>,
     devices: HashMap<(String, String), Vec<u8>>,
+    requests: HashMap<(String, String), JoinRequest>,
+    tombstones: HashSet<(String, Vec<u8>)>,
 }
 
 impl Store for MemoryStore {
@@ -125,7 +206,7 @@ impl Store for MemoryStore {
         self.enrolled_at.get(&(space.to_string(), machine.to_string())).copied()
     }
     fn save_enrolled_at(&mut self, space: &str, machine: &str, at: u64) {
-        self.enrolled_at.entry((space.to_string(), machine.to_string())).or_insert(at);
+        self.enrolled_at.insert((space.to_string(), machine.to_string()), at);
     }
     fn save_owner(&mut self, space: &str, machine: &str, member: &str) {
         self.owners.insert((space.to_string(), machine.to_string()), member.to_string());
@@ -147,6 +228,29 @@ impl Store for MemoryStore {
     fn remove_device(&mut self, space: &str, machine: &str) {
         self.devices.remove(&(space.to_string(), machine.to_string()));
     }
+    fn requests(&self, space: &str) -> Vec<JoinRequest> {
+        let mut out: Vec<JoinRequest> = self.requests.iter()
+            .filter(|((s, _), _)| s == space)
+            .map(|(_, r)| r.clone())
+            .collect();
+        out.sort_by(|a, b| a.machine.cmp(&b.machine));
+        out
+    }
+    fn save_request(&mut self, space: &str, request: &JoinRequest) {
+        self.requests.insert((space.to_string(), request.machine.clone()), request.clone());
+    }
+    fn remove_request(&mut self, space: &str, machine: &str) {
+        self.requests.remove(&(space.to_string(), machine.to_string()));
+    }
+    fn is_tombstoned(&self, space: &str, entry: &[u8]) -> bool {
+        self.tombstones.contains(&(space.to_string(), entry.to_vec()))
+    }
+    fn save_tombstone(&mut self, space: &str, entry: &[u8]) {
+        self.tombstones.insert((space.to_string(), entry.to_vec()));
+    }
+    fn remove_tombstone(&mut self, space: &str, entry: &[u8]) {
+        self.tombstones.remove(&(space.to_string(), entry.to_vec()));
+    }
     fn save_backup(&mut self, space: &str, policy: BackupPolicy) {
         self.backups.insert(space.to_string(), policy);
     }
@@ -159,21 +263,46 @@ pub const TOKEN_LIFETIME_SECS: u64 = 24 * 60 * 60;
 /// authenticator code is required again.
 pub const RENEW_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// A join request the admin has not answered expires after this long: 7 days, the same span as
+/// the renewal window the request's token starts.
+pub const REQUEST_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Open join requests one member may have at a time.
+pub const MAX_REQUESTS_PER_MEMBER: usize = 3;
+
+/// Open join requests one team may have at a time.
+pub const MAX_REQUESTS_PER_TEAM: usize = 20;
+
+/// The refusal for a new key under a machine name a listed device already holds. The real device
+/// keeps working; the admin revokes it first if the machine really has a new key.
+const MACHINE_TAKEN: &str = "machine name already in the team";
+
 pub struct Service<S: Store> {
     store: S,
     /// Leases are in-memory by design: they are short-lived and a restart ends them safely
     /// (every holder must re-acquire, which the fencing version then enforces).
     leases: LeaseTable,
+    /// Wrong join codes per (space, member), across machine names. In memory like the leases:
+    /// the per-machine gate is the stored one, this only stops guessing under fresh machine names.
+    attempts: HashMap<(String, String), MemberAttempts>,
 }
 
 impl<S: Store> Service<S> {
     pub fn new(store: S) -> Self {
-        Service { store, leases: LeaseTable::default() }
+        Service { store, leases: LeaseTable::default(), attempts: HashMap::new() }
     }
 
     /// Create a space. Refused if it already exists: replacing one would replace its secret and
-    /// content keys, which would lock every member out of their data.
+    /// content keys, which would lock every member out of their data. The name may hold any
+    /// printable character (clients encode it where it becomes a URI or a file name), but not a
+    /// control character, and member names must be names a token can carry.
     pub fn create_space(&mut self, name: &str, members: &[&str]) -> Result<(), ServiceError> {
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(ServiceError::Invalid("the team name is empty or holds a control character".into()));
+        }
+        for m in members {
+            check_name("member", m)?;
+        }
         if self.store.load_space(name).is_some() {
             return Err(ServiceError::Conflict(format!("team '{name}' already exists")));
         }
@@ -191,6 +320,7 @@ impl<S: Store> Service<S> {
 
     /// Add a member to an existing space. Inviting someone already in it does nothing.
     pub fn invite(&mut self, space: &str, who: &str) -> Result<(), ServiceError> {
+        check_name("member", who)?;
         let mut s = self.store.load_space(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
         s.add_member(who);
         self.store.save_space(s);
@@ -218,28 +348,152 @@ impl<S: Store> Service<S> {
         s.seal_for_member_check(who).map_err(|_| ServiceError::NotMember(who.into()))
     }
 
-    /// A machine joins a space with the authenticator code for `now`.
-    pub fn join(&mut self, space: &str, who: &str, machine: &str, code: &str, now: u64) -> Result<(), ServiceError> {
-        self.check_store()?;
-        self.member(space, who)?;
+    /// Check the authenticator code a machine sends for `now`. Refused while the member is locked
+    /// out by wrong codes from any machine, as well as while this machine's gate is locked.
+    /// Records nothing about the machine: what a confirmed code leads to is `enrol`'s decision.
+    fn check_code(&mut self, space: &str, who: &str, machine: &str, code: &str, now: u64) -> Result<(), ServiceError> {
         let secret = self.space_secret(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
-        // Remember which member this machine joined as. Stored, so it survives a restart.
-        self.store.save_owner(space, machine, who);
+        let key = (space.to_string(), who.to_string());
+        if let Some(a) = self.attempts.get(&key) {
+            a.check(now)?;
+        }
         let mut gate = self.store.load_gate(space, machine).unwrap_or_else(|| JoinGate::new(secret.clone()));
         let r = gate.verify(code, now);
         self.store.save_gate(space, machine, gate);
+        match &r {
+            Ok(()) => { self.attempts.remove(&key); }
+            Err(JoinError::Wrong) => self.attempts.entry(key).or_default().wrong(now),
+            Err(_) => {}
+        }
         r.map_err(ServiceError::from)
     }
 
-    /// Enrol a machine: confirm the authenticator code, then issue a token bound to that
-    /// machine. The token is the only credential the HTTP layer accepts for later calls.
-    pub fn enrol(&mut self, space: &str, who: &str, machine: &str, code: &str, now: u64)
-        -> Result<String, ServiceError>
+    /// A machine joins with the authenticator code and, once the team has a trust root, its device
+    /// entry. The code proves only that someone was given the authenticator. What it leads to:
+    ///
+    /// - no trust root (a legacy team): the code alone admits, as it always did;
+    /// - a revoked or declined key: refused (`Removed`), no token;
+    /// - a key in the current list: re-authentication if it is bound to this machine for this
+    ///   member, or bound now if no machine holds it yet; refused if another machine holds it;
+    /// - a new key: refused if the machine name is bound to a listed key (a listed machine's key is
+    ///   never replaced through a join), otherwise a join request waits for the admin and the
+    ///   token opens nothing until the admin signs the key into the list.
+    ///
+    /// Nothing about the machine is stored before the code is confirmed.
+    pub fn enrol(&mut self, space: &str, who: &str, machine: &str, code: &str, device: Option<&[u8]>, now: u64)
+        -> Result<Admission, ServiceError>
     {
-        self.join(space, who, machine, code, now)?;
-        self.store.save_enrolled_at(space, machine, now);
+        self.check_store()?;
+        check_name("machine", machine)?;
+        self.member(space, who)?;
+        let root = self.current_list(space)?;
+        if root.is_some() && device.is_none() {
+            return Err(ServiceError::Invalid("this team needs the device key; upgrade the client".into()));
+        }
+        self.check_code(space, who, machine, code, now)?;
         let key = self.store.load_token_key(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
-        Ok(crate::auth::issue_token(&key, who, machine, now + TOKEN_LIFETIME_SECS))
+        let token = crate::auth::issue_token(&key, who, machine, now + TOKEN_LIFETIME_SECS);
+        let Some(list) = root else {
+            self.store.save_owner(space, machine, who);
+            if let Some(entry) = device {
+                self.store.save_device(space, machine, entry.to_vec());
+            }
+            self.store.save_enrolled_at(space, machine, now);
+            return Ok(Admission::Legacy(token));
+        };
+        let entry = device.unwrap_or_default();
+        self.settle(space, &list, now);
+        if self.store.is_tombstoned(space, entry) {
+            return Err(ServiceError::Removed);
+        }
+        // After `settle`, every binding names a listed key.
+        let bindings = self.store.devices(space);
+        let machine_bound = bindings.iter().any(|(m, _)| m == machine);
+        if list.list.devices.iter().any(|e| e.as_slice() == entry) {
+            match bindings.iter().find(|(_, e)| e.as_slice() == entry) {
+                Some((m, _)) if m == machine => {
+                    if self.store.load_owner(space, machine).as_deref() != Some(who) {
+                        return Err(ServiceError::Conflict("this device is in the team under another member".into()));
+                    }
+                }
+                Some(_) => {
+                    return Err(ServiceError::Conflict("this device key is already in the team under another machine name".into()));
+                }
+                None if machine_bound => {
+                    return Err(ServiceError::Conflict(MACHINE_TAKEN.into()));
+                }
+                None => {
+                    // A listed key no machine holds yet (the admin listed it directly): bind it.
+                    self.store.save_device(space, machine, entry.to_vec());
+                    self.store.save_owner(space, machine, who);
+                    self.store.remove_request(space, machine);
+                }
+            }
+            self.store.save_enrolled_at(space, machine, now);
+            return Ok(Admission::Listed(token));
+        }
+        if machine_bound {
+            return Err(ServiceError::Conflict(MACHINE_TAKEN.into()));
+        }
+        let requests = self.store.requests(space);
+        if requests.iter().any(|r| r.machine != machine && r.entry.as_slice() == entry) {
+            return Err(ServiceError::Conflict("this device key already has a join request under another machine name".into()));
+        }
+        match requests.iter().find(|r| r.machine == machine) {
+            Some(r) if r.member != who => {
+                return Err(ServiceError::Conflict("this machine name already has a join request from another member".into()));
+            }
+            Some(_) => {}
+            None => {
+                if requests.iter().filter(|r| r.member == who).count() >= MAX_REQUESTS_PER_MEMBER {
+                    return Err(ServiceError::Limit(format!(
+                        "this member already has {MAX_REQUESTS_PER_MEMBER} join requests waiting; ask the admin to approve or decline them")));
+                }
+                if requests.len() >= MAX_REQUESTS_PER_TEAM {
+                    return Err(ServiceError::Limit(format!(
+                        "this team already has {MAX_REQUESTS_PER_TEAM} join requests waiting; ask the admin to approve or decline them")));
+                }
+            }
+        }
+        self.store.save_request(space, &JoinRequest {
+            member: who.to_string(), machine: machine.to_string(), entry: entry.to_vec(), requested_at: now,
+        });
+        self.store.save_enrolled_at(space, machine, now);
+        Ok(Admission::Pending { token, fingerprint: crate::membership::fingerprint(entry) })
+    }
+
+    /// The space's current signed list, parsed. None for a team without a trust root.
+    fn current_list(&self, space: &str) -> Result<Option<crate::membership::SignedList>, ServiceError> {
+        match self.store.load_trust_list(space) {
+            None => Ok(None),
+            Some(bytes) => crate::membership::SignedList::from_bytes(&bytes)
+                .map(Some)
+                .map_err(|_| ServiceError::Crypto("trust root unreadable".into())),
+        }
+    }
+
+    /// Bring a space's membership records in line with `list` before acting on them: requests
+    /// past REQUEST_TTL_SECS are dropped, and a binding whose key the list does not name (left by
+    /// the enrolment rules before join requests existed) becomes a join request for the admin to
+    /// approve or decline. It is never tombstoned: nobody revoked it. Idempotent.
+    fn settle(&mut self, space: &str, list: &crate::membership::SignedList, now: u64) {
+        for r in self.store.requests(space) {
+            if now >= r.requested_at.saturating_add(REQUEST_TTL_SECS) {
+                self.store.remove_request(space, &r.machine);
+            }
+        }
+        for (machine, entry) in self.store.devices(space) {
+            if list.list.devices.contains(&entry) {
+                continue;
+            }
+            self.store.remove_device(space, &machine);
+            let owner = self.store.load_owner(space, &machine);
+            if let Some(member) = owner {
+                if !self.store.is_tombstoned(space, &entry) {
+                    self.store.save_request(space, &JoinRequest { member, machine, entry, requested_at: now });
+                }
+            }
+        }
     }
 
     /// Renew a member token without the code. Allowed only if the token is valid for this
@@ -272,22 +526,38 @@ impl<S: Store> Service<S> {
         Ok(member)
     }
 
-    /// Record the device entry a machine enrolled with. The entry is a claimed public key: it
-    /// carries no authority until the admin's signed list names it.
-    pub fn bind_device(&mut self, space: &str, machine: &str, entry: Vec<u8>) {
-        self.store.save_device(space, machine, entry);
+    /// The admin's view of a team: the current signed list, the member and machine bound to each
+    /// listed key, and the open join requests. Refused for a team without a trust root.
+    pub fn roster(&mut self, space: &str, now: u64) -> Result<Roster, ServiceError> {
+        self.check_store()?;
+        self.store.load_space(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
+        let bytes = self.store.load_trust_list(space)
+            .ok_or_else(|| ServiceError::Invalid("this team has no admin-signed list".into()))?;
+        let list = crate::membership::SignedList::from_bytes(&bytes)
+            .map_err(|_| ServiceError::Crypto("trust root unreadable".into()))?;
+        self.settle(space, &list, now);
+        let bindings = self.store.devices(space);
+        let listed = list.list.devices.iter().map(|entry| {
+            let machine = bindings.iter().find(|(_, e)| e == entry).map(|(m, _)| m.clone());
+            let member = machine.as_deref().and_then(|m| self.store.load_owner(space, m));
+            ListedDevice { member, machine, entry: entry.clone() }
+        }).collect();
+        Ok(Roster { version: list.list.version, signed_list: bytes, listed, pending: self.store.requests(space) })
     }
 
-    /// Every device entry enrolled for a space, sorted by machine. The admin reads this to build
-    /// the next signed list; the server never invents entries of its own.
-    pub fn devices(&self, space: &str) -> Vec<(String, Vec<u8>)> {
-        self.store.devices(space)
-    }
-
-    /// Forget a machine's enrolled device. Live access ends at once, and the next published
-    /// list no longer names it: forget, then publish, is how a device is revoked.
-    pub fn forget_device(&mut self, space: &str, machine: &str) {
-        self.store.remove_device(space, machine);
+    /// Decline a join request: its key is tombstoned, so it is refused at every later join, and
+    /// the request is dropped. NoSpace when no such request is open, so a typo never reads as done.
+    pub fn decline(&mut self, space: &str, member: &str, machine: &str, now: u64) -> Result<(), ServiceError> {
+        self.check_store()?;
+        if let Some(list) = self.current_list(space)? {
+            self.settle(space, &list, now);
+        }
+        let request = self.store.requests(space).into_iter()
+            .find(|r| r.machine == machine && r.member == member)
+            .ok_or_else(|| ServiceError::NoSpace(format!("{space}/{member}/{machine}")))?;
+        self.store.save_tombstone(space, &request.entry);
+        self.store.remove_request(space, machine);
+        Ok(())
     }
 
     /// When the team has a trust root, the machine's bound device must be in the current list.
@@ -361,7 +631,7 @@ impl<S: Store> Service<S> {
     }
 
     /// The pinned admin public key for a space, if one was set.
-    pub fn load_admin_key_for_test(&self, space: &str) -> Option<Vec<u8>> {
+    pub fn admin_key(&self, space: &str) -> Option<Vec<u8>> {
         self.store.load_admin_key(space)
     }
 
@@ -379,7 +649,15 @@ impl<S: Store> Service<S> {
     /// Publish a newer admin-signed member list. The list must be signed by the pinned admin key
     /// and its version must be strictly newer than the stored one, so revocation is monotone:
     /// an older or equal list can never be replayed over a newer one. Returns the new version.
-    pub fn publish_trust_list(&mut self, space: &str, bytes: &[u8]) -> Result<u64, ServiceError> {
+    ///
+    /// The list is the roster, so storing it applies the admin's decisions: a key the previous
+    /// list named and this one does not is tombstoned and its machine unbound (its token stops at
+    /// once and the key never joins again); a new key that answers a join request binds that
+    /// request's machine to its member. `removed_members` leave the member set, so the code alone
+    /// no longer lets them join, until the admin invites them again.
+    pub fn publish_trust_list(&mut self, space: &str, bytes: &[u8], removed_members: &[String], now: u64)
+        -> Result<u64, ServiceError>
+    {
         self.check_store()?;
         let admin = self.store.load_admin_key(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
         let signed = crate::membership::SignedList::from_bytes(bytes)
@@ -387,15 +665,61 @@ impl<S: Store> Service<S> {
         let mut verifier = crate::membership::Verifier::new(admin);
         verifier.accept(&signed)
             .map_err(|_| ServiceError::Crypto("signed list is not signed by the admin key".into()))?;
-        if let Some(current) = self.store.load_trust_list(space) {
-            let have = crate::membership::SignedList::from_bytes(&current).map(|l| l.list.version).unwrap_or(0);
-            if signed.list.version <= have {
+        let previous = self.current_list(space)?;
+        if let Some(prev) = &previous {
+            if signed.list.version <= prev.list.version {
                 return Err(ServiceError::Conflict(format!(
-                    "list version {} is not newer than the stored {have}", signed.list.version)));
+                    "list version {} is not newer than the stored {}", signed.list.version, prev.list.version)));
             }
+        }
+        let mut space_record = self.store.load_space(space).ok_or_else(|| ServiceError::NoSpace(space.into()))?;
+        for m in removed_members {
+            if space_record.seal_for_member_check(m).is_err() {
+                return Err(ServiceError::Invalid(format!("'{m}' is not a member of this team")));
+            }
+        }
+        if let Some(prev) = &previous {
+            self.settle(space, prev, now);
         }
         let version = signed.list.version;
         self.store.save_trust_list(space, bytes.to_vec());
+        let before: Vec<Vec<u8>> = previous.map(|p| p.list.devices).unwrap_or_default();
+        let after = &signed.list.devices;
+        for gone in before.iter().filter(|e| !after.contains(e)) {
+            self.store.save_tombstone(space, gone);
+            for (machine, entry) in self.store.devices(space) {
+                if &entry == gone {
+                    self.store.remove_device(space, &machine);
+                }
+            }
+        }
+        for added in after.iter().filter(|e| !before.contains(e)) {
+            // Signing a key back in is an explicit admin decision: it lifts the tombstone.
+            self.store.remove_tombstone(space, added);
+            for r in self.store.requests(space) {
+                if &r.entry == added {
+                    self.store.save_device(space, &r.machine, r.entry.clone());
+                    self.store.save_owner(space, &r.machine, &r.member);
+                    self.store.remove_request(space, &r.machine);
+                }
+            }
+        }
+        if !removed_members.is_empty() {
+            for m in removed_members {
+                space_record.remove_member(m)?;
+            }
+            self.store.save_space(space_record);
+            for r in self.store.requests(space) {
+                if removed_members.contains(&r.member) {
+                    self.store.remove_request(space, &r.machine);
+                }
+            }
+            for (machine, _) in self.store.devices(space) {
+                if self.store.load_owner(space, &machine).map_or(false, |o| removed_members.contains(&o)) {
+                    self.store.remove_device(space, &machine);
+                }
+            }
+        }
         Ok(version)
     }
 

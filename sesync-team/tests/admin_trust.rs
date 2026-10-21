@@ -41,7 +41,7 @@ async fn creating_a_team_pins_the_admin_and_stores_a_signed_list() {
     })).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     let svc = state.service.lock().unwrap();
-    assert_eq!(svc.load_admin_key_for_test("personal").unwrap(), admin.public_key(), "the admin key is pinned");
+    assert_eq!(svc.admin_key("personal").unwrap(), admin.public_key(), "the admin key is pinned");
     let list = svc.load_trust_list_for_test("personal").expect("a signed list is stored");
     assert!(sesync_team::membership::SignedList::from_bytes(&list).is_ok());
 }

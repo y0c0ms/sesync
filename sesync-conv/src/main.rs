@@ -5,6 +5,7 @@
 //!   to-omp     journal -> omp journal  (projection: add title slot, new id)
 //!   to-opencode journal -> OpenCode import bundle (JSON on stdout or --out)
 //!   to-claude  journal -> Claude transcript lines (--out file)
+//!   to-antigravity journal -> Antigravity CLI conversation DB (+ title annotation)
 //! `inspect` prints what the reader sees, for differential tests.
 //!
 //! All ids are deterministic from --id (or the source id), so re-running
@@ -12,12 +13,14 @@
 //! re-import but ignores existing message ids, so replacing an imported mirror
 //! means delete-then-import under the same deterministic id.
 
+mod antigravity;
 mod claude;
+mod from_antigravity;
 mod from_claude;
-mod from_gemini;
 mod from_opencode;
 mod prior_reasoning;
-mod to_gemini;
+mod protobuf;
+mod to_antigravity;
 mod journal;
 mod opencode;
 
@@ -68,11 +71,13 @@ fn usage() -> ! {
          sesync-conv to-opencode <journal> [--out bundle.json] --id SES_ID --title T [--cli-version V] [--no-thinking]\n\
          sesync-conv from-claude <transcript.jsonl> --out <journal.jsonl>\n\
          sesync-conv from-opencode <export.json> --out <journal.jsonl>\n\
-         sesync-conv from-gemini <session.jsonl> --out <journal.jsonl>\n\
-         sesync-conv to-gemini <journal.jsonl> --gemini-dir <~/.gemini> [--project <abs path>] [--slug <slug>] [--id UUID]\n\
+         sesync-conv to-antigravity <journal.jsonl> --store <~/.gemini/antigravity-cli> --id <conversation id> [--title T]\n\
+         sesync-conv from-antigravity <conversation.db> --out <journal.jsonl>\n\
+         sesync-conv antigravity-retitle --store <~/.gemini/antigravity-cli> --id <conversation id> --title T\n\
+           (exit 2: a summary cache is locked by a running agy; the annotations title is written)\n\
          sesync-conv to-claude <journal> --out-dir <~/.claude/projects> [--id UUID] [--title T] [--cli-version V]\n\
          sesync-conv ids <seed>            (prints the deterministic opencode and claude ids)\n\
-         Output path is printed on stdout for to-pi/to-omp/to-claude/to-gemini."
+         Output path is printed on stdout for to-pi/to-omp/to-claude/to-antigravity/from-*."
     );
     process::exit(1)
 }
@@ -152,23 +157,6 @@ fn main() {
                     Ok(())
                 })
         }
-        "from-gemini" => {
-            let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
-            let out = arg(&args, "--out").unwrap_or_else(|| usage());
-            fs::read_to_string(&p)
-                .map_err(|e| format!("{}: {e}", p.display()))
-                .and_then(|raw| from_gemini::to_journal_lines(&raw))
-                .and_then(|(lines, stats)| {
-                    let mut text = lines.join("\n");
-                    text.push('\n');
-                    fs::write(&out, text).map_err(|e| format!("{out}: {e}"))?;
-                    eprintln!("from-gemini: {} message(s), {} text part(s), {} tool call(s) / {} result(s), skipped {} thought / {} ui / {} bad line(s)",
-                        stats.messages, stats.text_parts, stats.tool_calls, stats.tool_results,
-                        stats.skipped_thoughts, stats.skipped_ui_messages, stats.bad_lines);
-                    println!("{out}");
-                    Ok(())
-                })
-        }
         "from-opencode" => {
             let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
             let out = arg(&args, "--out").unwrap_or_else(|| usage());
@@ -186,68 +174,49 @@ fn main() {
                     Ok(())
                 })
         }
-        "to-gemini" => (|| -> Result<(), String> {
-            // to-gemini <journal.jsonl> --gemini-dir <~/.gemini> [--project <abs path>] [--slug <slug>] [--id UUID]
+        "to-antigravity" => (|| -> Result<(), String> {
             let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
-            let gdir = PathBuf::from(arg(&args, "--gemini-dir").unwrap_or_else(|| usage()));
-            let j = journal::Journal::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let header_id = j.session_id().unwrap_or("").to_string();
-            let start = j.timestamp().unwrap_or("").to_string();
-            let cwd = j.cwd().unwrap_or("").to_string();
-            // The live window, not the whole journal: the archived turns are already summarised
-            // by the compaction, and exporting them inflated a mirror far past the model's
-            // window. The summary itself is carried as the first message, since Gemini has no
-            // compaction of its own to replace them.
-            let mut records: Vec<Value> = j.live_records().into_iter().cloned().map(Value::Object).collect();
-            if let Some(note) = j.compaction_note() {
-                records.insert(
-                    0,
-                    serde_json::json!({
-                        "type": "message",
-                        "id": "compaction-summary",
-                        "timestamp": start,
-                        "message": {"role": "user", "content": [{"type": "text", "text": note}]},
-                    }),
-                );
+            let store = PathBuf::from(arg(&args, "--store").unwrap_or_else(|| usage()));
+            let id = arg(&args, "--id").unwrap_or_else(|| usage());
+            let (j, _) = read_with_blobs(&p)?;
+            let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
+            let (db, s, notes) = to_antigravity::install(&j, &store, &id, &title)?;
+            for n in notes {
+                eprintln!("to-antigravity: {n}");
             }
-            // The journal's own directory is the project; --project overrides for callers
-            // that know better. Normalized, so the registry key and the header hash match
-            // the path Gemini itself would resolve a cwd to.
-            let project = to_gemini::normalize_root(&arg(&args, "--project").unwrap_or(cwd));
-            if project.is_empty() {
-                return Err("to-gemini needs --project or a journal whose header carries cwd".into());
-            }
-            // The slug must be Gemini's own for this project, or native sessions of the
-            // project would vanish from `--list-sessions` under a second folder.
-            let slug = arg(&args, "--slug").unwrap_or_else(|| to_gemini::resolve_slug(&gdir, &project));
-            let sid = arg(&args, "--id").unwrap_or(header_id);
-            let (lines, stats) = to_gemini::to_session_lines(&sid, &project, &start, &records)?;
-            let short: String = sid.chars().take(8).collect();
-            let stamp: String = start.chars().take(16).collect::<String>().replace(':', "-");
-            let dir = gdir.join("tmp").join(&slug).join("chats");
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let dst = dir.join(format!("session-{stamp}-{short}.jsonl"));
-            // One conversation keeps one file: drop older files for the same mirror id,
-            // whatever their timestamp prefix, exactly as the journal installers do.
-            if let Ok(rd) = fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    if e.path() == dst { continue; }
-                    if e.file_name().to_string_lossy().ends_with(&format!("-{short}.jsonl")) {
-                        let _ = fs::remove_file(e.path());
-                    }
-                }
-            }
-            let tmp = dst.with_extension("jsonl.tmp");
-            let mut text = lines.join("\n");
-            text.push('\n');
-            fs::write(&tmp, text).map_err(|e| e.to_string())?;
-            fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
-            to_gemini::register_project(&gdir, &project, &slug)?;
-            eprintln!("to-gemini: {} message(s), {} tool call(s), {} tool result(s), {} image(s), dropped {}",
-                stats.messages, stats.tool_calls, stats.tool_results, stats.images, stats.dropped_blocks);
-            println!("{}", dst.display());
+            eprintln!("to-antigravity: {} user / {} assistant step(s), {} tool call(s) / {} result(s), {} image(s), {} thinking, {} generated call id(s); dropped {} tool-result image(s) / {} orphan / {} duplicate result(s) / {} block(s) / {} message(s)",
+                s.user_steps, s.planner_steps, s.tool_calls, s.tool_results, s.images, s.thinking_blocks, s.generated_call_ids,
+                s.tool_result_images_dropped, s.orphan_tool_results, s.duplicate_tool_results, s.dropped_blocks, s.skipped_messages);
+            println!("{}", db.display());
             Ok(())
         })(),
+        "from-antigravity" => (|| -> Result<(), String> {
+            let p = PathBuf::from(args.get(1).unwrap_or_else(|| usage()));
+            let out = PathBuf::from(arg(&args, "--out").unwrap_or_else(|| usage()));
+            let (lines, s) = from_antigravity::to_journal_lines(&p)?;
+            write_lines(&out, lines.into_iter())?;
+            eprintln!("from-antigravity: {} message(s) ({} user / {} assistant), {} tool call(s) / {} result(s), {} thinking, {} image(s); missing {} image(s), {} unlinked result(s), {} opaque step(s), skipped {} system / {} empty step(s) / {} bad payload(s)",
+                s.messages, s.user_messages, s.assistant_messages, s.tool_calls, s.tool_results, s.thinking_blocks, s.images,
+                s.missing_images, s.unlinked_tool_results, s.opaque_steps, s.skipped_system_steps, s.skipped_empty_steps, s.bad_payloads);
+            println!("{}", out.display());
+            Ok(())
+        })(),
+        "antigravity-retitle" => {
+            let store = PathBuf::from(arg(&args, "--store").unwrap_or_else(|| usage()));
+            let id = arg(&args, "--id").unwrap_or_else(|| usage());
+            let title = arg(&args, "--title").unwrap_or_else(|| usage());
+            match to_antigravity::retitle(&store, &id, &title) {
+                Ok(()) => Ok(()),
+                Err(to_antigravity::RetitleError::Other(e)) => Err(e),
+                Err(to_antigravity::RetitleError::Locked(notes)) => {
+                    for n in notes {
+                        eprintln!("sesync_conv: {n}");
+                    }
+                    eprintln!("sesync_conv: title written to annotations; agy shows it once the cache is free (rerun when no agy is running)");
+                    process::exit(2);
+                }
+            }
+        }
         "ids" => {
             let seed = args.get(1).unwrap_or_else(|| usage());
             println!("opencode {}\nclaude {}", opencode::session_id_for(seed), claude::session_id_for(seed));
@@ -272,7 +241,7 @@ fn main() {
                     (journal::pi_bucket(&cwd), None)
                 } else {
                     let home = arg(&args, "--home").or_else(|| env::var("USERPROFILE").ok()).unwrap_or_else(|| usage());
-                    (journal::omp_bucket(&cwd, &home), Some(Journal::title_slot_line(&title, &ts)))
+                    (journal::omp_bucket(&cwd, &home, &journal::node_tmpdir()), Some(Journal::title_slot_line(&title, &ts)))
                 };
                 if cmd == "to-pi" {
                     // Pi has no title slot: the picker shows the last `session_info.name`.

@@ -2307,6 +2307,7 @@ dependencies = [
 name = "sesync"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "crossterm",
  "crypto_box",
  "postgres",
@@ -2319,6 +2320,8 @@ dependencies = [
  "serde_json",
  "sesync-team",
  "sha2 0.10.9",
+ "tokio",
+ "unicode-width",
  "ureq",
  "uuid",
  "zstd",

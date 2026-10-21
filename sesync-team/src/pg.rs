@@ -4,7 +4,7 @@
 //! from the database without the master key.
 
 use crate::backup::BackupPolicy;
-use crate::service::Store;
+use crate::service::{JoinRequest, Store};
 use crate::spaces::Space;
 use crate::totp::JoinGate;
 use postgres::{Client, NoTls};
@@ -72,29 +72,27 @@ impl PgStore {
              CREATE TABLE IF NOT EXISTS trust (space TEXT PRIMARY KEY, signed_list BYTEA NOT NULL);
              CREATE TABLE IF NOT EXISTS admin_keys (space TEXT PRIMARY KEY, admin BYTEA NOT NULL);
              CREATE TABLE IF NOT EXISTS devices (space TEXT NOT NULL, machine TEXT NOT NULL, entry BYTEA NOT NULL,
-                 PRIMARY KEY (space, machine));",
+                 PRIMARY KEY (space, machine));
+             CREATE TABLE IF NOT EXISTS requests (space TEXT NOT NULL, machine TEXT NOT NULL, member TEXT NOT NULL,
+                 entry BYTEA NOT NULL, requested_at BIGINT NOT NULL, PRIMARY KEY (space, machine));
+             CREATE TABLE IF NOT EXISTS tombstones (space TEXT NOT NULL, entry BYTEA NOT NULL,
+                 PRIMARY KEY (space, entry));",
         ).map_err(|e| match e.as_db_error() {
             Some(db) => format!("{}: {}", db.code().code(), db.message()),
             None => e.to_string(),
         })
     }
 
-    /// Create the tables. For tests and first start; migrations come later.
+    /// Drop every table and create the current schema. For tests only.
     pub fn reset(&self) -> Result<(), String> {
         self.client.borrow_mut().batch_execute(
-            "DROP TABLE IF EXISTS records, spaces, gates, backups, owners;
-             CREATE TABLE spaces (name TEXT PRIMARY KEY, wrapped BYTEA NOT NULL);
-             CREATE TABLE records (space TEXT NOT NULL, conversation TEXT NOT NULL,
-                 sealed BYTEA NOT NULL, PRIMARY KEY (space, conversation));
-             CREATE TABLE gates (space TEXT NOT NULL, machine TEXT NOT NULL, state BYTEA NOT NULL,
-                 PRIMARY KEY (space, machine));
-             CREATE TABLE backups (space TEXT PRIMARY KEY, policy TEXT NOT NULL);
-             CREATE TABLE owners (space TEXT NOT NULL, machine TEXT NOT NULL, member TEXT NOT NULL,
-                 PRIMARY KEY (space, machine));",
+            "DROP TABLE IF EXISTS records, spaces, gates, backups, owners, enrolled, trust, admin_keys,
+                 devices, requests, tombstones;",
         ).map_err(|e| match e.as_db_error() {
             Some(db) => format!("{}: {}", db.code().code(), db.message()),
             None => e.to_string(),
-        })
+        })?;
+        self.migrate()
     }
 
     fn one_bytes(&self, sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]) -> Option<Vec<u8>> {
@@ -223,10 +221,10 @@ impl Store for PgStore {
 
     fn save_enrolled_at(&mut self, space: &str, machine: &str, at: u64) {
         self.ensure_connected();
-        // The first confirmed enrolment sets the start of the renewal window; later ones keep it.
+        // Every code-confirmed enrolment starts a new renewal window; renewals never call this.
         let _ = self.client.borrow_mut().execute(
             "INSERT INTO enrolled (space, machine, at) VALUES ($1, $2, $3)
-             ON CONFLICT (space, machine) DO NOTHING",
+             ON CONFLICT (space, machine) DO UPDATE SET at = EXCLUDED.at",
             &[&space, &machine, &(at as i64)]);
     }
 
@@ -263,6 +261,48 @@ impl Store for PgStore {
         self.ensure_connected();
         let _ = self.client.borrow_mut().execute(
             "DELETE FROM devices WHERE space = $1 AND machine = $2", &[&space, &machine]);
+    }
+    fn requests(&self, space: &str) -> Vec<JoinRequest> {
+        self.ensure_connected();
+        let rows = self.client.borrow_mut()
+            .query("SELECT member, machine, entry, requested_at FROM requests WHERE space = $1 ORDER BY machine", &[&space])
+            .unwrap_or_default();
+        rows.iter().map(|r| JoinRequest {
+            member: r.get::<_, String>(0),
+            machine: r.get::<_, String>(1),
+            entry: r.get::<_, Vec<u8>>(2),
+            requested_at: r.get::<_, i64>(3) as u64,
+        }).collect()
+    }
+    fn save_request(&mut self, space: &str, request: &JoinRequest) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "INSERT INTO requests (space, machine, member, entry, requested_at) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (space, machine) DO UPDATE SET member = EXCLUDED.member, entry = EXCLUDED.entry,
+                 requested_at = EXCLUDED.requested_at",
+            &[&space, &request.machine, &request.member, &request.entry, &(request.requested_at as i64)]);
+    }
+    fn remove_request(&mut self, space: &str, machine: &str) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "DELETE FROM requests WHERE space = $1 AND machine = $2", &[&space, &machine]);
+    }
+    fn is_tombstoned(&self, space: &str, entry: &[u8]) -> bool {
+        self.ensure_connected();
+        self.client.borrow_mut()
+            .query_opt("SELECT 1 FROM tombstones WHERE space = $1 AND entry = $2", &[&space, &entry])
+            .ok().flatten().is_some()
+    }
+    fn save_tombstone(&mut self, space: &str, entry: &[u8]) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "INSERT INTO tombstones (space, entry) VALUES ($1, $2) ON CONFLICT (space, entry) DO NOTHING",
+            &[&space, &entry]);
+    }
+    fn remove_tombstone(&mut self, space: &str, entry: &[u8]) {
+        self.ensure_connected();
+        let _ = self.client.borrow_mut().execute(
+            "DELETE FROM tombstones WHERE space = $1 AND entry = $2", &[&space, &entry]);
     }
 
     fn load_token_key(&self, space: &str) -> Option<[u8; 32]> {

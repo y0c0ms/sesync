@@ -18,12 +18,7 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &PathBuf) -> Roots {
-    Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    }
+    Roots::under(&sb, sb.join("no-sesync-conv"))
 }
 
 #[test]
@@ -46,7 +41,7 @@ fn control_characters_are_refused() {
 fn a_path_outside_the_roots_is_refused() {
     let sb = sandbox("outside");
     let r = roots(&sb);
-    fs::create_dir_all(&r.pi).unwrap();
+    fs::create_dir_all(&r.locations.sessions_dir("pi")).unwrap();
     let outside = sb.join("elsewhere.jsonl");
     fs::write(&outside, "x").unwrap();
     let g = Group::file("pi", outside.display().to_string(), "t");
@@ -58,11 +53,11 @@ fn a_path_outside_the_roots_is_refused() {
 fn deleting_removes_only_the_picked_session_and_keeps_its_mirror() {
     let sb = sandbox("order");
     let r = roots(&sb);
-    let dir = r.omp.join("-tmp");
+    let dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(r.pi.join("-tmp")).unwrap();
+    fs::create_dir_all(r.locations.sessions_dir("pi").join("-tmp")).unwrap();
     let src = dir.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
-    let mirror = r.pi.join("-tmp").join("2026-10-01T10-00-01-000Z_bbbbbbbb-1111-2222-3333-444444444444.jsonl");
+    let mirror = r.locations.sessions_dir("pi").join("-tmp").join("2026-10-01T10-00-01-000Z_bbbbbbbb-1111-2222-3333-444444444444.jsonl");
     fs::write(&src, "source").unwrap();
     fs::write(&mirror, "mirror").unwrap();
     let mut g = Group::file("omp", src.display().to_string(), "t");
@@ -77,7 +72,7 @@ fn deleting_removes_only_the_picked_session_and_keeps_its_mirror() {
 fn rename_changes_only_the_title_record() {
     let sb = sandbox("rename");
     let r = roots(&sb);
-    let dir = r.omp.join("-tmp");
+    let dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let src = dir.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     let body = "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"Old\"}\n{\"type\":\"message\",\"id\":\"m1\",\"message\":{\"role\":\"user\",\"content\":\"keep this\"}}\n";
@@ -93,8 +88,8 @@ fn rename_changes_only_the_title_record() {
 fn list_shows_sources_without_their_mirrors() {
     let sb = sandbox("list");
     let r = roots(&sb);
-    fs::create_dir_all(r.omp.join("-tmp")).unwrap();
-    fs::write(r.omp.join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl"), "x").unwrap();
+    fs::create_dir_all(r.locations.sessions_dir("omp").join("-tmp")).unwrap();
+    fs::write(r.locations.sessions_dir("omp").join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl"), "x").unwrap();
     let groups = list_groups(&r, &sesync::state::State::default());
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].fmt, "omp");
@@ -104,7 +99,7 @@ fn list_shows_sources_without_their_mirrors() {
 fn list_is_newest_first() {
     let sb = sandbox("newest-first");
     let r = roots(&sb);
-    let dir = r.omp.join("-tmp");
+    let dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let make = |id: &str, secs: u64| {
         let p = dir.join(format!("2026-10-01T10-00-00-000Z_{id}.jsonl"));
@@ -126,15 +121,15 @@ fn list_is_newest_first() {
 fn harness_side_renames_are_read_for_every_format() {
     let sb = sandbox("harness-rename");
     let r = roots(&sb);
-    let omp_dir = r.omp.join("-tmp");
+    let omp_dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&omp_dir).unwrap();
     let omp = omp_dir.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     fs::write(&omp, "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"Old omp\"}\n{\"type\":\"title\",\"title\":\"Renamed by omp\"}\n").unwrap();
-    let pi_dir = r.pi.join("-tmp");
+    let pi_dir = r.locations.sessions_dir("pi").join("-tmp");
     fs::create_dir_all(&pi_dir).unwrap();
     let pi = pi_dir.join("2026-10-01T10-00-00-000Z_bbbbbbbb-1111-2222-3333-444444444444.jsonl");
     fs::write(&pi, "{\"type\":\"session_info\",\"name\":\"Renamed by pi\"}\n").unwrap();
-    let claude_dir = r.claude.join("-tmp");
+    let claude_dir = r.locations.sessions_dir("claude").join("-tmp");
     fs::create_dir_all(&claude_dir).unwrap();
     let claude = claude_dir.join("cccccccc-1111-2222-3333-444444444444.jsonl");
     fs::write(&claude, "{\"type\":\"custom-title\",\"customTitle\":\"Renamed by claude\",\"sessionId\":\"cccccccc-1111-2222-3333-444444444444\"}\n").unwrap();
@@ -149,15 +144,15 @@ fn harness_side_renames_are_read_for_every_format() {
 fn tui_rename_writes_the_native_record_for_every_format() {
     let sb = sandbox("rename-native");
     let r = roots(&sb);
-    let omp_dir = r.omp.join("-tmp");
+    let omp_dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&omp_dir).unwrap();
     let omp = omp_dir.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     fs::write(&omp, "{\"type\":\"title\",\"v\":1,\"title\":\"Old\",\"source\":\"auto\",\"updatedAt\":\"2026-10-01T09:00:00.000Z\",\"pad\":\"\"}\n{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"Old\"}\n").unwrap();
-    let pi_dir = r.pi.join("-tmp");
+    let pi_dir = r.locations.sessions_dir("pi").join("-tmp");
     fs::create_dir_all(&pi_dir).unwrap();
     let pi = pi_dir.join("2026-10-01T10-00-00-000Z_bbbbbbbb-1111-2222-3333-444444444444.jsonl");
     fs::write(&pi, "{\"type\":\"session\",\"version\":3,\"id\":\"bbbbbbbb-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\"}\n").unwrap();
-    let claude_dir = r.claude.join("-tmp");
+    let claude_dir = r.locations.sessions_dir("claude").join("-tmp");
     fs::create_dir_all(&claude_dir).unwrap();
     let claude = claude_dir.join("cccccccc-1111-2222-3333-444444444444.jsonl");
     fs::write(&claude, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
@@ -202,11 +197,11 @@ fn big_transcripts_are_titled_from_their_head_or_tail() {
         .map(|i| format!("{{\"type\":\"message\",\"id\":\"m{i}\",\"message\":{{\"role\":\"user\",\"content\":\"filler line {i} ......................\"}}}}\n"))
         .collect();
     assert!(filler.len() > 256 * 1024, "the test file must exceed the whole-read limit");
-    let omp = r.omp.join("-tmp");
+    let omp = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&omp).unwrap();
     fs::write(omp.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl"),
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"Head title\"}}\n{filler}")).unwrap();
-    let claude = r.claude.join("-tmp");
+    let claude = r.locations.sessions_dir("claude").join("-tmp");
     fs::create_dir_all(&claude).unwrap();
     fs::write(claude.join("cccccccc-1111-2222-3333-444444444444.jsonl"),
         format!("{filler}{{\"type\":\"custom-title\",\"customTitle\":\"Tail rename\",\"sessionId\":\"cccccccc-1111-2222-3333-444444444444\"}}\n")).unwrap();
@@ -220,7 +215,7 @@ fn big_transcripts_are_titled_from_their_head_or_tail() {
 fn the_title_cache_re_reads_a_file_only_when_it_changed() {
     let sb = sandbox("title-cache");
     let r = roots(&sb);
-    let dir = r.omp.join("-tmp");
+    let dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let src = dir.join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     fs::write(&src, "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"Before\"}\n").unwrap();

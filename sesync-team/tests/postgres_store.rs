@@ -3,7 +3,8 @@
 //! The store must hold ciphertext only, and must never be given a rule to decide.
 
 use sesync_team::pg::PgStore;
-use sesync_team::service::{Service, ServiceError};
+use sesync_team::membership::{device_entry, Device, MemberList};
+use sesync_team::service::{Admission, Service, ServiceError};
 use sesync_team::totp::code_at;
 
 const T0: u64 = 1_000_020;
@@ -50,7 +51,7 @@ fn the_postgres_store_matches_the_service_rules_and_holds_ciphertext() {
     let mut s = fresh(&url, "t_pg_rules");
     s.create_space("team-pg", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-pg").unwrap(), T0);
-    let token = s.enrol("team-pg", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-pg", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     assert_eq!(s.authenticate("team-pg", &token, "box-1", T0 + 1).unwrap(), "alice");
     let lease = s.acquire("team-pg", "ses_1", "box-1", T0).unwrap();
     s.put_record("team-pg", "ses_1", "box-1", lease.version, b"plain session text".to_vec(), T0).unwrap();
@@ -67,7 +68,7 @@ fn owners_and_the_token_key_survive_a_restart_on_postgres() {
     let mut s = fresh(&url, "t_restart");
     s.create_space("team-restart", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-restart").unwrap(), T0);
-    let token = s.enrol("team-restart", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-restart", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     // A brand-new connection, as after a process restart.
     let restarted = Service::new(PgStore::connect(&with_schema(&url, "t_restart"), [5u8; 32]).expect("reconnect"));
     assert_eq!(restarted.authenticate("team-restart", &token, "box-1", T0 + 1).unwrap(), "alice",
@@ -82,7 +83,7 @@ fn a_wrong_master_key_cannot_read_stored_records() {
     let mut s = fresh(&url, "t_key");
     s.create_space("team-key", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-key").unwrap(), T0);
-    let token = s.enrol("team-key", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-key", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     let lease = s.acquire("team-key", "ses_1", "box-1", T0).unwrap();
     s.put_record("team-key", "ses_1", "box-1", lease.version, b"x".to_vec(), T0).unwrap();
     let _ = token;
@@ -92,4 +93,38 @@ fn a_wrong_master_key_cannot_read_stored_records() {
         "a different master key must not unlock the space secret");
     assert!(wrong.authenticate("team-key", &token, "box-1", T0 + 1).is_err(),
         "a different master key must not verify an existing token");
+}
+
+#[test]
+fn join_requests_and_tombstones_survive_a_restart_on_postgres() {
+    let Some(url) = url() else { skip_or_fail("TEAM_TEST_PG unset"); return };
+    make_schema(&url, "t_membership");
+    let mut s = fresh(&url, "t_membership");
+    let admin = Device::generate();
+    let waiting = Device::generate();
+    let revoked = Device::generate();
+    s.create_space("team-m", &["alice"]).unwrap();
+    s.pin_admin_key("team-m", &admin.public_key()).unwrap();
+    s.store_trust_list("team-m", &MemberList::new(1, vec![device_entry(&admin), device_entry(&revoked)])
+        .sign(&admin).to_bytes()).unwrap();
+    let secret = s.space_secret("team-m").unwrap();
+    let pending = s.enrol("team-m", "alice", "box-1", &code_at(&secret, T0), Some(&device_entry(&waiting)), T0).unwrap();
+    assert!(matches!(pending, Admission::Pending { .. }));
+    s.publish_trust_list("team-m", &MemberList::new(2, vec![device_entry(&admin)]).sign(&admin).to_bytes(), &[], T0)
+        .unwrap();
+
+    // A brand-new connection, as after a process restart.
+    let mut restarted = Service::new(PgStore::connect(&with_schema(&url, "t_membership"), [5u8; 32]).expect("reconnect"));
+    let roster = restarted.roster("team-m", T0 + 1).unwrap();
+    assert_eq!(roster.pending.len(), 1, "the join request persists");
+    assert_eq!((roster.pending[0].member.as_str(), roster.pending[0].machine.as_str()), ("alice", "box-1"));
+    assert_eq!(roster.pending[0].entry, device_entry(&waiting));
+    assert_eq!(restarted.enrol("team-m", "alice", "box-2", &code_at(&secret, T0 + 60), Some(&device_entry(&revoked)), T0 + 60),
+        Err(ServiceError::Removed), "the tombstone persists");
+    // Approval binds the waiting machine, and that survives a restart too.
+    restarted.publish_trust_list("team-m", &MemberList::new(3, vec![device_entry(&admin), device_entry(&waiting)])
+        .sign(&admin).to_bytes(), &[], T0 + 90).unwrap();
+    let again = Service::new(PgStore::connect(&with_schema(&url, "t_membership"), [5u8; 32]).expect("reconnect"));
+    let token = pending.token().to_string();
+    assert_eq!(again.authenticate("team-m", &token, "box-1", T0 + 120).unwrap(), "alice", "approved and bound");
 }

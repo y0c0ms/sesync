@@ -19,12 +19,7 @@ fn app() -> App {
     std::fs::create_dir_all(d.join("pi")).unwrap();
     std::fs::create_dir_all(d.join("claude")).unwrap();
     App::new(
-        sesync::manage::Roots {
-            omp: d.join("omp").join("sessions"),
-            pi: d.join("pi"),
-            claude: d.join("claude"),
-            gemini: d.join("gemini"),
-        },
+        sesync::manage::Roots::under(&d, d.join("no-sesync-conv")),
         sesync::state::State::default(),
         d.join("locks"),
         d.join("no-sesync_lock"),
@@ -156,10 +151,26 @@ fn esc_closes_the_dialog_without_a_request() {
 fn the_register_dialog_asks_for_the_admin_fields() {
     let a = open_register();
     let text = screen(&a, 110, 26);
-    for field in ["team", "members", "admin token file"] {
+    for field in ["team", "members", "admin token file", "server url"] {
         assert!(text.contains(field), "the dialog asks for '{field}':\n{text}");
     }
-    assert!(text.contains("shown once and cannot be read back"), "the QR warning is shown:\n{text}");
+    assert!(text.contains("a QR code for your authenticator app, shown only once"), "the QR warning is shown:\n{text}");
+}
+
+/// The dialog shows made-up examples in its empty fields. They are never values: Enter on an
+/// untouched dialog is refused, so a stray Enter cannot start a team.
+#[test]
+fn an_untouched_start_a_team_dialog_shows_examples_and_refuses_enter() {
+    let mut a = open_register();
+    let text = screen(&a, 110, 26);
+    assert!(text.contains("e.g. design-team") && text.contains("e.g. ana, rui"), "examples are shown:\n{text}");
+    a.handle(Ev::Tab, Instant::now()); // -> members
+    assert!(screen(&a, 110, 26).contains("who may join"), "the focused field says what it is for");
+    a.handle(Ev::Enter, Instant::now());
+    assert_eq!(a.mode(), Mode::Form, "the dialog stays open");
+    assert!(a.take_setup_request().is_none(), "no team is started");
+    assert!(a.status().contains("'team' is empty"), "{}", a.status());
+    assert_eq!(a.form_value("team"), "", "the example is not a value");
 }
 
 #[test]
@@ -173,7 +184,7 @@ fn the_dialog_can_be_prefilled_by_the_caller() {
 #[test]
 fn a_completed_register_hands_the_request_to_the_caller() {
     let mut a = open_register();
-    for (i, v) in ["main", "laptop, pixel", "/tmp/admin-token"].iter().enumerate() {
+    for (i, v) in ["main", "laptop, pixel", "/tmp/admin-token", "http://team.test:30500"].iter().enumerate() {
         if i > 0 {
             a.handle(Ev::Tab, Instant::now());
         }
@@ -184,6 +195,7 @@ fn a_completed_register_hands_the_request_to_the_caller() {
     assert_eq!(req.kind, Kind::Register);
     assert_eq!(req.value_of("team"), "main");
     assert_eq!(req.value_of("members"), "laptop, pixel");
+    assert_eq!(req.value_of("server url"), "http://team.test:30500");
 }
 
 #[test]

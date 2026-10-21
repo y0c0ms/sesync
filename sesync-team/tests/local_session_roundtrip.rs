@@ -31,7 +31,7 @@ fn a_local_session_survives_the_database_round_trip() {
     let mut s = Service::new(store);
     s.create_space("local", &["me"]).unwrap();
     let code = code_at(&s.space_secret("local").unwrap(), T0);
-    let token = s.enrol("local", "me", "this-box", &code, T0).unwrap();
+    let token = s.enrol("local", "me", "this-box", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     assert_eq!(s.authenticate("local", &token, "this-box", now().max(T0)).is_err(), now() > T0 + 86_400,
         "token check behaves on wall clock");
     let lease = s.acquire("local", "session", "this-box", T0).unwrap();

@@ -8,7 +8,8 @@ use std::fs;
 use std::path::PathBuf;
 
 fn sesync_lock() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-lock/target/debug/sesync-lock");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../sesync-lock/target/debug/sesync-lock{}", std::env::consts::EXE_SUFFIX));
     assert!(p.exists(), "build lock first: cargo build --manifest-path sesync-lock/Cargo.toml");
     p
 }
@@ -77,4 +78,37 @@ fn claim_is_released_even_when_the_work_panics() {
     });
     assert!(r.is_err());
     assert!(!d.join("conv-p.lock").exists(), "a panic must not leave the conversation locked");
+}
+
+/// A turn inside a copy claims the copy's own session id, the daemon's write claims the
+/// conversation. Without the alias the two took different locks and never excluded each other.
+#[test]
+fn a_claim_on_a_copy_holds_its_conversation_through_the_alias() {
+    let d = lock_dir("alias");
+    let bin = sesync_lock();
+    sesync::lock::write_alias(&d, "ses_copy123", "conv-abc").unwrap();
+    let me = std::process::id();
+    let claimed = std::process::Command::new(&bin)
+        .env("SESYNC_LOCK_DIR", &d)
+        .args(["claim", "ses_copy123", "opencode", &me.to_string(), "t"])
+        .output()
+        .unwrap();
+    assert!(claimed.status.success(), "{claimed:?}");
+    let mut ran = false;
+    let out = with_claim(&bin, Some(&d), "conv-abc", "daemon", 1, "/src", || ran = true);
+    assert!(!ran, "the daemon must not write a copy while a turn runs in it");
+    assert!(matches!(out, ClaimOutcome::Skipped(ref h) if h.starts_with("opencode")), "got {out:?}");
+}
+
+#[test]
+fn the_conversation_name_itself_is_never_aliased_away() {
+    let d = lock_dir("alias-self");
+    fs::create_dir_all(d.join("map")).unwrap();
+    // A leftover alias would send every claim on the conversation somewhere else.
+    fs::write(d.join("map").join("conv-abc"), "elsewhere").unwrap();
+    sesync::lock::write_alias(&d, "ses_copy123", "conv-abc").unwrap();
+    assert!(!d.join("map").join("conv-abc").exists(), "the conversation must resolve to itself");
+    sesync::lock::write_alias(&d, "conv-abc", "conv-abc").unwrap();
+    assert!(!d.join("map").join("conv-abc").exists(), "no alias from a name to itself");
+    assert_eq!(fs::read_to_string(d.join("map").join("ses_copy123")).unwrap(), "conv-abc");
 }

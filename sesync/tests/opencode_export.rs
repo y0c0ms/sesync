@@ -1,9 +1,13 @@
+// The fake CLIs here are `#!/bin/sh` scripts made executable with Unix permissions: they cannot
+// run on Windows, where the file never compiled. The real-CLI path is covered on Unix CI.
+#![cfg(unix)]
+
 //! O-penCode export and convert, ported from daemon/sesync.py
 //! prepare_opencode_source. The export is saved as-is and sesync_conv from-opencode reads
 //! it, skipping any banner before the first '{'. Uses the real opencode CLI and the
 //! real sesync_conv in a sandbox. Skipped when the CLI is not installed.
 
-use sesync::opencode::export_and_convert;
+use sesync::harness::opencode::store::export_and_convert;
 use std::fs;
 use std::path::PathBuf;
 

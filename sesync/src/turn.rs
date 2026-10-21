@@ -1,14 +1,35 @@
 //! Turn-taking: a mirror is a copy, but the user may answer in the copy's harness. When that
 //! happens, that copy is the newest statement of the conversation and becomes the session's
-//! source — the "main harness" moves — and the same pass rewrites every other configured copy
-//! from it, including the old source. When more than one copy changed since the last pass,
-//! the newest write wins; the losers are overwritten (operator decision).
+//! source (the "main harness" moves), and the same pass rewrites every other configured copy
+//! from it, including the old source. When more than one copy was answered since the last pass,
+//! the newest answer wins; the losers are overwritten (operator decision), and bytes sesync did
+//! not write are archived before that happens (mirror_write).
+//!
+//! An answer is a user prompt in the copy that is newer than every prompt of the source. Every
+//! copy sesync writes carries the source's own timestamps, so a copy can only get ahead of its
+//! source by somebody typing into it. Changed bytes alone never move the source: a rename, a
+//! resume that appends bookkeeping, a file rewritten by an older binary or a state record that
+//! fell behind all change bytes, and each of those used to turn the conversation over to a stale
+//! copy, which then overwrote everything else.
 
-use crate::divergence::fingerprint;
+use crate::harness;
+use crate::mirror::{copy_hash, copy_stamp};
 use crate::state::{Mirror, Source, State};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// One mirror whose content no longer matches what the daemon installed.
+/// When the user last typed into a conversation: (format, key) -> newest prompt, in seconds
+/// since the epoch. The daemon asks each harness; tests pass fixed answers.
+pub type PromptOf<'a> = &'a dyn Fn(&str, &str) -> Option<f64>;
+
+/// Per store harness (by id), the (session id, last update) of every row its database lists.
+pub type StoreRows = BTreeMap<String, Vec<(String, f64)>>;
+
+/// A copy is ahead of its source only by a prompt typed at least this much later. Every format
+/// keeps milliseconds, so this only absorbs rounding.
+const PROMPT_SLACK_SECS: f64 = 1.0;
+
+/// One copy somebody answered in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirrorEdit {
     /// The source entry the mirror hangs off.
@@ -17,57 +38,70 @@ pub struct MirrorEdit {
     pub target: String,
     /// The mirror file. For OpenCode this is the conversation id (store-backed).
     pub path: String,
-    /// The copy's last write, in seconds, as the tie-breaker.
+    /// The copy's newest prompt, in seconds: the newest answer wins.
     pub mtime: f64,
     /// The content hash at detection time.
     pub hash: String,
 }
 
-/// Whether a recorded mirror changed since the daemon last wrote or last saw it unchanged.
-/// `SameContent` covers an mtime touch with identical bytes: it only refreshes the stamp.
+/// What a pass learns about one recorded file mirror. Cheap by design: a stat per pass; the
+/// content is read only when the fingerprint moved.
 #[derive(Debug)]
 pub enum MirrorChange {
     /// Fingerprint matches the one recorded last pass.
     None,
-    /// Content differs from what was installed; the harness wrote here.
+    /// The copy holds a prompt the source does not: somebody answered there.
     Edited(MirrorEdit),
     /// Same bytes as installed, newer stamp; the stamp is refreshed, no promotion.
     SameContent,
+    /// The bytes changed but nobody answered (a rename, resume bookkeeping, an older write):
+    /// the stamp is refreshed, no promotion.
+    NoTurn,
 }
 
-/// Check one recorded mirror against what the daemon installed. Cheap by design: a stat per
-/// pass; the content is read only when the fingerprint moved.
-pub fn check(mirror: &Mirror, source_key: &str) -> MirrorChange {
-    let path = Path::new(&mirror.path);
-    if mirror.target == "opencode" {
-        return MirrorChange::None; // store-backed; the caller feeds row updates separately
+/// The copy's newest prompt when it is newer than every prompt of its source. None when the copy
+/// has no prompt, or none the source does not already have.
+fn ahead_of_source(prompt_of: PromptOf, copy_fmt: &str, copy_key: &str, src_fmt: &str, src_key: &str) -> Option<f64> {
+    let copy = prompt_of(copy_fmt, copy_key)?;
+    match prompt_of(src_fmt, src_key) {
+        Some(source) if copy <= source + PROMPT_SLACK_SECS => None,
+        _ => Some(copy),
     }
-    let stamp = fingerprint(path);
+}
+
+/// Check one recorded file mirror of `src` (keyed `source_key`).
+pub fn check(mirror: &Mirror, src: &Source, source_key: &str, prompt_of: PromptOf) -> MirrorChange {
+    let path = Path::new(&mirror.path);
+    if harness::is_store(&mirror.target) {
+        return MirrorChange::None; // in a store harness; promote_changed reads its rows
+    }
+    // An Antigravity copy changes in its WAL while agy runs: the stamp and the hash cover both.
+    let stamp = copy_stamp(&mirror.target, path);
     if stamp == "missing" {
         return MirrorChange::None; // a gone mirror is cleanup's business, not a promotion
     }
-        if !mirror.edit_stamp.is_empty() && stamp == mirror.edit_stamp {
-            return MirrorChange::None;
-        }
-        if debug_env() {
-            eprintln!("turn: stamp moved for {} (recorded {:?})", mirror.path, mirror.edit_stamp);
-        }
-    match crate::mirror::file_hash(path) {
+    if !mirror.edit_stamp.is_empty() && stamp == mirror.edit_stamp {
+        return MirrorChange::None;
+    }
+    if debug_env() {
+        eprintln!("turn: stamp moved for {} (recorded {:?})", mirror.path, mirror.edit_stamp);
+    }
+    match copy_hash(&mirror.target, path) {
         Err(_) => MirrorChange::SameContent,
         Ok(h) if h == mirror.installed_hash => MirrorChange::SameContent,
-        Ok(h) => MirrorChange::Edited(MirrorEdit {
-            source_key: source_key.to_string(),
-            target: mirror.target.clone(),
-            path: mirror.path.clone(),
-            mtime: crate::divergence::mtime_secs(path),
-            hash: h,
-        }),
+        Ok(h) => match ahead_of_source(prompt_of, &mirror.target, &mirror.path, &src.fmt, source_key) {
+            Some(at) => MirrorChange::Edited(MirrorEdit {
+                source_key: source_key.to_string(),
+                target: mirror.target.clone(),
+                path: mirror.path.clone(),
+                mtime: at,
+                hash: h,
+            }),
+            None => MirrorChange::NoTurn,
+        },
     }
 }
 
-/// Find every edited mirror, promote the newest write per session, and report the new source
-/// keys. Pure over the state: no file is written here, no harness is touched. The caller's
-/// next pass writes the winner's mirrors through the normal pipeline.
 fn now_secs() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -77,107 +111,125 @@ fn debug_env() -> bool {
     std::env::var_os("SESYNC_TURN_DEBUG").is_some()
 }
 
-pub fn promote_changed(state: &mut State, opencode_rows: &[(String, f64)]) -> Vec<String> {
+/// Collapse leftover tangles, find every copy somebody answered in, promote the newest answer per
+/// conversation, and report the new source keys. Pure over the state: no file is written here,
+/// no harness is touched. The caller writes the winner's mirrors through the normal pipeline.
+/// `store_rows` holds the rows of each store harness.
+pub fn promote_changed(state: &mut State, store_rows: &StoreRows, prompt_of: PromptOf) -> Vec<String> {
     let debug = debug_env();
-    // Collect the edits and the quiet stamps first (read-only), then resolve, then write.
+    collapse_tangles(state);
     let mut edits: Vec<MirrorEdit> = Vec::new();
-    let mut touched: Vec<(String, String, String)> = Vec::new();
+    let mut stamps: Vec<(String, String, String)> = Vec::new();
+    let mut rows_seen: Vec<(String, String, f64)> = Vec::new();
     for (key, src) in state.sources.iter() {
         for m in src.mirrors.values() {
-            if m.target == "opencode" {
-                if m.target_updated > 0.0 {
-                    if let Some((_, updated)) = opencode_rows.iter().find(|(id, _)| *id == m.path) {
-                        if *updated > m.target_updated {
-                            edits.push(MirrorEdit {
-                                source_key: key.clone(),
-                                target: m.target.clone(),
-                                path: m.path.clone(),
-                                mtime: *updated,
-                                hash: format!("{:.3}", updated),
-                            });
-                        }
-                    }
+            if harness::is_store(&m.target) {
+                // The row's update time filters out the untouched copies; the prompts decide.
+                let row = store_rows.get(&m.target).and_then(|rows| rows.iter().find(|(id, _)| *id == m.path));
+                let Some((_, updated)) = row else { continue };
+                if *updated <= m.target_updated {
+                    continue;
+                }
+                match ahead_of_source(prompt_of, &m.target, &m.path, &src.fmt, key) {
+                    Some(at) => edits.push(MirrorEdit {
+                        source_key: key.clone(),
+                        target: m.target.clone(),
+                        path: m.path.clone(),
+                        mtime: at,
+                        hash: format!("{updated:.3}"),
+                    }),
+                    None => rows_seen.push((key.clone(), m.target.clone(), *updated)),
                 }
                 continue;
             }
-            match check(m, key) {
+            match check(m, src, key, prompt_of) {
                 MirrorChange::None => {}
-                MirrorChange::SameContent => {
-                    touched.push((key.clone(), m.target.clone(), fingerprint(Path::new(&m.path))));
+                MirrorChange::SameContent | MirrorChange::NoTurn => {
+                    stamps.push((key.clone(), m.target.clone(), copy_stamp(&m.target, Path::new(&m.path))));
                 }
                 MirrorChange::Edited(e) => edits.push(e),
             }
         }
     }
-    for (key, target, stamp) in touched {
-        if let Some(src) = state.sources.get_mut(&key) {
-            if let Some(m) = src.mirrors.get_mut(&target) {
-                m.edit_stamp = stamp;
-            }
+    for (key, target, stamp) in stamps {
+        if let Some(m) = state.sources.get_mut(&key).and_then(|s| s.mirrors.get_mut(&target)) {
+            m.edit_stamp = stamp;
+        }
+    }
+    for (key, target, updated) in rows_seen {
+        if let Some(m) = state.sources.get_mut(&key).and_then(|s| s.mirrors.get_mut(&target)) {
+            m.target_updated = updated;
         }
     }
     if debug {
         for e in &edits {
-            eprintln!("turn: candidate {} of {} ({}) at {:.3}", e.path, e.source_key, e.target, e.mtime);
+            eprintln!("turn: answered in {} of {} ({}) at {:.3}", e.path, e.source_key, e.target, e.mtime);
         }
     }
-    // Components: entries whose keys are each other's mirror paths are copies of one
-    // conversation (leftover tangles of an older binary). A component with a real edit turns
-    // to the newest edit and keeps the winner's entry; one with none keeps its most recently
-    // turned entry. Healthy states have one entry per component and are untouched here.
-    let mut edits_sorted = edits;
-    edits_sorted.sort_by(|a, b| {
-        b.mtime.partial_cmp(&a.mtime).unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.target.cmp(&b.target))
-    });
-    let mut resolved: std::collections::BTreeSet<String> = Default::default();
+    // The newest answer wins; an exact tie breaks by harness name, so the outcome is stable.
+    edits.sort_by(|a, b| b.mtime.total_cmp(&a.mtime).then_with(|| a.target.cmp(&b.target)));
+    let mut turned: BTreeSet<String> = BTreeSet::new();
     let mut promoted = Vec::new();
-    for edit in &edits_sorted {
-        if resolved.contains(&edit.source_key) {
+    for edit in &edits {
+        if !turned.insert(edit.source_key.clone()) {
             continue;
         }
-        for member in component_of(state, &edit.source_key) {
-            resolved.insert(member.clone());
-            if member != edit.source_key {
-                state.sources.remove(&member);
-            }
-        }
-        if promote(state, edit).is_some() {
-            promoted.push(edit.path.clone());
+        if let Some(key) = promote(state, edit) {
+            promoted.push(key);
         }
     }
-    // Components with no edit: collapse to the most recently turned entry.
-    let keep: Vec<String> = {
-        let mut roots: Vec<String> = Vec::new();
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
-        for key in state.sources.keys().cloned().collect::<Vec<_>>() {
-            if seen.contains(&key) {
-                continue;
+    promoted
+}
+
+/// Entries whose keys are each other's mirror paths are copies of one conversation, left by an
+/// older binary (or a merge that re-adopted a demoted source). Each such group keeps its most
+/// recently turned entry and drops the rest before any copy is checked, so a stale entry's
+/// records can never turn the conversation back. A dropped file stays a mirror key, so the scan
+/// does not adopt it again; when its harness is still chosen, the survivor records it as a copy
+/// whose bytes sesync did not write.
+fn collapse_tangles(state: &mut State) {
+    let keys: Vec<String> = state.sources.keys().cloned().collect();
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    for key in keys {
+        if done.contains(&key) || !state.sources.contains_key(&key) {
+            continue;
+        }
+        let members = component_of(state, &key);
+        done.extend(members.iter().cloned());
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(best) = members.iter()
+            .max_by(|a, b| {
+                let (a, b) = (&state.sources[*a], &state.sources[*b]);
+                a.turn_at.total_cmp(&b.turn_at).then_with(|| a.last_seen_change.total_cmp(&b.last_seen_change))
+            })
+            .cloned() else { continue };
+        for member in members.iter().filter(|m| **m != best) {
+            let Some(gone) = state.sources.remove(member) else { continue };
+            let keep = state.sources.get_mut(&best).expect("the survivor stays");
+            if keep.chosen_targets.contains(&gone.fmt) && !keep.mirrors.contains_key(&gone.fmt) && gone.fmt != keep.fmt {
+                keep.mirrors.insert(gone.fmt.clone(), Mirror {
+                    target: gone.fmt.clone(),
+                    path: member.clone(),
+                    ..Default::default()
+                });
             }
-            let members = component_of(state, &key);
-            for m in &members {
-                seen.insert(m.clone());
-            }
-            let best = members.iter()
-                .map(|k| state.sources.get(k).unwrap())
-                .max_by(|a, b| {
-                    a.turn_at.partial_cmp(&b.turn_at).unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.last_seen_change.partial_cmp(&b.last_seen_change).unwrap_or(std::cmp::Ordering::Equal))
-                })
-                .map(|s| s.key.clone());
-            if let Some(best) = best {
-                for m in &members {
-                    if *m != best {
-                        state.sources.remove(m);
-                    }
+            for (target, rec) in gone.mirrors {
+                if target != keep.fmt && rec.path != best && !keep.mirrors.contains_key(&target) {
+                    keep.mirrors.insert(target, rec);
                 }
-                roots.push(best);
+            }
+            for (target, rec) in gone.sync {
+                if target != keep.fmt && !keep.sync.contains_key(&target) {
+                    keep.sync.insert(target, rec);
+                }
+            }
+            if crate::mirror::is_file_key(member) {
+                state.mirror_keys.insert(member.clone());
             }
         }
-        roots
-    };
-    let _ = keep;
-    promoted
+    }
 }
 
 /// The entries that are copies of the same conversation as `start`: transitively, two entries
@@ -205,59 +257,57 @@ fn component_of(state: &State, start: &str) -> Vec<String> {
     out
 }
 
-/// Move the session to the winner: the winner's file becomes the source, the old source's
-/// harness becomes a mirror target. The old source's other mirror records are carried over,
-/// so a later re-write into a new path removes the old file (record_mirror's replace rule:
-/// the stale copies' bytes are still what the daemon installed). Returns the new source key.
+/// Move the session to the winner: the winner's copy becomes the source, the old source becomes
+/// the copy in its own harness. The old source's other mirror records are carried over, so the
+/// next write replaces each copy in place. Returns the new source key.
 fn promote(state: &mut State, edit: &MirrorEdit) -> Option<String> {
-    let old = state.sources.get(&edit.source_key)?.clone();
-    if edit.path == edit.source_key {
-        return None; // the winner is already the source; not a turn
-    }
-    if state.sources.contains_key(&edit.path) {
-        // The destination copy already holds the source entry (a redundant candidate from a
-        // tangled leftover): overwriting it would graft this leftover's stale mirror records
-        // onto the live entry. Nothing to turn.
+    if edit.path == edit.source_key || state.sources.contains_key(&edit.path) {
+        // The winner already holds a source entry: nothing to turn, and grafting this entry's
+        // records onto it would overwrite the live ones.
         return None;
     }
+    let conv = state.team_id_of(&edit.source_key);
+    let old = state.sources.get(&edit.source_key)?.clone();
+    let now = now_secs();
     let mut chosen = old.chosen_targets.clone();
     chosen.remove(&edit.target);
     chosen.insert(old.fmt.clone());
     let mut new = Source::new(&edit.target, &edit.path);
     new.title = old.title.clone();
-    // The conversation's stable id moves with the turn: the team keys the mark, the pushed
-    // hash and the server conversation on it, so the promoted copy keeps pushing as the SAME
-    // conversation on the server, and the server keeps holding the newest version.
-    new.conv = old.conv.clone();
+    // Sync records follow the targets they describe. The winner's own target is no longer a
+    // mirror, and the old source's target now holds bytes sesync did not write: neither keeps one.
+    new.sync = old.sync.clone();
+    new.sync.remove(&edit.target);
+    new.sync.remove(&old.fmt);
+    // The conversation's stable id moves with the turn: mirror ids are minted from it and the
+    // team keys on it, so every copy keeps its id and the server keeps one conversation.
+    new.conv = conv;
     new.last_seen_change = edit.mtime;
     new.last_hash = edit.hash.clone();
     new.chosen_targets = chosen;
-    new.turn_at = now_secs();
+    new.turn_at = now;
     let mut mirrors = old.mirrors.clone();
     mirrors.remove(&edit.target);
-    // The old source's harness becomes a mirror of the winner. For a file that is the stale
-    // bytes as they sit on disk; for OpenCode it is the conversation id, and the next write
-    // replaces that conversation in place.
-    let installed_hash = if crate::mirror::is_file_key(&edit.source_key) {
-        crate::mirror::file_hash(Path::new(&edit.source_key)).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // The old source is now the copy in its own harness. sesync did not write those bytes, and
+    // the record says so: an empty installed_hash is never "ours, unchanged", so nothing deletes
+    // them, and the next write keeps a verified archive of them before replacing them in place.
+    let file = crate::mirror::is_file_key(&edit.source_key);
     mirrors.insert(old.fmt.clone(), Mirror {
         target: old.fmt.clone(),
         path: edit.source_key.clone(),
-        source_hash: edit.hash.clone(),
-        installed_hash,
+        source_hash: String::new(),
+        installed_hash: String::new(),
         diverged: false,
-        edit_stamp: String::new(),
-        target_updated: 0.0,
+        edit_stamp: if file { copy_stamp(&old.fmt, Path::new(&edit.source_key)) } else { String::new() },
+        target_updated: now,
     });
     new.mirrors = mirrors;
     state.sources.remove(&edit.source_key);
     state.sources.insert(edit.path.clone(), new);
+    state.seen_keys.insert(edit.path.clone());
     // The winner is no longer a mirror; the old source now is, when it is a file.
     state.mirror_keys.remove(&edit.path);
-    if crate::mirror::is_file_key(&edit.source_key) {
+    if file {
         state.mirror_keys.insert(edit.source_key.clone());
     }
     Some(edit.path.clone())
@@ -277,229 +327,203 @@ mod tests {
         d
     }
 
-    fn omp_source(sb: &PathBuf, name: &str, body: &str) -> String {
-        let p = sb.join("omp").join("sessions").join(name);
-        fs::create_dir_all(p.parent().unwrap()).unwrap();
-        fs::write(&p, body).unwrap();
-        p.display().to_string()
+    /// Files are read for real; store answers come from the map.
+    fn files_and(stored: Vec<(&'static str, f64)>) -> impl Fn(&str, &str) -> Option<f64> {
+        move |fmt: &str, key: &str| match harness::get(fmt) {
+            Some(h) if h.kind() == harness::Kind::Files => h.newest_prompt(&harness::Location::default(), key),
+            _ => stored.iter().find(|(id, _)| *id == key).map(|(_, t)| *t),
+        }
     }
 
-    fn mirror_file(sb: &PathBuf, body: &str) -> String {
-        let p = sb.join("claude-mirror.jsonl");
-        fs::write(&p, body).unwrap();
-        p.display().to_string()
+    fn no_rows() -> StoreRows {
+        StoreRows::new()
     }
 
-    fn source_with_mirror(p_omp: String, c_path: String) -> (State, String) {
+    fn omp_prompt(id: &str, at: &str, text: &str) -> String {
+        format!(r#"{{"type":"message","id":"{id}","timestamp":"{at}","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#)
+    }
+
+    fn claude_prompt(at: &str, text: &str) -> String {
+        format!(r#"{{"type":"user","uuid":"u-{at}","timestamp":"{at}","message":{{"role":"user","content":"{text}"}}}}"#)
+    }
+
+    const T1: &str = "2026-10-01T10:00:00.000Z";
+    const T2: &str = "2026-10-01T10:05:00.000Z";
+    const T3: &str = "2026-10-01T10:09:00.000Z";
+
+    /// An omp source with one prompt at T1 and its Claude copy as sesync installed it.
+    fn source_and_copy(d: &Path) -> (State, String, String) {
+        let src = d.join("omp").join("a.jsonl");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, format!("{{\"type\":\"session\",\"id\":\"a\",\"cwd\":\"/p\"}}\n{}\n", omp_prompt("m1", T1, "first question"))).unwrap();
+        let copy = d.join("claude").join("c.jsonl");
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::write(&copy, format!("{}\n", claude_prompt(T1, "first question"))).unwrap();
+        let (src, copy) = (src.display().to_string(), copy.display().to_string());
         let mut state = State::default();
-        let mut src = Source::new("omp", &p_omp);
-        src.chosen_targets.insert("claude".to_string());
-        let c_hash = crate::mirror::file_hash(std::path::Path::new(&c_path)).unwrap();
-        src.mirrors.insert("claude".to_string(), Mirror {
-            target: "claude".to_string(),
-            path: c_path.clone(),
-            source_hash: "old".to_string(),
-            installed_hash: c_hash,
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
+        let mut s = Source::new("omp", &src);
+        s.chosen_targets.insert("claude".into());
+        s.mirrors.insert("claude".into(), Mirror {
+            target: "claude".into(),
+            path: copy.clone(),
+            source_hash: "h".into(),
+            installed_hash: crate::mirror::file_hash(Path::new(&copy)).unwrap(),
+            ..Default::default()
         });
-        state.sources.insert(p_omp.clone(), src);
-        (state, p_omp)
+        state.sources.insert(src.clone(), s);
+        (state, src, copy)
     }
 
-    const SRC_BODY: &str = "{\"type\":\"session\",\"id\":\"x\"}\n";
+    fn append(path: &str, line: &str) {
+        let mut body = fs::read_to_string(path).unwrap();
+        body.push_str(line);
+        body.push('\n');
+        fs::write(path, body).unwrap();
+    }
 
     #[test]
-    fn an_edited_mirror_becomes_the_source() {
-        let d = sb("basic");
-        let p_omp = omp_source(&d, "a.jsonl", SRC_BODY);
-        let c_path = mirror_file(&d, "{\"old\":true}\n");
-        let (mut state, old_key) = source_with_mirror(p_omp, c_path.clone());
-        // The user answers in claude: the mirror's content changes.
-        fs::write(&c_path, "{\"old\":true}\n{\"user\":\"hi\"}\n").unwrap();
-        let promoted = promote_changed(&mut state, &[]);
-        assert_eq!(promoted, vec![c_path.clone()], "the edited copy wins");
-        let new = &state.sources[&c_path];
-        assert_eq!(new.fmt, "claude", "the winner's harness is the format");
-        assert!(new.chosen_targets.contains("omp"), "the old source's harness becomes a target");
-        assert!(!new.chosen_targets.contains("claude"), "the winner does not mirror to itself");
-        assert!(state.sources.get(&old_key).is_none(), "the old source entry is gone");
-        assert!(state.mirror_keys.contains(&old_key), "the old source file is now a mirror");
-        assert!(!state.mirror_keys.contains(&c_path), "the winner is no longer a mirror");
+    fn an_answer_in_a_copy_moves_the_source_there() {
+        let d = sb("answer");
+        let (mut state, src, copy) = source_and_copy(&d);
+        append(&copy, &claude_prompt(T2, "a new question asked in claude"));
+        let promoted = promote_changed(&mut state, &no_rows(), &files_and(vec![]));
+        assert_eq!(promoted, vec![copy.clone()], "the answered copy wins");
+        let new = &state.sources[&copy];
+        assert_eq!(new.fmt, "claude");
+        assert!(new.chosen_targets.contains("omp") && !new.chosen_targets.contains("claude"));
+        assert!(state.sources.get(&src).is_none(), "the old source entry is gone");
+        assert!(state.mirror_keys.contains(&src), "the old source file is now a mirror");
+        assert_eq!(new.mirrors["omp"].installed_hash, "",
+            "the old source's bytes are not sesync's: nothing may treat them as a disposable copy");
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
-    fn a_touched_mirror_with_the_same_content_promotes_nothing() {
-        let d = sb("quiet");
-        let p_omp = omp_source(&d, "b.jsonl", SRC_BODY);
-        let c_path = mirror_file(&d, "{\"old\":true}\n");
-        let (mut state, old_key) = source_with_mirror(p_omp, c_path.clone());
-        assert!(promote_changed(&mut state, &[]).is_empty(), "nothing changed");
-        // The fingerprint was recorded; a later identical pass costs nothing and stays quiet.
-        assert_eq!(
-            state.sources[&old_key].mirrors["claude"].edit_stamp,
-            fingerprint(std::path::Path::new(&c_path)),
-            "the stamp is recorded for the next pass");
-        // A different stamp but identical content: SameContent, no promotion.
-        let file = std::path::Path::new(&c_path);
-        let stamp = fingerprint(file);
-        state.sources.get_mut(&old_key).unwrap().mirrors.get_mut("claude").unwrap().edit_stamp = format!("x{}", stamp.len());
-        let changed = check(&state.sources[&old_key].mirrors["claude"], &old_key);
-        assert!(matches!(changed, MirrorChange::SameContent), "same bytes never promote");
-        assert!(promote_changed(&mut state, &[]).is_empty(), "no promotion");
-        assert_eq!(state.sources[&old_key].mirrors["claude"].edit_stamp, stamp,
-            "the fresh stamp replaces the stale one");
+    fn changed_bytes_without_a_new_prompt_never_move_the_source() {
+        // The bug this guards: a copy whose bytes no longer matched the recorded hash (a rename,
+        // resume bookkeeping, a write the state record missed) was promoted, and its stale
+        // content then overwrote the real conversation everywhere.
+        let d = sb("noturn");
+        let (mut state, src, copy) = source_and_copy(&d);
+        append(&copy, r#"{"type":"custom-title","customTitle":"renamed in claude","sessionId":"c"}"#);
+        append(&copy, r#"{"type":"user","timestamp":"2026-10-01T10:30:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}"#);
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(), "no prompt, no turn");
+        assert!(state.sources.contains_key(&src), "the source stays where it is");
+        assert_eq!(state.sources[&src].mirrors["claude"].edit_stamp, copy_stamp("claude", Path::new(&copy)),
+            "the new stamp is recorded, so the next pass costs a stat");
+        // A record that fell behind: the copy is a full rewrite with the source's own prompts.
+        fs::write(&copy, format!("{}\n{}\n", claude_prompt(T1, "first question"), claude_prompt(T1, "first question"))).unwrap();
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(), "the source's own prompts are no answer");
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
-    fn the_newest_of_two_edited_copies_wins() {
-        let d = sb("conflict");
-        let p_omp = omp_source(&d, "c.jsonl", SRC_BODY);
-        let c_path = mirror_file(&d, "{\"a\":1}\n");
-        let (mut state, _) = source_with_mirror(p_omp, c_path.clone());
-        // Two edits: pi (older) and claude (newer). Newer wins.
-        let older = d.join("older.jsonl");
-        fs::write(&older, "{\"pi\":1}\n").unwrap();
-        let src = state.sources.values_mut().next().unwrap();
-        src.mirrors.insert("pi".to_string(), Mirror {
-            target: "pi".to_string(),
-            path: older.display().to_string(),
-            source_hash: "old".to_string(),
-            installed_hash: "stale".to_string(),
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(&c_path, "{\"a\":1}\n{\"user\":\"later\"}\n").unwrap();
-        let promoted = promote_changed(&mut state, &[]);
-        assert_eq!(promoted, vec![c_path.clone()], "the newest write wins");
-        assert_eq!(state.sources[&c_path].fmt, "claude");
+    fn the_compaction_note_is_not_an_answer() {
+        let d = sb("note");
+        let (mut state, src, copy) = source_and_copy(&d);
+        append(&copy, &claude_prompt(T3, "Earlier turns of this conversation were compacted. Their summary: x"));
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(),
+            "sesync's own note is stamped with the compaction time and must not read as a turn");
+        assert!(state.sources.contains_key(&src));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_answer_in_the_source_after_the_copy_keeps_the_source() {
+        let d = sb("source-newer");
+        let (mut state, src, copy) = source_and_copy(&d);
+        append(&copy, &claude_prompt(T2, "asked in claude"));
+        append(&src, &omp_prompt("m2", T3, "asked later in omp"));
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(),
+            "the newest answer wins, and it is the source's");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_newest_of_two_answered_copies_wins() {
+        let d = sb("two");
+        let (mut state, src, copy) = source_and_copy(&d);
+        let pi = d.join("pi").join("p.jsonl");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&pi, format!("{}\n{}\n", omp_prompt("m1", T1, "first question"), omp_prompt("m9", T2, "asked in pi"))).unwrap();
+        let pi = pi.display().to_string();
+        let s = state.sources.get_mut(&src).unwrap();
+        s.chosen_targets.insert("pi".into());
+        s.mirrors.insert("pi".into(), Mirror { target: "pi".into(), path: pi.clone(), installed_hash: "older".into(), ..Default::default() });
+        append(&copy, &claude_prompt(T3, "asked later in claude"));
+        let promoted = promote_changed(&mut state, &no_rows(), &files_and(vec![]));
+        assert_eq!(promoted, vec![copy.clone()], "claude answered last");
+        assert_eq!(state.sources[&copy].mirrors["pi"].path, pi, "the other copy stays recorded, to be rewritten");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_opencode_copy_turns_only_on_a_newer_prompt() {
+        let d = sb("opencode");
+        let (mut state, src, _copy) = source_and_copy(&d);
+        let s = state.sources.get_mut(&src).unwrap();
+        s.chosen_targets.insert("opencode".into());
+        s.mirrors.insert("opencode".into(), Mirror { target: "opencode".into(), path: "ses_x".into(), target_updated: 100.0, ..Default::default() });
+        let t1 = crate::prompts::parse_rfc3339(T1).unwrap();
+        // The row moved (a rename, an open) but the copy's newest prompt is the source's own.
+        let rows: StoreRows = [("opencode".to_string(), vec![("ses_x".to_string(), 500.0)])].into_iter().collect();
+        assert!(promote_changed(&mut state, &rows, &files_and(vec![("ses_x", t1)])).is_empty());
+        assert_eq!(state.sources[&src].mirrors["opencode"].target_updated, 500.0, "the row time is taken as seen");
+        // Somebody typed in OpenCode.
+        let rows: StoreRows = [("opencode".to_string(), vec![("ses_x".to_string(), 900.0)])].into_iter().collect();
+        let promoted = promote_changed(&mut state, &rows, &files_and(vec![("ses_x", t1 + 60.0)]));
+        assert_eq!(promoted, vec!["ses_x".to_string()]);
+        assert_eq!(state.sources["ses_x"].fmt, "opencode");
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
     fn a_missing_mirror_is_not_a_promotion() {
         let d = sb("missing");
-        let p_omp = omp_source(&d, "d.jsonl", SRC_BODY);
-        let c_path = sb("missing").join("gone.jsonl").display().to_string();
-        let mut state = State::default();
-        let mut src = Source::new("omp", &p_omp);
-        src.chosen_targets.insert("claude".to_string());
-        src.mirrors.insert("claude".to_string(), Mirror {
-            target: "claude".to_string(),
-            path: c_path.clone(),
-            source_hash: "old".to_string(),
-            installed_hash: String::new(), // recorded before fingerprinting existed
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
-        });
-        state.sources.insert(p_omp.clone(), src);
-        assert!(promote_changed(&mut state, &[]).is_empty(), "a gone mirror is cleanup's business");
-        assert!(state.sources.contains_key(&p_omp), "the source survives");
-        fs::remove_dir_all(&d).unwrap();
-    }
-    #[test]
-    fn an_old_state_without_target_updated_never_promotes_on_upgrade() {
-        // States written before turn-taking existed have target_updated = 0.0 on their
-        // OpenCode mirrors: the first pass must adopt them quietly, not promote spuriously.
-        let d = sb("upgrade");
-        let p_omp = omp_source(&d, "u.jsonl", SRC_BODY);
-        let mut state = State::default();
-        let mut src = Source::new("omp", &p_omp);
-        src.chosen_targets.insert("opencode".to_string());
-        src.mirrors.insert("opencode".to_string(), Mirror {
-            target: "opencode".to_string(),
-            path: "ses_upgraded".to_string(),
-            source_hash: "old".to_string(),
-            installed_hash: String::new(),
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
-        });
-        state.sources.insert(p_omp.clone(), src);
-        // Even a rising row update must not promote while nothing was recorded at install.
-        let promoted = promote_changed(&mut state, &[("ses_upgraded".to_string(), 9999999.0)]);
-        assert!(promoted.is_empty(), "target_updated = 0.0 means 'never installed', not 'edited'");
-        assert!(state.sources.contains_key(&p_omp));
+        let (mut state, src, copy) = source_and_copy(&d);
+        fs::remove_file(&copy).unwrap();
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(), "a gone mirror is cleanup's business");
+        assert!(state.sources.contains_key(&src));
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
-    fn an_exact_mtime_tie_breaks_by_harness_name() {
+    fn two_answers_at_the_same_instant_break_by_harness_name() {
         let d = sb("tie");
-        let p_omp = omp_source(&d, "t.jsonl", SRC_BODY);
-        let mut state = State::default();
-        let mut src = Source::new("opencode", "ses_tie");
-        src.chosen_targets.insert("pi".to_string());
-        src.chosen_targets.insert("gemini".to_string());
-        let now = 2000.0;
-        src.last_seen_change = now;
-        for (t, path) in [("pi", "pi.jsonl"), ("gemini", "gemini.jsonl")] {
-            let p = d.join(t).join(t);
-            fs::create_dir_all(p.parent().unwrap()).unwrap();
-            fs::write(&p, "{\"v\":1}\n").unwrap();
-            src.mirrors.insert(t.to_string(), Mirror {
-                target: t.to_string(),
-                path: p.display().to_string(),
-                source_hash: "old".to_string(),
-                installed_hash: "stale".to_string(),
-                diverged: false,
-                edit_stamp: String::new(),
-                target_updated: 0.0,
-            });
-        }
-        state.sources.insert("ses_tie".to_string(), src);
-        // Both copies report the same mtime; the tie must resolve by name (gemini < pi).
-        let promoted = promote_changed(&mut state, &[]);
-        let gpath = d.join("gemini").join("gemini").display().to_string();
-        assert_eq!(promoted, vec![gpath.clone()],
-            "the tie-break picks the alphabetically first harness");
-        assert_eq!(state.sources[&gpath].fmt, "gemini");
+        let (mut state, src, copy) = source_and_copy(&d);
+        let pi = d.join("pi").join("p.jsonl");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&pi, format!("{}\n", omp_prompt("m9", T2, "asked in pi"))).unwrap();
+        let pi = pi.display().to_string();
+        let s = state.sources.get_mut(&src).unwrap();
+        s.chosen_targets.insert("pi".into());
+        s.mirrors.insert("pi".into(), Mirror { target: "pi".into(), path: pi, installed_hash: "older".into(), ..Default::default() });
+        append(&copy, &claude_prompt(T2, "asked in claude"));
+        let promoted = promote_changed(&mut state, &no_rows(), &files_and(vec![]));
+        assert_eq!(promoted, vec![copy], "claude sorts before pi, so the outcome never depends on map order");
         fs::remove_dir_all(&d).unwrap();
     }
+
     #[test]
-    fn a_tangle_of_copies_collapses_to_one_entry() {
-        // Two entries mirroring each other (an older bug's disk state): every pass would turn
-        // the session again because each copy's rewrite invalidates the other's fingerprint.
-        // The collapse keeps one entry and stops the machine.
+    fn a_tangle_collapses_to_its_latest_turn_and_does_not_turn_again() {
+        // The loop seen on 2026-10-21: the demoted OpenCode source was adopted back from disk, so
+        // it and the promoted copy recorded each other as mirrors. The stale side's record
+        // of the copy no longer matched, and the copy was promoted (and the OpenCode session
+        // deleted and re-imported) on every pass.
         let d = sb("tangle");
-        let p_omp = omp_source(&d, "x.jsonl", SRC_BODY);
-        let c_path = mirror_file(&d, "{\"a\":1}\n");
-        let mut state = State::default();
-        let mut src = Source::new("omp", &p_omp);
-        src.chosen_targets.insert("claude".to_string());
-        src.mirrors.insert("claude".to_string(), Mirror {
-            target: "claude".to_string(),
-            path: c_path.clone(),
-            source_hash: "old".to_string(),
-            installed_hash: "stale".to_string(),
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
-        });
-        state.sources.insert(p_omp.clone(), src);
-        let mut cl = Source::new("claude", &c_path);
-        cl.chosen_targets.insert("omp".to_string());
-        cl.mirrors.insert("omp".to_string(), Mirror {
-            target: "omp".to_string(),
-            path: p_omp.clone(),
-            source_hash: "old".to_string(),
-            installed_hash: "stale".to_string(),
-            diverged: false,
-            edit_stamp: String::new(),
-            target_updated: 0.0,
-        });
-        state.sources.insert(c_path.clone(), cl);
-        let promoted = promote_changed(&mut state, &[]);
-        assert_eq!(promoted.len(), 1, "one winner, not a cycle");
-        assert_eq!(state.sources.len(), 1, "the tangle collapsed to a single entry");
-        // And a second pass with nothing touched turns nothing.
-        assert!(promote_changed(&mut state, &[]).is_empty(), "the machine stopped");
+        let (mut state, src, copy) = source_and_copy(&d);
+        state.sources.get_mut(&src).unwrap().mirrors.get_mut("claude").unwrap().installed_hash = "stale".into();
+        let mut cl = Source::new("claude", &copy);
+        cl.turn_at = 5000.0;
+        cl.chosen_targets.insert("omp".into());
+        cl.mirrors.insert("omp".into(), Mirror { target: "omp".into(), path: src.clone(), installed_hash: "stale".into(), ..Default::default() });
+        state.sources.insert(copy.clone(), cl);
+        let promoted = promote_changed(&mut state, &no_rows(), &files_and(vec![]));
+        assert!(promoted.is_empty(), "collapsing a tangle is not a turn");
+        assert_eq!(state.sources.len(), 1, "one entry per conversation");
+        assert!(state.sources.contains_key(&copy), "the most recently turned entry survives");
+        assert!(state.mirror_keys.contains(&src), "the dropped file stays a mirror, never a source again");
+        assert!(promote_changed(&mut state, &no_rows(), &files_and(vec![])).is_empty(), "the machine stopped");
         fs::remove_dir_all(&d).unwrap();
     }
 }

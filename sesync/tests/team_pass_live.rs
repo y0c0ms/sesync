@@ -88,12 +88,20 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
     let svc = Service::new(PgStore::connect(&scoped, MASTER).unwrap());
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let code = code_at(&svc.space_secret("personal").unwrap(), now);
-    let writer_path = team_join::join(&base, "personal", "writer", "writer-box", &code, &dir.join("keys/writer")).unwrap();
-    let reader_path = team_join::join(&base, "personal", "reader", "reader-box", &code, &dir.join("keys/reader")).unwrap();
-    let writer_cred = team_join::load(&writer_path).unwrap();
-    let reader_cred = team_join::load(&reader_path).unwrap();
-    let publish = Command::Publish { name: "personal".into() };
-    sesync::team_cli::run_detailed(&publish, &base, ADMIN_TOKEN, &dir).expect("publish the member list");
+    let writer_join = team_join::join(&base, "personal", "writer", "writer-box", &code, &dir.join("keys/writer")).unwrap();
+    let reader_join = team_join::join(&base, "personal", "reader", "reader-box", &code, &dir.join("keys/reader")).unwrap();
+    // A new key only asks: the admin approves each device after comparing its fingerprint, and
+    // each device picks up the signed list the way the daemon does.
+    for (member, machine, joined) in [("writer", "writer-box", &writer_join), ("reader", "reader-box", &reader_join)] {
+        let approve = Command::Approve { name: "personal".into(), member: member.into(), machine: machine.into(),
+                                         fingerprint: Some(joined.fingerprint.clone()) };
+        sesync::team_cli::run_detailed(&approve, &base, ADMIN_TOKEN, &dir).expect("the admin approves the device");
+    }
+    for keys in ["keys/writer", "keys/reader"] {
+        team_join::check_approval(None, &dir.join(keys), "personal").expect("the device picks up its approval");
+    }
+    let writer_cred = team_join::load(&writer_join.path).unwrap();
+    let reader_cred = team_join::load(&reader_join.path).unwrap();
 
     // The writer's daemon pass: the session is marked and quiet, so it is sealed and pushed.
     std::env::set_var("SESYNC_TEAM_URL", &base);

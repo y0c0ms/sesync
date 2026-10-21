@@ -2,10 +2,11 @@
 //! panic on any input. A malformed journal, transcript, export row or state file is a
 //! normal event, and the worst acceptable outcome is an error or an empty result.
 
-use sesync::claude_source::cut_compaction_cycles;
-use sesync::discovery::{parse_claude_name, parse_omp_name};
+use sesync::harness::claude::compaction::cut_compaction_cycles;
+use sesync::harness::claude::{claude_title_from_lines, parse_claude_name};
+use sesync::harness::journal::{omp_title_from_lines, parse_omp_name};
+use sesync::harness::opencode::store::clean_title;
 use sesync::state::State;
-use sesync::titles::{claude_title_from_lines, clean_opencode_title, omp_title_from_lines};
 use proptest::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -33,8 +34,7 @@ proptest! {
 
     #[test]
     fn opencode_title_never_panics(t in ".{0,200}") {
-        let _ = clean_opencode_title(Some(&t));
-        let _ = clean_opencode_title(None);
+        let _ = clean_title(&t);
     }
 
     #[test]

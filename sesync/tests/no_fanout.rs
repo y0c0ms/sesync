@@ -42,7 +42,7 @@ fn run(sb: &Path, args: &[&str]) -> Output {
         .env("OMP_AGENT_DIR", sb.join("omp"))
         .env("PI_AGENT_DIR", sb.join("pi"))
         .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
-        .env("GEMINI_CLI_HOME", sb.join("gemini"))
+        .env("ANTIGRAVITY_CLI_HOME", sb.join("antigravity"))
         .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
         .env("SESYNC_CONV", sb.join("no-converter"))
         .env("SESYNC_LOCK", sb.join("no-sesync_lock"))

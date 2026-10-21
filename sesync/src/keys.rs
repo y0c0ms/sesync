@@ -21,6 +21,9 @@ pub fn key_to_ev(code: KeyCode, mods: KeyModifiers) -> Option<Ev> {
         KeyCode::Enter => Some(Ev::Enter),
         KeyCode::Esc => Some(Ev::Esc),
         KeyCode::Tab => Some(Ev::Tab),
+        // Shift with an arrow scrolls the preview of the highlighted session, not the list.
+        KeyCode::Up if mods.contains(KeyModifiers::SHIFT) => Some(Ev::PreviewUp),
+        KeyCode::Down if mods.contains(KeyModifiers::SHIFT) => Some(Ev::PreviewDown),
         KeyCode::Up => Some(Ev::Up),
         KeyCode::Down => Some(Ev::Down),
         KeyCode::PageUp => Some(Ev::PageUp),

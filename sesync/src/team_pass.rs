@@ -14,7 +14,7 @@ use std::path::Path;
 /// Why a team pass could not run at all. A pass that runs reports per-session results instead.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotRun {
-    /// No team is configured on this machine (no credential, or no server address).
+    /// No team is configured on this machine (no usable credential, or no server address).
     NoTeam,
     /// The credential is there but has no pinned trust root, so nothing can be sealed for it.
     NoTrustRoot,
@@ -30,6 +30,8 @@ pub fn team_quiet_secs() -> f64 {
 /// Run a pass for every team this machine belongs to: each team pushes the sessions shared with
 /// it, under its own lease and sequence. The canonical bytes for a conversation are built ONCE
 /// and reused for every team it is shared with, so a session on two teams is converted once.
+/// A team whose credential cannot be read, or that has no server address, is skipped; the other
+/// teams are still pushed.
 pub fn run(
     config_dir: &Path,
     state: &mut State,
@@ -37,23 +39,24 @@ pub fn run(
     mut content_of: impl FnMut(&str) -> Result<Vec<u8>, String>,
     mut last_change_of: impl FnMut(&str) -> Option<f64>,
 ) -> Result<Vec<TeamPass>, NotRun> {
-    let base = std::env::var("SESYNC_TEAM_URL").map_err(|_| NotRun::NoTeam)?;
+    let env_base = std::env::var("SESYNC_TEAM_URL").ok();
     let spaces: Vec<String> = match std::env::var("SESYNC_TEAM_SPACE").ok() {
         Some(s) => vec![s],
-        None => {
-            let all = crate::team_watch::all_teams(config_dir);
-            if all.is_empty() { single_team(config_dir).into_iter().collect() } else { all }
-        }
+        None => crate::team_watch::all_teams(config_dir),
     };
-    if spaces.is_empty() { return Err(NotRun::NoTeam); }
     // Build each conversation's canonical bytes once, whatever it is shared with.
     let mut canon = CanonCache::default();
     let mut passes = Vec::new();
     for space in spaces {
-        let cred = team_join::load(&team_join::credential_path(config_dir, &space)).map_err(|_| NotRun::NoTeam)?;
+        let Ok(cred) = team_join::load(&team_join::credential_path(config_dir, &space)) else { continue };
+        // The server the team was joined on; SESYNC_TEAM_URL for an older credential.
+        let Some(base) = cred.server.clone().or_else(|| env_base.clone()) else { continue };
         let Some(pinned) = team_join::trust_of(&cred) else { continue };
-        // Refresh before sealing: records must be signed under the current list version.
+        // Refresh before sealing: records must be signed under the current list version. A newer
+        // list is kept, so the list held here only moves forward; a failure to keep it is the
+        // pull's to report, the push still seals under the list it verified.
         let trust = fetch_and_verify(&base, &cred.token, &cred.machine, &space, &pinned).unwrap_or(pinned);
+        let _ = team_join::ratchet_list(config_dir, &space, &trust);
         let Ok(writer) = load_or_create(config_dir) else { continue };
         let remote = HttpTeam { base: base.clone(), token: cred.token.clone(), machine: cred.machine.clone() };
         let quiet = team_quiet_secs();
@@ -86,19 +89,13 @@ impl CanonCache {
     }
 }
 
-/// The one credential on this machine, when there is exactly one team; otherwise none.
-fn single_team(config_dir: &Path) -> Option<String> {
-    let dir = config_dir.join("teams");
-    let mut names = std::fs::read_dir(&dir).ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|n| n.strip_suffix(".cred").map(str::to_string));
-    let first = names.next()?;
-    if names.next().is_some() { None } else { Some(first) }
-}
-
-/// Whether a pass ran and what it did, for the daemon's log line.
+/// Whether a pass ran and what it did, for the daemon's log line. Each failure is named with its
+/// reason: a bare count hides, say, that the server no longer accepts this device.
 pub fn summary(pass: &TeamPass) -> String {
-    format!("team push: {} pushed, {} unchanged, {} failed",
-        pass.pushed.len(), pass.skipped_unchanged.len(), pass.failed.len())
+    let mut s = format!("team push: {} pushed, {} unchanged, {} failed",
+        pass.pushed.len(), pass.skipped_unchanged.len(), pass.failed.len());
+    for (id, why) in &pass.failed {
+        s.push_str(&format!("; {id}: {why}"));
+    }
+    s
 }

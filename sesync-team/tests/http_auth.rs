@@ -14,7 +14,7 @@ fn setup() -> (Service<MemoryStore>, String) {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let token = s.enrol("team-a", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     (s, token)
 }
 
@@ -27,7 +27,7 @@ fn enrol_with_the_right_code_returns_a_token_and_lifetime() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code, device: None };
+    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code, device: None, proof: None };
     let (status, json) = http::enrol(&mut s, &body, T0);
     assert_eq!(status, 200);
     assert!(json["token"].as_str().unwrap().len() > 10);
@@ -38,7 +38,7 @@ fn enrol_with_the_right_code_returns_a_token_and_lifetime() {
 fn enrol_with_a_wrong_code_is_401_and_issues_nothing() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
-    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code: "000000".into(), device: None };
+    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-1".into(), code: "000000".into(), device: None, proof: None };
     let (status, json) = http::enrol(&mut s, &body, T0);
     assert_eq!(status, 401);
     assert!(json.get("token").is_none());
