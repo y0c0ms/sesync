@@ -107,14 +107,9 @@ fn an_answer_in_the_mirror_promotes_it_to_source() {
     assert!(new_src.chosen_targets.contains("omp"), "the losing harness is still a target");
     assert!(disk.mirror_keys.contains(&omp_files[0].display().to_string()),
         "the surviving omp copy is recorded as a mirror");
-    // Where omp files the winner's copy depends on the temp root: with /tmp as the temp root (as
-    // on Linux) a /tmp/proj session belongs in `-tmp-proj`, so the copy replaces the losing file
-    // at its own path; elsewhere it lands in `--tmp-proj--` and the losing file must be gone.
-    if omp_files[0] != omp_path {
-        assert!(!disk.mirror_keys.contains(&omp_path.display().to_string()),
-            "the losing file is gone, and its key with it");
-        assert!(!omp_path.exists(), "the losing omp file was replaced by the winner's copy");
-    }
+    assert!(!disk.mirror_keys.contains(&omp_path.display().to_string()),
+        "the losing file is gone, and its key with it");
+    assert!(!omp_path.exists(), "the losing omp file was replaced by the winner's copy");
     let _ = fs::remove_dir_all(&sb);
 }
 

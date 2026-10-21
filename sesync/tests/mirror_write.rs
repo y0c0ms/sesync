@@ -118,6 +118,27 @@ fn replacing_a_mirror_keeps_an_edited_old_file() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The install replaces an older copy with the same id in the folder it writes to, so the copy
+/// being replaced can be gone before it is recorded over: its key goes too, never pointing at a
+/// file that is not there.
+#[test]
+fn replacing_a_mirror_whose_old_file_is_already_gone_leaves_no_key() {
+    let d = sandbox("replace-gone");
+    let mut state = State::default();
+    state.sources.insert("/src/a.jsonl".into(), Source::new("omp", "/src/a.jsonl"));
+    let old = d.join("sessions/-proj/2026-10-01T10-00-00-000Z_mirror.jsonl");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"old copy").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &old).unwrap();
+    std::fs::remove_file(&old).unwrap();
+    let new = d.join("sessions/-proj/2026-10-01T10-00-01-000Z_mirror.jsonl");
+    std::fs::write(&new, b"new copy").unwrap();
+    record_mirror(&mut state, "/src/a.jsonl", "omp", &new).unwrap();
+    assert!(!state.mirror_keys.contains(&old.display().to_string()), "no key for a file that is gone");
+    assert!(state.mirror_keys.contains(&new.display().to_string()));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_source_with_no_chosen_target_is_never_counted_as_wanting_a_mirror() {
     // The daemon's `wanted` is the number of chosen targets. With the default empty set, a

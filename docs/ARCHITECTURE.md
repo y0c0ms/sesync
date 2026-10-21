@@ -360,7 +360,9 @@ recorded the copy and its sync time.
   when the target says it is misplaced (`Harness::misplaced`: its bucket disagrees with that
   cwd), the file is gone, or, for a database harness, its id is absent from the rows the scan
   read; the next pass rewrites it, and `mirror_write::record_mirror` replaces the record,
-  deleting the superseded file only when it is unchanged. Before 2026-10-21 Pi copies, and omp
+  deleting the superseded file only when it is unchanged (the install itself replaces an older
+  file with the same id in the folder it writes to, after the archive kept it if sesync had not
+  written it; a superseded file already gone leaves no key). Before 2026-10-21 Pi copies, and omp
   copies of a temp-root or outside-home project, went to a folder named by a wrong rule
   (`-<absolute>-`), which their harness never lists for the project; those copies are moved this
   way on the first pass of a fixed daemon.

@@ -205,7 +205,8 @@ fn install_into(
 /// the old file is removed first, but only when it is still exactly what sesync wrote (or was
 /// kept in the archive just before this write), so nothing a user may have since edited is ever
 /// lost. Anything kept stays in `mirror_keys`, which is what stops the scan from treating it as
-/// a source.
+/// a source. An old file already gone (the install replaces an older copy with the same id in
+/// the folder it writes to) leaves no key: nothing is left to keep apart.
 pub fn record_mirror(state: &mut State, source_key: &str, target: &str, installed: &Path) -> Result<(), String> {
     let src = state.sources.get_mut(source_key).ok_or("unknown source")?;
     let path = installed.display().to_string();
@@ -218,6 +219,8 @@ pub fn record_mirror(state: &mut State, source_key: &str, target: &str, installe
                 && copy_hash(target, p).map(|h| h == old_hash).unwrap_or(false);
             if ours_unchanged {
                 let _ = crate::mirror::remove_copy(target, p);
+                state.mirror_keys.remove(&old_path);
+            } else if crate::mirror::is_file_key(&old_path) && !p.exists() {
                 state.mirror_keys.remove(&old_path);
             }
         }

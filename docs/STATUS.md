@@ -47,7 +47,17 @@ members, each with its own TUI and daemon) and reading the harnesses' own source
 - **Pi leftovers.** Three Pi files from 2026-10-12 (copies an older tool wrote, recorded as
   sources) sat in single-dash folders Pi never lists. They were deleted through the TUI, so their
   records went with them, and the eleven empty single-dash folders were removed.
-- **Suites** (Windows, sandboxed): `sesync` 596 passed, 0 failed; `sesync-conv` 75 passed.
+- **CI on Linux and macOS** (PR #56) ran tests Windows never runs. A unix-only TUI test wrote
+  the admin token file readable by others (the dialogs refuse that), the pty test waited for the
+  Team tab's old text, and the mirror picker showed claude without its icon: U+2736 sits in the
+  Dingbats block the screen scrub drops (now U+22C6, and a test keeps every harness icon out of
+  the scrubbed ranges). One was a real bug: with `/tmp` as the temp root, a promotion's omp
+  rewrite lands in the folder the losing file sits in, the install's same-id sweep removes that
+  file (after the archive kept it), and its key stayed in `mirror_keys`; a superseded file
+  already gone now leaves no key. On Windows, `TEMP=/tmp` reproduces Linux's temp root: the
+  converter and the folder check both read it.
+- **Suites** (Windows, sandboxed): `sesync` 598 passed, 0 failed (also with `TEMP=/tmp`);
+  `sesync-conv` 75 passed.
 
 ## 2026-10-21: a deleted session leaves the list; live OpenCode sessions are not "missing"
 
