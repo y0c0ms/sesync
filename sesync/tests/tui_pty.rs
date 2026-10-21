@@ -151,8 +151,8 @@ fn tui_opens_the_command_list_and_the_team_tab() {
     let _ = wait_for("PtyPaletteTitle", master, checked);
 
     m.write_all(b"\t").unwrap(); // tab moves to the Team pane
-    let text = wait_for("No team server configured", master, checked);
-    assert!(text.contains("SESYNC_TEAM_URL"), "the Team pane must say what is missing:\n{text}");
+    let text = wait_for("Not in a team yet", master, checked);
+    assert!(text.contains("Join a team"), "the Team pane must say how to join a team:\n{text}");
 
     m.write_all(b"\x03").unwrap(); // ctrl+c copies the path and reminds that q quits
     let text = wait_for("press q to quit", master, checked);

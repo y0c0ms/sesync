@@ -23,10 +23,16 @@ fn request(kind: Kind, values: &[(&str, &str)]) -> SetupRequest {
     }
 }
 
-/// The admin token file the dialogs read, written the way an operator would keep it.
+/// The admin token file the dialogs read, written the way an operator would keep it: owner-only,
+/// since the CLI and the dialogs refuse a token file others can read.
 fn token_file(dir: &Path) -> String {
     let path = dir.join("admin-token");
     std::fs::write(&path, ADMIN_TOKEN).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     path.display().to_string()
 }
 
