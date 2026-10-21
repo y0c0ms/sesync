@@ -211,3 +211,23 @@ fn the_qr_dialog_draws_the_authenticator_code() {
     a.handle(Ev::Esc, Instant::now());
     assert_eq!(a.mode(), Mode::Browse);
 }
+
+#[test]
+fn surrounding_spaces_in_a_field_never_reach_the_caller() {
+    // A trailing space typed into the server-url field made it an invalid URL and the create
+    // reported "cannot reach the team server" while the server was up.
+    let mut a = open_register();
+    for (i, v) in [" main ", "laptop, pixel ", " /tmp/admin-token", " http://team.test:30500 "].iter().enumerate() {
+        if i > 0 {
+            a.handle(Ev::Tab, Instant::now());
+        }
+        type_text(&mut a, v);
+    }
+    a.handle(Ev::Enter, Instant::now());
+    let req = a.take_setup_request().expect("the caller is asked to create the team");
+    assert_eq!(req.value_of("team"), "main");
+    assert_eq!(req.value_of("members"), "laptop, pixel");
+    assert_eq!(req.value_of("admin token file"), "/tmp/admin-token");
+    assert_eq!(req.value_of("server url"), "http://team.test:30500",
+        "the trimmed URL is what the caller posts to");
+}

@@ -1,6 +1,2 @@
-# Build only what the image needs. Local state, caches and secrets never enter the context.
-**/target/
-**/.git/
-**/*.key
-**/*.pem
-**/.env
+target
+.git

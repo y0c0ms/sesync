@@ -163,6 +163,8 @@ impl Form {
 
     /// (name, value) in field order, ready for the caller's network step.
     pub fn collected(&self) -> Vec<(String, String)> {
-        self.fields.iter().map(|f| (f.name.to_string(), f.value.clone())).collect()
+        // Trim every value: a trailing space typed into a field made the server URL invalid and
+        // the dialog report "cannot reach the team server" while the server was up.
+        self.fields.iter().map(|f| (f.name.to_string(), f.value.trim().to_string())).collect()
     }
 }
