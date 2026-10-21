@@ -102,6 +102,15 @@ fn display_safe_drops_glyphs_terminals_draw_at_different_widths() {
     assert_eq!(display_safe("  one\ttwo\n\nthree  "), "one two three", "whitespace collapses and trims");
 }
 
+/// Every harness icon is drawn: none is a glyph the screen scrub drops, or a harness would show
+/// in the pickers without the icon the others have.
+#[test]
+fn every_harness_icon_survives_the_screen_scrub() {
+    for h in sesync::harness::ALL {
+        assert_eq!(display_safe(h.icon()), h.icon(), "the {} icon is dropped from the screen", h.id());
+    }
+}
+
 #[test]
 fn fit_pads_and_cuts_by_terminal_cells_not_characters() {
     assert_eq!(text_width(&fit("\u{4E2D}\u{6587}", 6)), 6, "two wide characters pad to six cells");

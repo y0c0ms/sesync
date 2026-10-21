@@ -16,8 +16,10 @@ impl Harness for Claude {
     fn id(&self) -> &'static str {
         "claude"
     }
+    /// A star like Claude's own mark, from Mathematical Operators: the Dingbats star used before
+    /// (U+2736) is one of the glyphs the screen scrub drops, so it never showed.
     fn icon(&self) -> &'static str {
-        "✶"
+        "⋆"
     }
     fn locate(&self, home: &Path) -> Location {
         Location { root: super::env_path("CLAUDE_CONFIG_DIR", home.join(".claude")), cli: None }

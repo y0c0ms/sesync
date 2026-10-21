@@ -231,7 +231,7 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
 
     m.write_all(b"jj\r").unwrap(); // down two rows to Mirror to harness, then run it
     let text = wait_for("space tick", master, seen);
-    assert!(text.contains("[ ] π pi") && text.contains("[ ] ✶ claude"),
+    assert!(text.contains("[ ] π pi") && text.contains("[ ] ⋆ claude"),
         "a fresh picker starts with nothing ticked, each harness behind its icon:\n{text}");
 
     m.write_all(b"j \r").unwrap(); // tick claude only, confirm
