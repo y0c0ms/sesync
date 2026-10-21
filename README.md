@@ -97,10 +97,16 @@ more a details pane shows the selected session and, per copy, when it was last w
 failed. Below that it previews the session's last messages, newest at the bottom, and updates by
 itself when the session changes, so a new message shows up without a key press; shift+up/down or
 the wheel over the pane scrolls back. The tab bar says when the daemon last ran a pass and how many copies are in place or
-failing. A session whose file is gone is listed by its name with `(missing)`. Emoji and icon glyphs
+failing. Deleting a session (ctrl+d twice opens a dialog naming what goes and what stays; ctrl+d,
+Enter or `y` there deletes) removes its file and its row; its copies in other
+harnesses stay and are listed as sessions of their own. A session gone outside sesync (its file
+deleted, or its OpenCode row) is listed by its name with `(missing)`, and deleting that row only
+forgets it. Emoji and icon glyphs
 in titles are left out of the display, because terminals draw them at different widths; the stored
 title is unchanged. The mouse selects a row, the wheel scrolls the list (or the preview, over the
-details pane), and a double-click works like Enter.
+details pane), and a double-click works like Enter. Two TUIs can be open at once (two terminals):
+each saves only the choices made in it (shares, mirror targets, deletes), so neither overwrites
+the other, and each shows the other's choices as soon as the state file changes.
 
 Team commands. `join` and `renew` run on a member's machine; every other command runs on the
 admin's machine (the one that created the team, which holds the admin key) and also needs
@@ -136,7 +142,17 @@ started a team remembers it (team, server and token file path in `config/admin/t
 "Team members" and "Invite a member" work there from then on, before it joins the team itself.
 "Join a team" asks for the server, the team, your member name, this machine's name and the 6-digit
 code, and shows the fingerprint to read to the admin. The Team tab shows, per team, where this
-machine stands: listed, or waiting for the admin with its fingerprint.
+machine stands: listed, waiting for the admin with its fingerprint, or refused by the server (the
+device was revoked or its member removed) with the server's reason. "Leave a team" removes this
+machine's membership: a revoked one, or a join the admin declined (the server answers a declined
+key exactly as a pending one, so that join keeps saying it waits). It unshares every session from
+that team and takes the sessions only that team's pulls brought over off the Team list (one
+another team holds too stays, as that team's copy); the team and its sessions on the server are
+untouched. The
+same picker can stop managing a team started here. Enter twice confirms. On the Team tab, `i`
+imports the selected session into omp, in the folder omp lists for the session's project, unless
+omp already holds that session. The share picker also lists a team a session is still shared
+with after this machine left it, so that share can be untied.
 
 In the members dialog, `a` approves the selected waiting request, `d` refuses it, `r` revokes a
 listed device and `m` removes a member. Every change takes two presses on the same row; moving the

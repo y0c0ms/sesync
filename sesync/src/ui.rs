@@ -70,6 +70,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Transcript => draw_transcript(f, app, th, area),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, th, area),
         Mode::SharePick => draw_share_pick(f, app, th, area),
+        Mode::LeavePick => draw_leave_pick(f, app, th, area),
         Mode::Members => draw_members(f, app, th, area),
         _ => {}
     }
@@ -464,32 +465,45 @@ fn mirror_spans(parts: &[(String, crate::session_cols::MirrorState)], width: usi
     spans
 }
 
-/// The Team pane: one line per joined team saying where this machine stands, then what a
-/// verified pull actually brought over.
+/// The Team pane: one line per joined team saying where this machine stands (with a dim line
+/// under it when the user has something to do), then what a verified pull actually brought over.
 fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     use crate::team_join::Standing;
+    const LEAVE: &str = "ctrl+p, Leave a team";
     let cards = app.team_cards();
     // Teams this machine started but has not joined: it can manage them, but syncs nothing there
     // until it joins like any other device.
     let unjoined: Vec<&crate::team_cli::AdminTeam> = app.admin_teams().iter()
         .filter(|a| !cards.iter().any(|c| c.space == a.team))
         .collect();
-    let parts = Layout::vertical([Constraint::Length((cards.len() + unjoined.len()) as u16 + 1), Constraint::Min(1)]).split(area);
-    let mut head: Vec<Line> = cards.iter().map(|c| {
+    let mut head: Vec<Line> = Vec::new();
+    for c in cards {
         let who = if c.member.is_empty() { String::new() } else { format!("  {}@{}", c.member, c.machine) };
         let server = if c.server.is_empty() { String::new() } else { format!("  {}", c.server) };
-        let (standing, color) = match &c.standing {
-            Standing::Listed { version: Some(v) } => (format!("listed (list v{v})"), th.text),
-            Standing::Listed { version: None } => ("joined".to_string(), th.text),
+        let (standing, color, hint) = match &c.standing {
+            // A listed device the server now refuses (revoked, or its member removed): say so,
+            // and how to clear it, instead of reading as a healthy team with nothing in it.
+            Standing::Listed { .. } if app.team_problem(&c.space).is_some() => (
+                app.team_problem(&c.space).unwrap_or_default().to_string(), th.error,
+                Some(format!("this machine is no longer in the team; to clear it: {LEAVE}"))),
+            Standing::Listed { version: Some(v) } => (format!("listed (list v{v})"), th.text, None),
+            Standing::Listed { version: None } => ("joined".to_string(), th.text, None),
+            // The server answers a declined key as it answers a pending one, so the hint says
+            // how to drop a join that will never be approved.
             Standing::Waiting { fingerprint } => (
-                format!("waiting for the admin; tell them this fingerprint: {fingerprint}"), th.warn),
-            Standing::Unreadable(e) => (format!("credential unreadable: {e}"), th.error),
+                format!("waiting for the admin; tell them this fingerprint: {fingerprint}"), th.warn,
+                Some(format!("if the admin declined it, it waits forever; to drop it: {LEAVE}"))),
+            Standing::Unreadable(e) => (format!("credential unreadable: {e}"), th.error,
+                Some(format!("to remove it: {LEAVE}"))),
         };
-        Line::from(vec![
+        head.push(Line::from(vec![
             Span::styled(format!("{}{who}{server}  ", crate::session_cols::display_safe(&c.space)), Style::default().fg(th.text)),
             Span::styled(standing, Style::default().fg(color)),
-        ])
-    }).collect();
+        ]));
+        if let Some(hint) = hint {
+            head.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(th.dim))));
+        }
+    }
     for a in &unjoined {
         head.push(Line::from(vec![
             Span::styled(format!("{}  {}  ", crate::session_cols::display_safe(&a.team), a.server), Style::default().fg(th.text)),
@@ -497,6 +511,7 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ]));
     }
     head.push(Line::from(Span::styled(app.team_header(std::time::Instant::now()), Style::default().fg(th.dim))));
+    let parts = Layout::vertical([Constraint::Length(head.len() as u16), Constraint::Min(1)]).split(area);
     f.render_widget(Paragraph::new(head), parts[0]);
     let area = parts[1];
     let rows = app.team_rows();
@@ -787,10 +802,11 @@ fn draw_transcript(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     hint(f, "j/k scroll · esc close", th, parts[1]);
 }
 
-/// The share picker: one row per team this machine belongs to, space ticks. A session can be
-/// shared into several teams; the ticks start from what it already is.
+/// The share picker: one row per team this machine belongs to, plus any team the session is
+/// still shared with that it no longer belongs to (so that share can be untied), space ticks.
+/// A session can be shared into several teams; the ticks start from what it already is.
 fn draw_share_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
-    let teams = app.teams();
+    let teams = app.share_picker_rows();
     let outer = centered(56, teams.len().max(1) as u16 + 4, area);
     let inner = dialog(f, "Share with teams", th, outer);
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
@@ -807,6 +823,26 @@ fn draw_share_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         f.render_widget(List::new(lines), parts[0]);
     }
     hint(f, "space tick · a all · n none · enter keep · esc cancel", th, parts[1]);
+}
+
+/// The leave picker: every team record on this machine (a membership, or a team managed here),
+/// the cursor, and the row a first Enter armed.
+fn draw_leave_pick(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let rows = app.leave_rows();
+    // Wide enough for the longest row and the confirm marker; `centered` clamps it to the screen.
+    let widest = rows.iter().map(|(label, _)| label.chars().count()).max().unwrap_or(0);
+    let outer = centered((widest + 32).min(u16::MAX as usize) as u16, rows.len().max(1) as u16 + 4, area);
+    let inner = dialog(f, "Leave a team", th, outer);
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let cursor = app.leave_cursor();
+    let lines: Vec<ListItem> = rows.iter().enumerate().map(|(i, (label, _))| {
+        let armed = app.leave_armed() == Some(i);
+        let style = if i == cursor { on_accent(th, true) } else { Style::default().fg(th.text) };
+        let text = format!(" {}{}", crate::session_cols::display_safe(label), if armed { "  · enter again to confirm" } else { "" });
+        ListItem::new(Line::from(Span::styled(text, style)))
+    }).collect();
+    f.render_widget(List::new(lines), parts[0]);
+    hint(f, "up/down move · enter twice leaves · esc cancel", th, parts[1]);
 }
 
 /// The members dialog: the team's list (listed devices, then requests waiting for approval),

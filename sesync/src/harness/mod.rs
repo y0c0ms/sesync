@@ -196,6 +196,12 @@ pub trait Harness: Send + Sync {
     fn misplaced(&self, _path: &str, _cwd: Option<&str>, _home: &str) -> bool {
         false
     }
+    /// The folder this harness lists a project's conversations from, for the project directory
+    /// `cwd`: where a file written for that project must go to be offered there. None for a
+    /// harness whose files are not placed by project.
+    fn folder_for_cwd(&self, _loc: &Location, _home: &str, _cwd: &str) -> Option<PathBuf> {
+        None
+    }
 
     // ----- both kinds --------------------------------------------------------------------------
 

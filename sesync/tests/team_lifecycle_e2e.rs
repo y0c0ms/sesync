@@ -648,6 +648,34 @@ fn a_revoked_device_is_refused_at_once_and_only_a_new_approval_lets_anyone_back(
 }
 
 #[test]
+fn a_members_held_list_follows_a_revoke_and_never_goes_back() {
+    let srv = TeamServer::start(T0);
+    let admin = sandbox("rt-admin");
+    let (acfg, bcfg) = (sandbox("rt-alice"), sandbox("rt-bob"));
+    srv.create(&admin, "personal", &["alice", "bob"]);
+    srv.admit(&admin, &acfg, "personal", "alice", "laptop");
+    srv.set_now(T0 + 60);
+    srv.admit(&admin, &bcfg, "personal", "bob", "bob-box");
+    let held = |cfg: &Path| team_join::load(&credential_path(cfg, "personal")).unwrap().list_version.unwrap();
+    let at_approval = held(&acfg);
+    let old = trust_of(&team_join::load(&credential_path(&acfg, "personal")).unwrap()).unwrap();
+
+    run_admin(&srv, &admin, Command::Revoke { name: "personal".into(), member: "bob".into(), machine: "bob-box".into() }).unwrap();
+    let pulls = TeamWatch::pull_each(&teams_from_env(&acfg), &BTreeMap::new());
+    let kept = TeamWatch::keep_newer_lists(&acfg, &pulls);
+    let now_held = held(&acfg);
+    assert!(now_held > at_approval, "the list in force after the revoke is kept ({at_approval} -> {now_held})");
+    assert_eq!(kept, vec![("personal".to_string(), Ok(now_held))]);
+    assert!(TeamWatch::keep_newer_lists(&acfg, &TeamWatch::pull_each(&teams_from_env(&acfg), &BTreeMap::new())).is_empty(),
+        "the same list again changes nothing");
+    // The list from before the revoke is never kept again, whoever offers it.
+    assert_eq!(team_join::ratchet_list(&acfg, "personal", &old).unwrap(), None);
+    assert_eq!(held(&acfg), now_held);
+    assert!(matches!(&team_join::team_cards(&acfg)[0].standing,
+        team_join::Standing::Listed { version: Some(v) } if *v == now_held), "the Team card shows the version in force");
+}
+
+#[test]
 fn a_listed_machines_key_cannot_be_replaced_through_a_join_and_the_real_device_keeps_working() {
     let srv = TeamServer::start(T0);
     let admin = sandbox("steal-admin");

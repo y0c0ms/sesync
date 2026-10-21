@@ -241,7 +241,7 @@ fn main() {
                     (journal::pi_bucket(&cwd), None)
                 } else {
                     let home = arg(&args, "--home").or_else(|| env::var("USERPROFILE").ok()).unwrap_or_else(|| usage());
-                    (journal::omp_bucket(&cwd, &home), Some(Journal::title_slot_line(&title, &ts)))
+                    (journal::omp_bucket(&cwd, &home, &journal::node_tmpdir()), Some(Journal::title_slot_line(&title, &ts)))
                 };
                 if cmd == "to-pi" {
                     // Pi has no title slot: the picker shows the last `session_info.name`.

@@ -315,11 +315,133 @@ pub fn jsonl_sessions(agent_dir: &Path) -> Vec<PathBuf> {
     one_level_down(&agent_dir.join("sessions"), |n| parse_omp_name(n).is_some())
 }
 
-/// Each path separator becomes '-', the drive colon too; every other character is kept. The
-/// converter (`sesync-conv/src/journal.rs`) is the single writer of copies, and names their
-/// project folders by this rule: this copy exists only so a copy in the wrong folder is noticed.
+/// Each path separator becomes '-', the drive colon too; every other character is kept.
 pub fn seg_join(path: &str) -> String {
     path.chars().map(|c| if matches!(c, '\\' | '/' | ':') { '-' } else { c }).collect()
+}
+
+/// Pi's project folder for a cwd, as pi-coding-agent 1.1 names it (`session-manager.ts`,
+/// `getDefaultSessionDirPath`): the absolute path without one leading separator, each `/`, `\`
+/// and `:` made '-', wrapped in "--" on both sides: `C:\Users\u\proj` is `--C--Users-u-proj--`,
+/// `/home/u/proj` is `--home-u-proj--`. Pi lists, continues and resumes a project from that one
+/// folder, so a copy anywhere else is never offered there. The converter
+/// (`sesync-conv/src/journal.rs`) writes copies by the same rule; keep the two in step.
+pub fn pi_bucket(cwd: &str) -> String {
+    let path = resolved(cwd);
+    let rest = path.strip_prefix(['/', '\\']).unwrap_or(&path);
+    format!("--{}--", seg_join(rest))
+}
+
+/// omp's project folder for a cwd, as oh-my-pi 18.12 names it (`session/session-paths.ts`,
+/// `getDefaultSessionDirName`). The temp root is checked first (on Windows it sits inside the
+/// home): a cwd in it is `-tmp-<relative>`, the root itself `-tmp`. Then a cwd in the home is
+/// `-<relative>`, the home itself `-`. Any other cwd takes Pi's absolute form. The converter
+/// writes copies by the same rule; keep the two in step.
+pub fn omp_bucket(cwd: &str, home: &str, temp: &str) -> String {
+    let path = resolved(cwd);
+    if let Some(rel) = relative_within(&path, temp) {
+        return relative_bucket("-tmp", &rel);
+    }
+    if let Some(rel) = relative_within(&path, home) {
+        return relative_bucket("-", &rel);
+    }
+    pi_bucket(&path)
+}
+
+/// The temp root as Node's `os.tmpdir()` finds it, the root omp files temp sessions under:
+/// `TEMP`, else `TMP` on Windows; `TMPDIR`, `TMP`, `TEMP`, else `/tmp` elsewhere.
+pub fn node_tmpdir() -> String {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if cfg!(windows) {
+        var("TEMP").or_else(|| var("TMP"))
+            .or_else(|| var("SystemRoot").or_else(|| var("windir")).map(|r| format!("{r}\\temp")))
+            .unwrap_or_default()
+    } else {
+        var("TMPDIR").or_else(|| var("TMP")).or_else(|| var("TEMP")).unwrap_or_else(|| "/tmp".to_string())
+    }
+}
+
+/// A cwd as `path.resolve` leaves it: no trailing separator, except on a root (`/`, `C:\`).
+fn resolved(cwd: &str) -> String {
+    let t = cwd.trim_end_matches(['\\', '/']);
+    if t.is_empty() || t.ends_with(':') {
+        return cwd[..(t.len() + 1).min(cwd.len())].to_string();
+    }
+    t.to_string()
+}
+
+/// `path` relative to `root` when it is the root or inside it, without a leading separator.
+/// Either separator matches and ASCII case is ignored, as on Windows. None when it is outside,
+/// or `root` is empty.
+fn relative_within(path: &str, root: &str) -> Option<String> {
+    let norm = |s: &str| s.replace('/', "\\");
+    let (p, r) = (norm(path), norm(root.trim_end_matches(['\\', '/'])));
+    if r.is_empty() || !p.get(..r.len())?.eq_ignore_ascii_case(&r) {
+        return None;
+    }
+    match &p[r.len()..] {
+        "" => Some(String::new()),
+        rest => rest.strip_prefix('\\').map(str::to_string),
+    }
+}
+
+/// omp's `encodeRelativeSessionDirName`: the prefix alone for the root itself, else the prefix
+/// and the relative path with its separators made '-', joined by one '-'.
+fn relative_bucket(prefix: &str, rel: &str) -> String {
+    let enc = seg_join(rel);
+    if enc.is_empty() {
+        prefix.to_string()
+    } else if prefix.ends_with('-') {
+        format!("{prefix}{enc}")
+    } else {
+        format!("{prefix}-{enc}")
+    }
+}
+
+/// The file name omp and Pi give a session: its start time with `:` and `.` made '-', then its
+/// id (`2026-10-01T10-00-00-000Z_<uuid>.jsonl`).
+pub fn journal_filename(timestamp_iso: &str, id: &str) -> String {
+    format!("{}_{}.jsonl", timestamp_iso.replace([':', '.'], "-"), id)
+}
+
+/// Where and when a journal's conversation started, from its `session` record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionHead {
+    pub cwd: Option<String>,
+    pub timestamp: Option<String>,
+}
+
+/// The `session` record of journal bytes, read from the first 64 KiB: past an omp title slot,
+/// which is a line of its own. Empty fields when there is none.
+pub fn session_head(bytes: &[u8]) -> SessionHead {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)]);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if v.get("type").and_then(Value::as_str) == Some("session") {
+            let field = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+            return SessionHead { cwd: field("cwd"), timestamp: field("timestamp") };
+        }
+    }
+    SessionHead::default()
+}
+
+/// UTC now as `2026-10-18T17:01:16.266Z`, the shape omp and Pi stamp on entries (days-from-civil
+/// inverse; no timezone other than Z is ever written here).
+pub fn now_iso_ms() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = d.as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let (month, year) = if mp < 10 { (mp + 3, y) } else { (mp - 9, y + 1) };
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}.{:03}Z", d.subsec_millis())
 }
 
 /// The first cwd a journal records, read from a 64 KiB head window: omp and Pi journals carry it
@@ -439,6 +561,31 @@ pub fn convert_from(sesync_conv: &Path, verb: &str, src: &Path, scratch: &Path, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folders Pi and omp list a project from, as their own sources compute them
+    /// (pi-coding-agent 1.1 `getDefaultSessionDirPath`, oh-my-pi 18.12 `getDefaultSessionDirName`).
+    /// A copy anywhere else is never offered for its project, so it counts as misplaced.
+    #[test]
+    fn project_folders_follow_the_harness_rules() {
+        assert_eq!(pi_bucket("C:\\Users\\u\\proj"), "--C--Users-u-proj--");
+        assert_eq!(pi_bucket("C:\\Users\\u\\proj\\"), "--C--Users-u-proj--");
+        assert_eq!(pi_bucket("/home/u/proj"), "--home-u-proj--");
+        assert_eq!(pi_bucket("/"), "----");
+        assert_eq!(pi_bucket("C:\\"), "--C----");
+        let (home, temp) = ("C:\\Users\\u", "C:\\Users\\u\\AppData\\Local\\Temp");
+        assert_eq!(omp_bucket("C:\\Users\\u\\Projetos\\PC CONFIG", home, temp), "-Projetos-PC CONFIG");
+        assert_eq!(omp_bucket("c:/users/u/projetos", home, temp), "-projetos");
+        assert_eq!(omp_bucket(home, home, temp), "-");
+        assert_eq!(omp_bucket("C:\\Users\\u\\AppData\\Local\\Temp\\x\\y", home, temp), "-tmp-x-y",
+            "the temp root wins over the home it sits in");
+        assert_eq!(omp_bucket(temp, home, temp), "-tmp");
+        assert_eq!(omp_bucket("C:\\tmp", home, temp), "--C--tmp--");
+        assert_eq!(omp_bucket("C:\\Users\\uv", home, temp), "--C--Users-uv--",
+            "a name that only starts like the home is outside it");
+        assert_eq!(omp_bucket("/home/u/proj", "/home/u", "/tmp"), "-proj");
+        assert_eq!(omp_bucket("/tmp/x", "/home/u", "/tmp"), "-tmp-x");
+        assert_eq!(omp_bucket("/srv/x", "/home/u", "/tmp"), "--srv-x--");
+    }
 
     fn head_file(name: &str, text: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("sesync-journal-{}-{name}.jsonl", std::process::id()));

@@ -115,7 +115,10 @@ fn an_older_mirror_with_a_different_timestamp_is_removed() {
 fn an_omp_mirror_lands_in_the_home_relative_bucket() {
     // omp lists a project's sessions from its home-relative bucket. The daemon once passed
     // the store's parent as `--home`, which put every mirror in a bucket omp never reads.
-    let d = sandbox("omp-bucket");
+    // The home sits outside the temp root here: omp files a cwd inside the temp root under
+    // `-tmp-...` before it looks at the home.
+    let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("omp-bucket-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&d);
     let home = d.join("home");
     let cwd = home.join("proj");
     fs::create_dir_all(&cwd).unwrap();
@@ -124,6 +127,7 @@ fn an_omp_mirror_lands_in_the_home_relative_bucket() {
     let out = install("omp", &store, &home, &src, "mirror-id-omp", "T").unwrap();
     assert_eq!(out.parent().unwrap().file_name().unwrap(), "-proj",
                "the mirror must sit in the bucket omp actually lists: {}", out.display());
+    let _ = fs::remove_dir_all(&d);
 }
 
 #[test]

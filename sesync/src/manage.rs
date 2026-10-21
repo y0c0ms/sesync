@@ -139,6 +139,14 @@ pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) 
         by_key.insert(key.clone(), g);
     }
 
+    // A store harness's sessions are rows in its database, not files: each store is read once,
+    // and a recorded session there is missing only when the store no longer lists it. A store that
+    // listed nothing was not read (absent or locked), so none of its sessions is called missing.
+    let mut in_store: HashMap<&str, std::collections::HashSet<String>> = HashMap::new();
+    for h in harness::ALL.iter().filter(|h| h.kind() == Kind::Store) {
+        in_store.insert(h.id(), h.rows(roots.locations.of(h.id())).into_iter().map(|r| r.id).collect());
+    }
+
     // Sources recorded in state, with their mirrors. Keep orphans too.
     for (key, src) in &state.sources {
         if state.mirror_keys.contains(key) || state.is_recorded_mirror(key) {
@@ -148,8 +156,11 @@ pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) 
             // The name the daemon recorded, else "untitled": never a file name or a store id.
             let name = if src.title.is_empty() { "untitled".to_string() } else { src.title.clone() };
             let mut g = Group::file(&src.fmt, key.clone(), &name);
-            // Not found among the files on disk: keep it, flagged as an orphan.
-            g.orphan = true;
+            // Not among the files on disk, nor in its store: keep it, flagged as an orphan.
+            g.orphan = match in_store.get(src.fmt.as_str()) {
+                Some(ids) => !ids.is_empty() && !ids.contains(key),
+                None => true,
+            };
             g
         });
         g.updated = g.updated.max(src.last_seen_change);

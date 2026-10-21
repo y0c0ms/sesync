@@ -88,6 +88,20 @@ pub fn credential_path(config_dir: &Path, space: &str) -> PathBuf {
     config_dir.join("teams").join(format!("{}.cred", file_stem_of(space)))
 }
 
+/// Leave a team on this machine: its credential goes, so neither the daemon nor the TUI syncs
+/// or pulls that team any more. The only way out of a join the admin refused (the server answers
+/// a refused key exactly as a pending one) or of a membership the admin revoked. The device key
+/// stays (other teams use it) and nothing on the server changes. False when there was nothing to
+/// remove.
+pub fn leave(config_dir: &Path, space: &str) -> Result<bool, String> {
+    let path = credential_path(config_dir, space);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
+}
+
 /// The team name as a file name that is safe on every platform: the name itself, except that a
 /// path separator, a character Windows refuses (`: * ? " < > |`), a control character, `%`, a
 /// leading dot and a trailing dot or space are percent-encoded. Ordinary names, spaces and
@@ -151,13 +165,41 @@ pub fn save(path: &Path, c: &Credential) -> Result<(), String> {
     if let Some(l) = &c.signed_list { text.push_str(&format!("list={}\n", hex(l))); }
     if let Some(v) = c.list_version { text.push_str(&format!("list_version={v}\n")); }
     if let Some(s) = &c.server { text.push_str(&format!("server={s}\n")); }
-    let tmp = path.with_extension("cred.tmp");
+    // One temporary file per process: the daemon and the TUI can both save a credential (a list
+    // kept by `ratchet_list`), and a shared name would let one rename the other's half-written file.
+    let tmp = path.with_extension(format!("cred.{}.tmp", std::process::id()));
     {
         let mut f = open_owner_only(&tmp)?;
         f.write_all(text.as_bytes()).map_err(|_| "cannot write the team credential".to_string())?;
         f.sync_all().ok();
     }
     std::fs::rename(&tmp, path).map_err(|_| "cannot save the team credential".to_string())
+}
+
+/// Keep a member list newer than the one this credential holds. The list must already have been
+/// verified against the pinned admin key (`team_watch` checks every fetched list); keeping it
+/// makes it the floor every later list is checked against, so a server can never hand this
+/// machine back a list from before a revoke, across restarts too. The stored list only moves
+/// forward. Returns the new version when it moved; nothing when the list held is as new, the list
+/// is for another admin key, the join still waits (approval stores the first list), or the team
+/// has no credential file (it is configured by the environment).
+pub fn ratchet_list(config_dir: &Path, space: &str, list: &Trust) -> Result<Option<u64>, String> {
+    let path = credential_path(config_dir, space);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut c = load(&path)?;
+    let version = list.version().map_err(|_| "the member list is malformed; not kept".to_string())?;
+    if is_waiting(&c)
+        || c.admin_public.as_deref() != Some(list.admin_public())
+        || c.list_version.is_some_and(|held| held >= version)
+    {
+        return Ok(None);
+    }
+    c.signed_list = Some(list.signed_list().to_vec());
+    c.list_version = Some(version);
+    save(&path, &c)?;
+    Ok(Some(version))
 }
 
 /// Read a credential back. Refuses a file that other users can read, since the token is in it.

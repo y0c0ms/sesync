@@ -270,3 +270,64 @@ fn the_tui_never_saves_back_an_entry_the_daemon_removed() {
     assert!(after.sources["/o/new.jsonl"].chosen_targets.contains("pi"), "the app's own new choice is saved");
     assert!(after.sources["/a/copy.db"].mirrors.contains_key("opencode"), "the daemon's records survive");
 }
+
+/// Two TUIs open on one state file (two terminals): each saves only the choices made in it, so
+/// neither overwrites the other's shares or mirror choices, and each holds the other's choices
+/// once it has written or read the file. Undoing a choice is a change too.
+#[test]
+fn two_tuis_never_overwrite_each_others_choices() {
+    let d = tmp("two-tuis");
+    let f = d.join("state.json");
+    let mut daemon = State::default();
+    for key in ["/omp/a.jsonl", "/omp/b.jsonl"] {
+        daemon.sources.insert(key.into(), Source::new("omp", key));
+    }
+    daemon.save(&f).unwrap();
+    let mut one = State::load(&f).unwrap();
+    let mut two = State::load(&f).unwrap();
+
+    one.share("conv-a", "team-x");
+    one.sources.get_mut("/omp/a.jsonl").unwrap().chosen_targets.insert("pi".into());
+    one.save_user(&f).unwrap();
+    two.share("conv-b", "team-x");
+    two.sources.get_mut("/omp/b.jsonl").unwrap().chosen_targets.insert("claude".into());
+    two.save_user(&f).unwrap();
+
+    let after = State::load(&f).unwrap();
+    assert!(after.is_shared_with("conv-a", "team-x"), "the first TUI's share survives the second's save");
+    assert!(after.is_shared_with("conv-b", "team-x"));
+    assert!(after.sources["/omp/a.jsonl"].chosen_targets.contains("pi"), "and so does its mirror choice");
+    assert!(after.sources["/omp/b.jsonl"].chosen_targets.contains("claude"));
+    assert!(two.is_shared_with("conv-a", "team-x"), "the second TUI holds the first one's share once it saved");
+
+    one.absorb_user_choices(&after);
+    assert!(one.is_shared_with("conv-b", "team-x"), "the first TUI takes the second one's share from the file");
+    assert!(one.sources["/omp/b.jsonl"].chosen_targets.contains("claude"));
+
+    one.unshare("conv-a", "team-x");
+    one.save_user(&f).unwrap();
+    let after = State::load(&f).unwrap();
+    assert!(!after.is_shared_with("conv-a", "team-x"), "an undone share is saved");
+    assert!(after.is_shared_with("conv-b", "team-x"), "and the other TUI's share stays");
+}
+
+/// A choice made here and not saved yet is kept when the file changes under it, and goes out with
+/// the next save: for one conversation changed in both TUIs, the last save wins.
+#[test]
+fn an_unsaved_choice_survives_reading_the_file_again() {
+    let d = tmp("unsaved-choice");
+    let f = d.join("state.json");
+    State::default().save(&f).unwrap();
+    let mut one = State::load(&f).unwrap();
+    let mut two = State::load(&f).unwrap();
+    one.share("conv-a", "team-x");
+    two.share("conv-a", "team-y");
+    two.save_user(&f).unwrap();
+
+    one.absorb_user_choices(&State::load(&f).unwrap());
+    assert!(one.is_shared_with("conv-a", "team-x") && !one.is_shared_with("conv-a", "team-y"),
+        "the choice made here is not replaced by the file's");
+    one.save_user(&f).unwrap();
+    let after = State::load(&f).unwrap();
+    assert!(after.is_shared_with("conv-a", "team-x") && !after.is_shared_with("conv-a", "team-y"));
+}

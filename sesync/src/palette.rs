@@ -20,6 +20,7 @@ pub enum Action {
     Register,
     Invite,
     Members,
+    Leave,
 }
 
 struct Def {
@@ -44,6 +45,7 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::Register, title: "Start a team", key: "", event: Ev::OpenRegister },
     Def { action: Action::Members, title: "Team members", key: "", event: Ev::OpenMembers },
     Def { action: Action::Invite, title: "Invite a member", key: "", event: Ev::OpenInvite },
+    Def { action: Action::Leave, title: "Leave a team", key: "", event: Ev::OpenLeave },
 ];
 
 /// What a command can see when deciding whether it may run.
@@ -58,6 +60,9 @@ pub struct Ctx {
     /// Whether there is a team the admin dialogs can work on: one this machine created, or one
     /// it joined.
     pub team_to_manage: bool,
+    /// Whether this machine holds any team record: a membership (listed or waiting) or a team
+    /// it manages.
+    pub teams_here: bool,
     /// Whether this machine holds the team's admin key.
     pub admin: bool,
 }
@@ -99,6 +104,7 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
         } else {
             Ok(())
         },
+        Action::Leave => if ctx.teams_here { Ok(()) } else { Err("no team on this machine") },
         Action::SwitchView | Action::Quit | Action::Theme | Action::Enroll | Action::Register => Ok(()),
     }
 }

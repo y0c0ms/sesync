@@ -52,8 +52,11 @@ pub fn run(
         // The server the team was joined on; SESYNC_TEAM_URL for an older credential.
         let Some(base) = cred.server.clone().or_else(|| env_base.clone()) else { continue };
         let Some(pinned) = team_join::trust_of(&cred) else { continue };
-        // Refresh before sealing: records must be signed under the current list version.
+        // Refresh before sealing: records must be signed under the current list version. A newer
+        // list is kept, so the list held here only moves forward; a failure to keep it is the
+        // pull's to report, the push still seals under the list it verified.
         let trust = fetch_and_verify(&base, &cred.token, &cred.machine, &space, &pinned).unwrap_or(pinned);
+        let _ = team_join::ratchet_list(config_dir, &space, &trust);
         let Ok(writer) = load_or_create(config_dir) else { continue };
         let remote = HttpTeam { base: base.clone(), token: cred.token.clone(), machine: cred.machine.clone() };
         let quiet = team_quiet_secs();
@@ -86,8 +89,13 @@ impl CanonCache {
     }
 }
 
-/// Whether a pass ran and what it did, for the daemon's log line.
+/// Whether a pass ran and what it did, for the daemon's log line. Each failure is named with its
+/// reason: a bare count hides, say, that the server no longer accepts this device.
 pub fn summary(pass: &TeamPass) -> String {
-    format!("team push: {} pushed, {} unchanged, {} failed",
-        pass.pushed.len(), pass.skipped_unchanged.len(), pass.failed.len())
+    let mut s = format!("team push: {} pushed, {} unchanged, {} failed",
+        pass.pushed.len(), pass.skipped_unchanged.len(), pass.failed.len());
+    for (id, why) in &pass.failed {
+        s.push_str(&format!("; {id}: {why}"));
+    }
+    s
 }

@@ -57,6 +57,13 @@ pub struct PullOutcome {
     /// Conversations not fetched because the source advertised a sequence at or below the floor this
     /// device already holds. Neither shown nor dropped: the floor already covers them.
     pub unchanged: usize,
+    /// Why nothing could be listed: the server refused this device, or could not be reached. A
+    /// pull that failed this way shows nothing, and says so instead of reading as an empty team.
+    pub error: Option<String>,
+    /// The member list this pull fetched and verified against the pinned admin key, when the
+    /// server sent one at least as new as the list held. The caller keeps it
+    /// (`team_watch::keep_newer_lists`), so the list held here only moves forward.
+    pub list: Option<crate::sealed::Trust>,
 }
 
 /// Fetch and verify the records the team holds that may have changed. `trust` is the team's
@@ -84,7 +91,10 @@ fn pull_with(source: &dyn RecordSource, reader: &DeviceFile, trust: Option<&Trus
     let mut out = PullOutcome::default();
     let listing = match source.list_advertised() {
         Ok(c) => c,
-        Err(_) => return out,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
     };
     for (conv, advertised) in listing {
         // Skip only with a trust root, a floor and an advertised value. Otherwise the conversation is

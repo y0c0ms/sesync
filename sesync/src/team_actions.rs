@@ -1,9 +1,9 @@
-//! The network work behind the team dialogs. The binary runs these on worker threads so the UI
-//! never waits on the team server; the functions here do no drawing and touch no App state.
+//! The work behind the team dialogs. The binary runs the network steps on worker threads so the
+//! UI never waits on the team server; the functions here do no drawing and touch no App state.
 
 use std::path::Path;
 
-use crate::app::{Kind, SetupRequest};
+use crate::app::{Kind, LeaveRequest, SetupRequest};
 use crate::team_cli::{self, Command, RosterView};
 use crate::team_join;
 
@@ -100,6 +100,23 @@ pub enum AdminDone {
     Roster(RosterView),
     /// A change was signed and published; the text says what happened.
     Message(String),
+}
+
+/// Leave a team the user picked: a membership's credential goes, or the record of a team managed
+/// here, or both when both were asked. Local files only, no server call. Says what was done, for
+/// the status line; an error when neither record was there.
+pub fn leave(req: &LeaveRequest, config_dir: &Path) -> Result<String, String> {
+    let mut done = Vec::new();
+    if req.membership && team_join::leave(config_dir, &req.team)? {
+        done.push("left on this machine; its sessions stay on the server");
+    }
+    if req.admin && team_cli::forget_administered(config_dir, &req.team)? {
+        done.push("no longer managed here");
+    }
+    if done.is_empty() {
+        return Err(format!("'{}' is not recorded on this machine any more", req.team));
+    }
+    Ok(format!("team '{}': {}", req.team, done.join("; ")))
 }
 
 /// Run an admin action. Roster reads return rows; every other command returns its text.

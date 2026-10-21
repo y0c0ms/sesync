@@ -1,6 +1,7 @@
 //! Pi: the same JSONL journal as omp, one file per conversation under
 //! `<agent dir>/sessions/<bucket>/<timestamp>_<uuid>.jsonl`, but the bucket is the absolute
-//! project path, and Pi has no title slot: it shows the last `session_info` name.
+//! project path (`journal::pi_bucket`), and Pi has no title slot: it shows the last
+//! `session_info` name.
 
 use super::{journal, Harness, Location, Tools};
 use std::path::{Path, PathBuf};
@@ -35,13 +36,13 @@ impl Harness for Pi {
     fn placed_by_cwd(&self) -> bool {
         true
     }
-    /// Pi files a conversation under its absolute project path; a copy in another folder is
-    /// never listed.
+    /// Pi files a conversation under its absolute project path (`journal::pi_bucket`); a copy in
+    /// another folder is never listed for its project.
     fn misplaced(&self, path: &str, cwd: Option<&str>, _home: &str) -> bool {
-        match cwd {
-            Some(c) => journal::parent_name(path).as_deref() != Some(bucket(c).as_str()),
-            None => false,
-        }
+        cwd.is_some_and(|c| journal::parent_name(path).as_deref() != Some(journal::pi_bucket(c).as_str()))
+    }
+    fn folder_for_cwd(&self, loc: &Location, _home: &str, cwd: &str) -> Option<PathBuf> {
+        Some(self.sessions_dir(loc).join(journal::pi_bucket(cwd)))
     }
     fn newest_prompt(&self, _loc: &Location, key: &str) -> Option<f64> {
         journal::newest_prompt(Path::new(key), journal::message_prompt_time)
@@ -66,27 +67,16 @@ impl Harness for Pi {
     }
 }
 
-/// Pi's project folder: the absolute path, separators dashed, wrapped in a leading and trailing
-/// '-'. Verified on disk: `/home/u/proj` -> `--home-u-proj-`, `/tmp` -> `--tmp-`. Keep in step
-/// with the converter.
-fn bucket(cwd: &str) -> String {
-    format!("-{}-", journal::seg_join(cwd.trim_end_matches(['\\', '/'])))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn project_folders_match_the_converter_table() {
-        assert_eq!(bucket("/home/u/proj"), "--home-u-proj-");
-        assert_eq!(bucket("/tmp"), "--tmp-");
-    }
-
-    #[test]
     fn a_copy_outside_its_project_folder_is_misplaced() {
         let cwd = Some("/home/u/proj");
-        assert!(!Pi.misplaced("/store/sessions/--home-u-proj-/x.jsonl", cwd, "/home/u"));
+        assert!(!Pi.misplaced("/store/sessions/--home-u-proj--/x.jsonl", cwd, "/home/u"));
+        assert!(Pi.misplaced("/store/sessions/--home-u-proj-/x.jsonl", cwd, "/home/u"),
+            "a copy in the folder an older rule named is not where Pi lists it");
         assert!(Pi.misplaced("/store/sessions/--/x.jsonl", cwd, "/home/u"));
         assert!(!Pi.misplaced("/store/sessions/--/x.jsonl", None, "/home/u"), "without a cwd nothing is called misplaced");
     }

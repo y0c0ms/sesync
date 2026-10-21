@@ -1,6 +1,7 @@
 //! omp (oh-my-pi): one JSONL journal per conversation under `<agent dir>/sessions/<bucket>/`,
-//! named `<timestamp>_<uuid>.jsonl`. The bucket is the project directory relative to the home;
-//! the first line is a fixed-width title slot. The canonical journal is omp's own format.
+//! named `<timestamp>_<uuid>.jsonl`. The bucket is the project directory (`journal::omp_bucket`:
+//! relative to the temp root or the home, else absolute); the first line is an optional
+//! fixed-width title slot. The canonical journal is omp's own format.
 
 use super::{journal, Harness, Location, Tools};
 use std::path::{Path, PathBuf};
@@ -35,13 +36,15 @@ impl Harness for Omp {
     fn placed_by_cwd(&self) -> bool {
         true
     }
-    /// omp files a conversation under its project directory relative to the home. A copy in
-    /// another folder (an older write with the wrong `--home`, or a dropped cwd) is never listed.
+    /// omp files a conversation under its project folder (`journal::omp_bucket`). A copy in
+    /// another folder (an older write with the wrong `--home`, a dropped cwd, or a folder named
+    /// by an older rule) is never listed for its project.
     fn misplaced(&self, path: &str, cwd: Option<&str>, home: &str) -> bool {
-        match cwd.and_then(|c| home_bucket(c, home)) {
-            Some(expected) => journal::parent_name(path).as_deref() != Some(expected.as_str()),
-            None => false,
-        }
+        cwd.is_some_and(|c| journal::parent_name(path).as_deref()
+            != Some(journal::omp_bucket(c, home, &journal::node_tmpdir()).as_str()))
+    }
+    fn folder_for_cwd(&self, loc: &Location, home: &str, cwd: &str) -> Option<PathBuf> {
+        Some(self.sessions_dir(loc).join(journal::omp_bucket(cwd, home, &journal::node_tmpdir())))
     }
     fn newest_prompt(&self, _loc: &Location, key: &str) -> Option<f64> {
         journal::newest_prompt(Path::new(key), journal::message_prompt_time)
@@ -67,22 +70,6 @@ impl Harness for Omp {
     }
 }
 
-/// omp's project folder when `cwd` sits under `home`: the relative path with a leading '-'. None
-/// when cwd is outside home: omp's fallback encoding there is not pinned down on this platform,
-/// and a guessed folder would flag good copies as misplaced. Keep in step with the converter.
-fn home_bucket(cwd: &str, home: &str) -> Option<String> {
-    let norm = |s: &str| s.replace('/', "\\");
-    let (c, h) = (norm(cwd.trim_end_matches(['\\', '/'])), norm(home.trim_end_matches(['\\', '/'])));
-    if c.len() >= h.len() && c[..h.len()].eq_ignore_ascii_case(&h) && (c.len() == h.len() || c.as_bytes()[h.len()] == b'\\') {
-        let rel = &c[h.len()..];
-        if rel.is_empty() {
-            return Some("-".to_string());
-        }
-        return Some(journal::seg_join(rel));
-    }
-    None
-}
-
 /// omp's own rename: the 256-byte title slot (the first line, which omp reads first) is
 /// rewritten, the header title is kept in step for readers that fall back to it, and a
 /// `title_change` entry is appended, exactly what omp records when the rename is made inside it.
@@ -92,7 +79,7 @@ fn retitled(text: &str, title: &str) -> String {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         journal::omp_title_from_lines(&refs).0
     };
-    let now = now_iso_ms();
+    let now = journal::now_iso_ms();
     let mut slot_written = false;
     let mut header_written = false;
     if let Some(first) = lines.first_mut() {
@@ -171,37 +158,9 @@ fn slot_line(title: &str, updated_at: &str) -> String {
     }
 }
 
-/// UTC now as `2026-10-18T17:01:16.266Z`, the shape omp stamps on entries (days-from-civil
-/// inverse; no timezone other than Z is ever written here).
-fn now_iso_ms() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs() as i64;
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let (month, year) = if mp < 10 { (mp + 3, y) } else { (mp - 9, y + 1) };
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}.{:03}Z", d.subsec_millis())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn project_folders_match_the_converter_table() {
-        assert_eq!(home_bucket("/home/u/proj", "/home/u").as_deref(), Some("-proj"));
-        assert_eq!(home_bucket("/home/u/projects/CodeTeacher", "/home/u").as_deref(), Some("-projects-CodeTeacher"));
-        assert_eq!(home_bucket("/home/u", "/home/u").as_deref(), Some("-"));
-        assert_eq!(home_bucket("/tmp/x", "/home/u"), None, "outside home: not checked");
-        assert_eq!(home_bucket("/home/other", "/home/u"), None, "a prefix is not under home");
-    }
 
     #[test]
     fn a_copy_outside_its_project_folder_is_misplaced_and_an_unknown_place_is_not() {
@@ -209,7 +168,9 @@ mod tests {
         assert!(Omp.misplaced("/store/sessions/--/x.jsonl", cwd, "/home/u"));
         assert!(Omp.misplaced("/store/sessions/--home-u-proj-/x.jsonl", cwd, "/home/u"));
         assert!(!Omp.misplaced("/store/sessions/-proj/x.jsonl", cwd, "/home/u"));
-        assert!(!Omp.misplaced("/store/sessions/--/x.jsonl", None, "/home/u"));
-        assert!(!Omp.misplaced("/store/sessions/--tmp-/x.jsonl", Some("/tmp"), "/home/u"), "outside home is not checked");
+        assert!(!Omp.misplaced("/store/sessions/--/x.jsonl", None, "/home/u"), "without a cwd nothing is called misplaced");
+        assert!(Omp.misplaced("/store/sessions/--srv-x-/x.jsonl", Some("/srv/x"), "/home/u"),
+            "outside the home the folder is the absolute form, and an older single-dash copy is misplaced");
+        assert!(!Omp.misplaced("/store/sessions/--srv-x--/x.jsonl", Some("/srv/x"), "/home/u"));
     }
 }

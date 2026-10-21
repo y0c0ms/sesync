@@ -15,7 +15,8 @@ pub struct TeamWatch {
     pub machine: String,
     pub space: String,
     pub device: DeviceFile,
-    /// The trust root pinned at join: the admin key and the signed list as it stood then.
+    /// The trust root held here: the admin key pinned at join and the newest signed list kept
+    /// since (`team_join::ratchet_list`).
     pub trust: Option<Trust>,
 }
 
@@ -25,6 +26,29 @@ pub struct TeamWatch {
 pub struct TeamPull {
     pub space: String,
     pub out: PullOutcome,
+}
+
+/// One verified copy of a conversation, as one team's pull returned it. The Team list is built
+/// from these, so a row still knows which teams hold it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamCopy {
+    pub space: String,
+    pub conversation: String,
+    /// The record sequence the pull accepted for it.
+    pub seq: u64,
+    pub text: Vec<u8>,
+}
+
+/// One entry per conversation from verified copies: the highest sequence wins, so the newest copy
+/// a team holds is the one shown. Ties keep the first copy in order.
+pub fn newest_of(copies: &[TeamCopy]) -> Vec<(String, Vec<u8>)> {
+    let mut best: BTreeMap<&str, &TeamCopy> = BTreeMap::new();
+    for c in copies {
+        if best.get(c.conversation.as_str()).map_or(true, |b| c.seq > b.seq) {
+            best.insert(&c.conversation, c);
+        }
+    }
+    best.into_iter().map(|(conv, c)| (conv.to_string(), c.text.clone())).collect()
 }
 
 impl TeamWatch {
@@ -62,21 +86,36 @@ impl TeamWatch {
         }).collect()
     }
 
+    /// Keep every member list these pulls verified that is newer than the one a team's credential
+    /// holds (`team_join::ratchet_list`): the list held here only moves forward, so after a revoke
+    /// no server can hand this machine the older list back. Returns each team whose list moved,
+    /// with its new version, or why it could not be kept.
+    pub fn keep_newer_lists(config_dir: &std::path::Path, pulls: &[TeamPull]) -> Vec<(String, Result<u64, String>)> {
+        pulls.iter().filter_map(|p| {
+            let list = p.out.list.as_ref()?;
+            match crate::team_join::ratchet_list(config_dir, &p.space, list) {
+                Ok(Some(version)) => Some((p.space.clone(), Ok(version))),
+                Ok(None) => None,
+                Err(e) => Some((p.space.clone(), Err(e))),
+            }
+        }).collect()
+    }
+
+    /// Every verified copy the pulls returned, one per team and conversation, in pull order.
+    pub fn copies(pulls: &[TeamPull]) -> Vec<TeamCopy> {
+        pulls.iter().flat_map(|p| p.out.shown.iter().map(move |r| TeamCopy {
+            space: p.space.clone(),
+            conversation: r.conversation.clone(),
+            seq: p.out.accepted.get(&r.conversation).copied().unwrap_or(0),
+            text: r.text.clone(),
+        })).collect()
+    }
+
     /// Every conversation the given pulls can show, one entry each: when a conversation was
     /// pulled from more than one team the highest accepted sequence wins, so the newest copy a
     /// team holds is the one shown. Ties keep the first team in order.
     pub fn newest_per_conversation(pulls: &[TeamPull]) -> Vec<(String, Vec<u8>)> {
-        let mut best: BTreeMap<String, (u64, String, Vec<u8>)> = BTreeMap::new();
-        for p in pulls {
-            for r in &p.out.shown {
-                let seq = p.out.accepted.get(&r.conversation).copied().unwrap_or(0);
-                let entry = best.get(&r.conversation);
-                if entry.map_or(true, |(prev, _, _)| seq > *prev) {
-                    best.insert(r.conversation.clone(), (seq, p.space.clone(), r.text.clone()));
-                }
-            }
-        }
-        best.into_iter().map(|(conv, (_, _space, text))| (conv, text)).collect()
+        newest_of(&TeamWatch::copies(pulls))
     }
 
     fn pull_with(&self, last_seen: &BTreeMap<String, u64>,
@@ -87,7 +126,9 @@ impl TeamWatch {
                                 machine: self.machine.clone(), space: self.space.clone() };
         let fresh = self.refreshed_trust(&src);
         let active = fresh.as_ref().or(self.trust.as_ref());
-        pull(&src, &self.device, active, last_seen)
+        let mut out = pull(&src, &self.device, active, last_seen);
+        out.list = fresh;
+        out
     }
 
     /// Fetch the current list and accept it only if it verifies against the pinned admin key and
@@ -222,10 +263,18 @@ impl RecordSource for HttpRecords {
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
         let url = format!("{}/sessions", self.base.trim_end_matches('/'));
         let body = serde_json::json!({"space": self.space, "machine": self.machine});
-        let reply: serde_json::Value = agent.post(&url)
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .send_json(body).map_err(|_| "cannot list team sessions".to_string())?
-            .into_json().map_err(|_| "bad listing".to_string())?;
+        let reply: serde_json::Value = match agent.post(&url).set("Authorization", &format!("Bearer {}", self.token)).send_json(body) {
+            Ok(r) => r.into_json().map_err(|_| "the team server sent a listing it cannot read".to_string())?,
+            // The server's own reason: a device the admin revoked or removed is refused here, and
+            // a bare "cannot list" would hide that from the member.
+            Err(ureq::Error::Status(code, r)) => {
+                let why = r.into_json::<serde_json::Value>().ok()
+                    .and_then(|v| v["error"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                return Err(format!("the team server refused this device ({code}{}{why})", if why.is_empty() { "" } else { ": " }));
+            }
+            Err(e) => return Err(format!("cannot reach the team server: {e}")),
+        };
         let sequences = reply["sequences"].as_object();
         Ok(reply["conversations"].as_array().map(|a| a.iter()
             .filter_map(|v| v.as_str().map(|id| {

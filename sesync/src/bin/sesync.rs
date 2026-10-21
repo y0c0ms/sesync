@@ -87,23 +87,25 @@ fn is_mirror(state: &State, key: &str) -> bool {
     state.mirror_keys.contains(key)
 }
 
-/// Release what an older run recorded for harnesses sesync no longer syncs (`harness::RETIRED`):
-/// their sources move to their best surviving copy, their targets are released, and none of their
-/// files is ever touched. A copy survives when its own harness still has it. Cheap and
-/// idempotent: run at every load and after every merge with the TUI's file.
-fn retire_harnesses(locations: &Locations, state: &mut State) -> Vec<String> {
+/// What sesync lets go of at every load and after every merge with the TUI's file. The records of
+/// harnesses it no longer syncs (`harness::RETIRED`): their sources move to their best surviving
+/// copy (one its own harness still has), their targets are released, and none of their files is
+/// ever touched. And the sessions the user deleted in the TUI (`State::forget_deleted`): the
+/// record goes and the copies are released. Cheap and idempotent.
+fn release_records(locations: &Locations, state: &mut State) -> Vec<String> {
     let exists = |target: &str, key: &str| harness::get(target).is_some_and(|h| h.copy_exists(locations.of(target), key));
     let mut log = Vec::new();
     for retired in harness::RETIRED {
         log.extend(state.retire_harness(retired, &exists));
     }
+    log.extend(state.forget_deleted(now_secs()));
     log
 }
 
-/// `retire_harnesses`, reporting each change on stderr (the daemon and the CLI modes; the TUI's
+/// `release_records`, reporting each change on stderr (the daemon and the CLI modes; the TUI's
 /// screen would be garbled by it).
-fn retire_harnesses_logged(locations: &Locations, state: &mut State) {
-    for line in retire_harnesses(locations, state) {
+fn release_records_logged(locations: &Locations, state: &mut State) {
+    for line in release_records(locations, state) {
         eprintln!("sesync: {line}");
     }
 }
@@ -300,8 +302,9 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
-    // A choice saved by an older TUI can still name a retired harness.
-    retire_harnesses_logged(&env.locations, state);
+    // A choice saved by an older TUI can still name a retired harness, and the TUI may have
+    // deleted a session since the last pass.
+    release_records_logged(&env.locations, state);
     let changed = scan(env, state);
     let attempted = changed.len();
     // Un-choosing a target has to drop the copy, and that is not a content change, so it runs on
@@ -316,7 +319,7 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
-    retire_harnesses_logged(&env.locations, state);
+    release_records_logged(&env.locations, state);
     if let Err(e) = state.save(&env.state_file()) {
         eprintln!("sesync: cannot save state: {e}");
     }
@@ -567,7 +570,7 @@ fn run_mirrors(env: &Env, state: &mut State, apply: bool) -> i32 {
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
         eprintln!("sesync: cannot read user choices from state: {e}");
     }
-    retire_harnesses_logged(&env.locations, state);
+    release_records_logged(&env.locations, state);
     if let Err(e) = state.save(&env.state_file()) {
         eprintln!("sesync: cannot save state: {e}");
         return 1;
@@ -590,9 +593,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // The retired Gemini CLI: moved off before any mode reads the records, so neither the daemon,
-    // the TUI nor `sesync mirrors` ever acts on a Gemini copy (never deleted, only released).
-    retire_harnesses_logged(&env.locations, &mut state);
+    // Released before any mode reads the records: the retired Gemini CLI (so neither the daemon,
+    // the TUI nor `sesync mirrors` ever acts on a Gemini copy, never deleted, only released), and
+    // the sessions the user deleted.
+    release_records_logged(&env.locations, &mut state);
     if args.first().map(String::as_str) == Some("mirrors") {
         std::process::exit(run_mirrors(&env, &mut state, args.iter().any(|a| a == "--apply")));
     }
@@ -693,9 +697,20 @@ fn main() {
                     // importing a shown session stays a separate, confirmed action.
                     let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &state.floors_all());
                     let before = state.team_seen.clone();
+                    // A newer member list a pull verified is kept, so the list held here only
+                    // moves forward (a revoke stays in force whatever a server sends later).
+                    for (space, kept) in sesync::team_watch::TeamWatch::keep_newer_lists(&team_config_dir(), &pulls) {
+                        match kept {
+                            Ok(v) => eprintln!("sesync: team [{space}]: member list v{v} kept"),
+                            Err(e) => eprintln!("sesync: team [{space}]: cannot keep the newer member list: {e}"),
+                        }
+                    }
                     for p in &pulls {
-                        eprintln!("sesync: team pull [{}]: {} shown, {} dropped, {} rolled back",
-                            p.space, p.out.shown.len(), p.out.dropped, p.out.rolled_back);
+                        match &p.out.error {
+                            Some(e) => eprintln!("sesync: team pull [{}]: {e}", p.space),
+                            None => eprintln!("sesync: team pull [{}]: {} shown, {} dropped, {} rolled back",
+                                p.space, p.out.shown.len(), p.out.dropped, p.out.rolled_back),
+                        }
                         let visible = p.out.shown.len() + p.out.unchanged;
                         // The pull fetches every record each time, so only a sequence above the
                         // floor already held is new; a record read again unchanged is not activity.
@@ -715,7 +730,7 @@ fn main() {
                         if let Err(e) = state.absorb_user_edits(&env.state_file()) {
                             eprintln!("sesync: cannot read user choices from state: {e}");
                         }
-                        retire_harnesses_logged(&env.locations, &mut state);
+                        release_records_logged(&env.locations, &mut state);
                         if let Err(e) = state.save(&env.state_file()) {
                             eprintln!("sesync: cannot save state: {e}");
                         }
@@ -780,16 +795,14 @@ fn main() {
 /// live. Keep only what the signed member list vouches for; the team server is configured by
 /// SESYNC_TEAM_* (see team_watch); without them the refresh says so, nothing else changes.
 
-/// What a pull worker sends back: one verified outcome per team, the teams that can be shared
-/// with now (a join the admin just approved joins them), and one line per join still waiting or
-/// just approved.
+/// What a pull worker sends back: one verified outcome per team, and one line per join still
+/// waiting or just approved. The teams to share with are read from disk when it is applied.
 struct PullDone {
     pulls: Vec<sesync::team_watch::TeamPull>,
-    teams: Vec<String>,
     notes: Vec<String>,
 }
 
-/// The pull in flight, checked between key events.
+/// The pull in flight, collected on every loop turn.
 enum TeamPull {
     /// The request was refused before starting (not configured, or one already running).
     None,
@@ -798,22 +811,51 @@ enum TeamPull {
 }
 
 /// Put the result on the app: the verified sessions (one entry per conversation, the newest
-/// across the teams) and the refuse count, then any waiting or approved join, which the status
-/// line shows instead of the pull count. Runs on the main thread after the worker sent it.
+/// across the teams), the refuse count and each team the server would not list, then any waiting
+/// or approved join, which the status line shows instead of the pull count. A team left while
+/// the pull ran is dropped from it, so it is neither shown nor offered again. Runs on the main
+/// thread after the worker sent it.
 fn apply_pull(app: &mut sesync::app::App, done: PullDone, config_dir: &std::path::Path) {
-    let pulls = done.pulls;
-    let shown = sesync::team_watch::TeamWatch::newest_per_conversation(&pulls);
+    let current: Vec<String> = sesync::team_watch::teams_from_env(config_dir).into_iter().map(|t| t.space).collect();
+    let pulls: Vec<_> = done.pulls.into_iter().filter(|p| current.contains(&p.space)).collect();
+    let copies = sesync::team_watch::TeamWatch::copies(&pulls);
     let refused: usize = pulls.iter().map(|p| p.out.dropped).sum();
     let floors: Vec<(String, String, u64)> = pulls.iter()
         .flat_map(|p| p.out.accepted.iter().map(|(c, s)| (p.space.clone(), c.clone(), *s)))
         .collect();
-    app.set_pull_result(shown, refused);
+    let problems: std::collections::BTreeMap<String, String> = pulls.iter()
+        .filter_map(|p| p.out.error.clone().map(|e| (p.space.clone(), e)))
+        .collect();
+    app.set_pull_result(copies, refused);
     app.absorb_pull_floors(&floors);
-    app.set_teams(done.teams);
+    app.set_teams(current);
     // The worker asked whether a waiting join was approved and stored the list when it was.
     app.set_team_cards(sesync::team_join::team_cards(config_dir));
-    if !done.notes.is_empty() {
-        app.set_status(&done.notes.join("; "));
+    let mut notes = done.notes;
+    // A team the server refused to list reads as empty otherwise; its card says it too.
+    notes.extend(problems.iter().map(|(space, e)| format!("team [{space}]: {e}")));
+    let failed = !problems.is_empty();
+    app.set_team_problems(problems);
+    if failed {
+        app.set_error(&notes.join("; "));
+    } else if !notes.is_empty() {
+        app.set_status(&notes.join("; "));
+    }
+}
+
+/// Apply the pull in flight once its worker has answered (or died); otherwise leave it running.
+fn collect_pull(app: &mut sesync::app::App, pending: &mut TeamPull, config_dir: &std::path::Path) {
+    let TeamPull::Running(rx) = &*pending else { return };
+    match rx.try_recv() {
+        Ok(out) => {
+            apply_pull(app, out, config_dir);
+            *pending = TeamPull::None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            app.pull_failed();
+            *pending = TeamPull::None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
     }
 }
 
@@ -837,7 +879,7 @@ fn request_team_pull(app: &mut sesync::app::App, config_dir: &std::path::Path) -
     let config_dir = config_dir.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let notes = sesync::team_join::check_all_waiting(&config_dir).into_iter()
+        let mut notes: Vec<String> = sesync::team_join::check_all_waiting(&config_dir).into_iter()
             .map(|(space, r)| match r {
                 Ok(a) => a.describe(&space),
                 Err(e) => format!("team [{space}]: cannot check the join request: {e}"),
@@ -846,7 +888,13 @@ fn request_team_pull(app: &mut sesync::app::App, config_dir: &std::path::Path) -
         let _ = sesync::team_join::renew_all_due(&config_dir, now_secs() as u64);
         let teams = sesync::team_watch::teams_from_env(&config_dir);
         let pulls = sesync::team_watch::TeamWatch::pull_each(&teams, &floors);
-        let _ = tx.send(PullDone { pulls, teams: teams.into_iter().map(|t| t.space).collect(), notes });
+        // A newer member list is kept here too, so the Team card shows the version in force.
+        for (space, kept) in sesync::team_watch::TeamWatch::keep_newer_lists(&config_dir, &pulls) {
+            if let Err(e) = kept {
+                notes.push(format!("team [{space}]: cannot keep the newer member list: {e}"));
+            }
+        }
+        let _ = tx.send(PullDone { pulls, notes });
     });
     TeamPull::Running(rx)
 }
@@ -914,18 +962,21 @@ impl TeamJobs {
     }
 }
 
-/// Report a finished dialog and, when this machine now holds a credential, refresh the team list
-/// it can share into. A waiting join is listed for its refresh but not offered for sharing yet.
-/// The admin flag follows the key files, which a create may have just written.
+/// Report a finished dialog, then read the team records again: a join adds a team to share into
+/// (a waiting join is listed for its refresh but not offered for sharing yet), and the admin flag
+/// follows the key files, which a create may have just written.
 fn apply_setup(app: &mut sesync::app::App, done: sesync::team_actions::SetupDone, config_dir: &std::path::Path) {
-    let joined = done.joined;
     app.finish_setup(done);
-    if joined {
-        let teams = sesync::team_watch::teams_from_env(config_dir);
-        let waiting = sesync::team_join::waiting_teams(config_dir);
-        app.set_team_configured(!teams.is_empty() || !waiting.is_empty());
-        app.set_teams(teams.into_iter().map(|t| t.space).collect());
-    }
+    reload_team_records(app, config_dir);
+}
+
+/// Read this machine's team records again (memberships, waiting joins, teams managed here)
+/// after a dialog or a leave changed them.
+fn reload_team_records(app: &mut sesync::app::App, config_dir: &std::path::Path) {
+    let teams = sesync::team_watch::teams_from_env(config_dir);
+    let waiting = sesync::team_join::waiting_teams(config_dir);
+    app.set_team_configured(!teams.is_empty() || !waiting.is_empty());
+    app.set_teams(teams.into_iter().map(|t| t.space).collect());
     app.set_admin(sesync::team_cli::has_admin_key(config_dir));
     app.set_admin_teams(sesync::team_cli::administered(config_dir));
     app.set_team_cards(sesync::team_join::team_cards(config_dir));
@@ -1036,9 +1087,8 @@ fn run_tui(
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
         .map(|t| t.space.clone()).collect();
-    let mut state = state;
-    state.migrate_legacy_team_state(&teams);
     let mut app = App::new(roots, state, lock_dir, sesync_lock);
+    app.migrate_legacy_team_state(&teams);
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
     app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
@@ -1067,6 +1117,8 @@ fn run_tui(
     let mut jobs = TeamJobs::default();
     loop {
         jobs.tick(&mut app, &config_dir);
+        // A pull that finished while the terminal sat idle is applied now, not at the next key.
+        collect_pull(&mut app, &mut pending_pull, &config_dir);
         // A newly highlighted session goes to the worker; whatever it has read since is shown.
         if let Some((fmt, key)) = app.preview_wanted() {
             if app.preview().key != key {
@@ -1088,7 +1140,7 @@ fn run_tui(
                 if stamp != seen_state {
                     seen_state = stamp;
                     if let Ok(mut disk) = State::load(&state_file) {
-                        let _ = retire_harnesses(&locations, &mut disk);
+                        let _ = release_records(&locations, &mut disk);
                         app.absorb_daemon_state(&disk);
                         app.set_state_written(file_mtime_secs(&state_file));
                         app.refresh_rows();
@@ -1125,24 +1177,22 @@ fn run_tui(
         // Every key goes through the app, so every key cancels a pending delete the same way.
         // Ctrl+R on the Team tab asks for a network refresh; the local list refreshes in the app.
         app.handle(ev, Instant::now());
-        // A pull the app asked for (ctrl+r on the team tab): start it or collect the outcome of
-        // the one already running. The terminal keeps ticking either way.
-        if app.take_refresh_request() {
-            pending_pull = request_team_pull(&mut app, &config_dir);
+        // A team the user chose to leave goes now (a few local files), and the team records are
+        // read again, so neither the share picker nor the Team tab offers it any more.
+        if let Some(req) = app.take_leave_request() {
+            let outcome = sesync::team_actions::leave(&req, &config_dir);
+            app.left_team(&req, outcome);
+            reload_team_records(&mut app, &config_dir);
         }
-        if let TeamPull::Running(rx) = &pending_pull {
-            match rx.try_recv() {
-                Ok(out) => {
-                    apply_pull(&mut app, out, &config_dir);
-                    pending_pull = TeamPull::None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    app.pull_failed();
-                    pending_pull = TeamPull::None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        // A pull the app asked for (ctrl+r on the team tab). A request refused because one is
+        // still running must not drop that one: its result would never arrive, and every later
+        // ctrl+r would be refused for the rest of the run.
+        if app.take_refresh_request() {
+            if let started @ TeamPull::Running(_) = request_team_pull(&mut app, &config_dir) {
+                pending_pull = started;
             }
         }
+        collect_pull(&mut app, &mut pending_pull, &config_dir);
         // The app owns choices (mirror targets, marks) that must survive the process. Take
         // the daemon's fields when it wrote them, then save only when this key changed a
         // user-owned field: a save from the app must never roll back a mirror record or a
@@ -1150,14 +1200,14 @@ fn run_tui(
         let stamp = state_stamp(&state_file);
         if stamp != seen_state {
             if let Ok(mut disk) = State::load(&state_file) {
-                let _ = retire_harnesses(&locations, &mut disk);
+                let _ = release_records(&locations, &mut disk);
                 app.absorb_daemon_state(&disk);
                 app.set_state_written(file_mtime_secs(&state_file));
             }
             seen_state = stamp;
         }
         if app.take_user_dirty() {
-            if let Err(e) = app.state().save_user(&state_file) {
+            if let Err(e) = app.save_user(&state_file) {
                 eprintln!("sesync: cannot save state: {e}");
             } else {
                 seen_state = state_stamp(&state_file);

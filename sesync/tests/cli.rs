@@ -344,7 +344,7 @@ fn a_pass_dates_an_older_file_copy_from_the_file_and_leaves_an_opencode_copy_und
     let key = src.display().to_string();
 
     // The pi copy sits in the session's own bucket and holds what sesync wrote; it is old.
-    let copy = sb.join("pi").join("sessions").join("--tmp-proj-").join("copy.jsonl");
+    let copy = sb.join("pi").join("sessions").join("--tmp-proj--").join("copy.jsonl");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::write(&copy, fs::read(&src).unwrap()).unwrap();
     let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);

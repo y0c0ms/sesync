@@ -348,14 +348,22 @@ recorded the copy and its sync time.
   cap; a changed file and a successful pass reset it. The TUI shows a chosen target with no
   file as `pi?` (pending) or `pi!` (failing) in the MIRRORS column.
 - Mirror **placement** follows the source session's own project directory, not the target
-  store's layout: omp buckets are home-relative (`-SkillsOutlie` for `~/SkillsOutlie`) and are
-  computed from the real home (`Env.home`, not the store's parent); Pi and Claude buckets are
-  separator-replaced absolute paths. The cwd is read from the source's head (`Harness::cwd`,
-  `journal::cwd_from_head`). A recorded mirror is stale (`scan::mirror_stale`) when the target
-  says it is misplaced (`Harness::misplaced`: its bucket disagrees with that cwd), the file is
-  gone, or, for a database harness, its id is absent from the rows the scan read; the next pass
-  rewrites it, and `mirror_write::record_mirror` replaces the
-  record, deleting the superseded file only when it is unchanged.
+  store's layout, by each harness's own folder rule, read from its source: Pi files a project
+  under `--<absolute path>--` (pi-coding-agent 1.1 `getDefaultSessionDirPath`: one leading
+  separator dropped, `/`, `\` and `:` made '-'); omp under `-tmp-<relative>` for a cwd in the
+  temp root, `-<relative>` in the home (`-SkillsOutlie` for `~/SkillsOutlie`, computed from the
+  real home `Env.home`, not the store's parent), else Pi's absolute form (oh-my-pi 18.12
+  `getDefaultSessionDirName`); Claude buckets are separator-replaced absolute paths. The rules
+  live twice, in `harness/journal.rs` (`pi_bucket`, `omp_bucket`) and in the converter that
+  writes the copies; they change together. The cwd is read from the source's head
+  (`Harness::cwd`, `journal::cwd_from_head`). A recorded mirror is stale (`scan::mirror_stale`)
+  when the target says it is misplaced (`Harness::misplaced`: its bucket disagrees with that
+  cwd), the file is gone, or, for a database harness, its id is absent from the rows the scan
+  read; the next pass rewrites it, and `mirror_write::record_mirror` replaces the record,
+  deleting the superseded file only when it is unchanged. Before 2026-10-21 Pi copies, and omp
+  copies of a temp-root or outside-home project, went to a folder named by a wrong rule
+  (`-<absolute>-`), which their harness never lists for the project; those copies are moved this
+  way on the first pass of a fixed daemon.
 - A source's identity is `(fmt, key)`. omp and Pi both use the journal format; their `key` is
   the session id. OpenCode's `key` is its session id (`ses_...`); its display title is
   recorded in `Source::title` at scan time because the source does not carry one on disk.
@@ -414,6 +422,15 @@ recorded the copy and its sync time.
   held (`State::seen_keys`) that are no copy anywhere (`State::is_recorded_mirror`); the TUI
   prunes sources the daemon removed and its `save_user` adds only entries it created itself
   (`tui_created`); the scan and the session list never treat a recorded copy as a source.
+- **The user's choices merge per key.** Shares, chosen targets and deletes are written by any
+  TUI (two can be open at once) and read by the daemon. A TUI keeps the choices as it last read
+  or wrote them (`State::user_base`); its save writes only the conversations and sessions whose
+  choice differs from that (the ones changed in it), and everything else keeps what the file
+  holds (`State::save_user`). When the file changes, the TUI takes the file's choice for every key
+  it has not changed since (`State::absorb_user_choices`), so it shows the other TUI's choices; a
+  choice changed in both, the last save wins. Deletes are only ever added, so both sides' markers
+  are kept. The daemon never changes a choice; it takes them whole from the file before each pass
+  and again just before it saves (`State::absorb_user_edits`).
 - **One lock per conversation, whichever copy is live.** Every write claims the conversation's
   stable id, and every copy's own session id (and the source's, when it differs) is aliased to
   it in `<locks>/map/<id>` (`lock::write_alias`), which `sesync-lock` follows one hop. A turn
@@ -546,7 +563,16 @@ signed list names. A write also needs the record signed by a device the current 
 5. `team_pull_verified` merges accepted sequences upward into `State::team_seen`. The floor
    only ever rises. A record below it is a rollback and stays refused.
 6. The daemon only displays what passed. Writing a pulled session into a harness is an
-   explicit user action (`team_import`, an `i` key press from the TUI).
+   explicit user action (`team_import`, an `i` key press from the TUI): the journal is written,
+   as it is, into the first harness that keeps journals (omp), in the folder that harness lists
+   for the cwd the session's header records (`Harness::folder_for_cwd`; the home when there is
+   none), as `<start time>_<id>.jsonl`, created exclusively; an id the harness already holds is
+   refused.
+7. A listing the server refuses (a revoked device, a removed member) is reported with the
+   server's reason (`PullOutcome::error`): the daemon logs it, the TUI shows it in the status
+   line and on the team's card, and the pull never reads as an empty team. "Leave a team"
+   (`team_actions::leave`) removes the credential, which is the only way out of a declined join:
+   the server answers a declined key as it answers a pending one.
 
 ## Trust model
 
@@ -558,9 +584,13 @@ Every use re-verifies the list: `Trust::verifier()` parses and checks the signat
 any seal or open, so a fetched list can only narrow or widen within what the admin signed.
 
 The client trusts the *newest* verified list it has seen (`fetch_and_verify` refuses a lower
-version). A writer whose list is behind the server's will have its record refused: it must
-refresh before sealing. This is deliberate, so a device cannot seal under a list that already
-revoked someone.
+version) and keeps it: every pull and every push step stores a newer verified list in the
+credential (`team_join::ratchet_list`, `TeamWatch::keep_newer_lists`), so the list held only moves
+forward and, after a revoke, no server can hand this machine back a list that still names the
+revoked device, across restarts too. Until 2026-10-21 the credential kept the list from its
+approval, so "a lower version" was measured against that one. A writer whose list is behind the
+server's will have its record refused: it must refresh before sealing. This is deliberate, so a
+device cannot seal under a list that already revoked someone.
 
 Admission. The team code is a shared secret, so the server never admits on it: a code holder can
 ask to join and re-authenticate a key the admin already listed, nothing more. A new key waits as a
@@ -629,7 +659,8 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 | `sources[].sync` | per chosen copy: `{ok_at, problem, problem_at}`, the daemon's last good write and last failure. Settled on every pass (`settle_sync_records`): a copy no longer chosen loses its record at once, and a file copy written before the record existed gets `ok_at` once from its mtime (never for a diverged copy or bytes sesync did not write; an OpenCode copy waits for its next write, since its row time is the imported conversation's). A problem that says "will retry" (the copy was in use) shows as waiting, not failing |
 | `mirror_keys` | every path/id the daemon created; never treated as a source |
 | `subagents` | parent session → subagent transcript paths |
-| `marked` | sessions eligible for team push |
+| `deleted` | user-owned, written by the TUI: source key → when the user deleted it. Every load and merge (daemon and TUI) forgets each such session that is gone (`State::forget_deleted`): the record goes and its copies are released, so it is never listed as missing and the daemon does not bring it back. Kept for a day, which any running daemon outlasts |
+| `shares` | user-owned, written by the TUI: conversation id → the teams it is shared into; merged per conversation (see "The user's choices merge per key"). A file written before teams were per session carries a `marked` list instead, folded into `shares` once the machine's teams are known |
 | `team` | per session: `{hash, pushed_at}` of the last successful push |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
 

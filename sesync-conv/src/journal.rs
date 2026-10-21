@@ -363,53 +363,87 @@ pub fn inline_blobs(records: &mut [Map<String, Value>], blobs_dir: &Path) -> Res
     Ok(n)
 }
 
-/// Bucket directory name, same rule in both engines, verified against every
-/// bucket on this box (2026-10-12):
-///   <drive>:\<home>\<project> -> --C--<home>-<project>--   (pi: absolute)
-///   same cwd                                -> -<project>                             (omp: home-relative)
-///   C:\scratch (outside home)                   -> --C--tmp--                                       (omp falls back to absolute)
-///   home itself                             -> -                                                (omp)
-/// Rule: each path separator becomes '-', the drive colon becomes '-' as
-/// well (so "C:\" is "C--"), every other character (spaces, hyphens,
-/// underscores) is kept verbatim. Absolute form is wrapped in a leading "-"
-/// and trailing "-". Home-relative form is the relative part with '-' for
-/// separators and a leading '-'.
+/// Each path separator becomes '-', the drive colon too; every other character (spaces, hyphens,
+/// underscores) is kept verbatim.
 fn seg_join(path: &str) -> String {
-    // "<drive>:\<home>\x" -> "C--<home>-x"; "/tmp/x" -> "-tmp-x"
-    let mut out = String::new();
-    let mut prev_sep = false;
-    for ch in path.chars() {
-        match ch {
-            '\\' | '/' | ':' => {
-                out.push('-');
-                prev_sep = true;
-            }
-            c => {
-                out.push(c);
-                prev_sep = false;
-            }
-        }
-    }
-    let _ = prev_sep;
-    out
+    path.chars().map(|c| if matches!(c, '\\' | '/' | ':') { '-' } else { c }).collect()
 }
 
+/// Pi's project folder for a cwd, as pi-coding-agent 1.1 names it (`session-manager.ts`,
+/// `getDefaultSessionDirPath`): the absolute path without one leading separator, each `/`, `\`
+/// and `:` made '-', wrapped in "--" on both sides: `C:\Users\u\proj` is `--C--Users-u-proj--`,
+/// `/home/u/proj` is `--home-u-proj--`. Pi lists, continues and resumes a project from that one
+/// folder. sesync checks copies against the same rule (`sesync/src/harness/journal.rs`); keep
+/// the two in step.
 pub fn pi_bucket(cwd: &str) -> String {
-    let core = seg_join(cwd.trim_end_matches(['\\', '/']));
-    format!("-{core}-")
+    let path = resolved(cwd);
+    let rest = path.strip_prefix(['/', '\\']).unwrap_or(&path);
+    format!("--{}--", seg_join(rest))
 }
 
-pub fn omp_bucket(cwd: &str, home: &str) -> String {
-    let norm = |s: &str| s.replace('/', "\\");
-    let (c, h) = (norm(cwd.trim_end_matches(['\\', '/'])), norm(home.trim_end_matches(['\\', '/'])));
-    if c.len() >= h.len() && c[..h.len()].eq_ignore_ascii_case(&h) && (c.len() == h.len() || c.as_bytes()[h.len()] == b'\\') {
-        let rel = &c[h.len()..];
-        if rel.is_empty() {
-            return "-".to_string();
-        }
-        return seg_join(rel); // rel starts with '\' -> leading '-'
+/// omp's project folder for a cwd, as oh-my-pi 18.12 names it (`session/session-paths.ts`,
+/// `getDefaultSessionDirName`). The temp root is checked first (on Windows it sits inside the
+/// home): a cwd in it is `-tmp-<relative>`, the root itself `-tmp`. Then a cwd in the home is
+/// `-<relative>`, the home itself `-`. Any other cwd takes Pi's absolute form.
+pub fn omp_bucket(cwd: &str, home: &str, temp: &str) -> String {
+    let path = resolved(cwd);
+    if let Some(rel) = relative_within(&path, temp) {
+        return relative_bucket("-tmp", &rel);
     }
-    pi_bucket(&c)
+    if let Some(rel) = relative_within(&path, home) {
+        return relative_bucket("-", &rel);
+    }
+    pi_bucket(&path)
+}
+
+/// The temp root as Node's `os.tmpdir()` finds it, the root omp files temp sessions under:
+/// `TEMP`, else `TMP` on Windows; `TMPDIR`, `TMP`, `TEMP`, else `/tmp` elsewhere.
+pub fn node_tmpdir() -> String {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if cfg!(windows) {
+        var("TEMP").or_else(|| var("TMP"))
+            .or_else(|| var("SystemRoot").or_else(|| var("windir")).map(|r| format!("{r}\\temp")))
+            .unwrap_or_default()
+    } else {
+        var("TMPDIR").or_else(|| var("TMP")).or_else(|| var("TEMP")).unwrap_or_else(|| "/tmp".to_string())
+    }
+}
+
+/// A cwd as `path.resolve` leaves it: no trailing separator, except on a root (`/`, `C:\`).
+fn resolved(cwd: &str) -> String {
+    let t = cwd.trim_end_matches(['\\', '/']);
+    if t.is_empty() || t.ends_with(':') {
+        return cwd[..(t.len() + 1).min(cwd.len())].to_string();
+    }
+    t.to_string()
+}
+
+/// `path` relative to `root` when it is the root or inside it, without a leading separator.
+/// Either separator matches and ASCII case is ignored, as on Windows. None when it is outside,
+/// or `root` is empty.
+fn relative_within(path: &str, root: &str) -> Option<String> {
+    let norm = |s: &str| s.replace('/', "\\");
+    let (p, r) = (norm(path), norm(root.trim_end_matches(['\\', '/'])));
+    if r.is_empty() || !p.get(..r.len())?.eq_ignore_ascii_case(&r) {
+        return None;
+    }
+    match &p[r.len()..] {
+        "" => Some(String::new()),
+        rest => rest.strip_prefix('\\').map(str::to_string),
+    }
+}
+
+/// omp's `encodeRelativeSessionDirName`: the prefix alone for the root itself, else the prefix
+/// and the relative path with its separators made '-', joined by one '-'.
+fn relative_bucket(prefix: &str, rel: &str) -> String {
+    let enc = seg_join(rel);
+    if enc.is_empty() {
+        prefix.to_string()
+    } else if prefix.ends_with('-') {
+        format!("{prefix}{enc}")
+    } else {
+        format!("{prefix}-{enc}")
+    }
 }
 
 pub fn journal_filename(timestamp_iso: &str, id: &str) -> String {
@@ -468,6 +502,31 @@ pub mod fixture {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The folders Pi and omp list a project from, as their own sources compute them
+    /// (pi-coding-agent 1.1 `getDefaultSessionDirPath`, oh-my-pi 18.12 `getDefaultSessionDirName`).
+    /// A copy written anywhere else is never offered for its project.
+    #[test]
+    fn project_folders_follow_the_harness_rules() {
+        assert_eq!(pi_bucket("C:\\Users\\u\\proj"), "--C--Users-u-proj--");
+        assert_eq!(pi_bucket("C:\\Users\\u\\proj\\"), "--C--Users-u-proj--");
+        assert_eq!(pi_bucket("/home/u/proj"), "--home-u-proj--");
+        assert_eq!(pi_bucket("/"), "----");
+        assert_eq!(pi_bucket("C:\\"), "--C----");
+        let (home, temp) = ("C:\\Users\\u", "C:\\Users\\u\\AppData\\Local\\Temp");
+        assert_eq!(omp_bucket("C:\\Users\\u\\Projetos\\PC CONFIG", home, temp), "-Projetos-PC CONFIG");
+        assert_eq!(omp_bucket("c:/users/u/projetos", home, temp), "-projetos");
+        assert_eq!(omp_bucket(home, home, temp), "-");
+        assert_eq!(omp_bucket("C:\\Users\\u\\AppData\\Local\\Temp\\x\\y", home, temp), "-tmp-x-y",
+            "the temp root wins over the home it sits in");
+        assert_eq!(omp_bucket(temp, home, temp), "-tmp");
+        assert_eq!(omp_bucket("C:\\tmp", home, temp), "--C--tmp--");
+        assert_eq!(omp_bucket("C:\\Users\\uv", home, temp), "--C--Users-uv--",
+            "a name that only starts like the home is outside it");
+        assert_eq!(omp_bucket("/home/u/proj", "/home/u", "/tmp"), "-proj");
+        assert_eq!(omp_bucket("/tmp/x", "/home/u", "/tmp"), "-tmp-x");
+        assert_eq!(omp_bucket("/srv/x", "/home/u", "/tmp"), "--srv-x--");
+    }
 
     /// Everything before the last compaction's kept window was archived into that compaction's
     /// summary, and the engines resume without it. Exporting it anyway is what turned a session

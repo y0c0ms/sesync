@@ -3,6 +3,67 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-21: team exits, refusals that say so, and files filed where the harness lists them
+
+Found by running a team end to end on this machine (an in-memory team server, five sandboxed
+members, each with its own TUI and daemon) and reading the harnesses' own sources.
+
+- **Pull stuck.** The TUI applied a pull's result only on the next key, and a second ctrl+r
+  while one ran dropped the running one, so "a team pull is already running" stayed for the rest
+  of the run. The result is now collected on every loop turn and a refused request keeps the
+  running pull.
+- **A refused device read as an empty team.** A revoked or removed device saw "team pull: 0
+  verified" and could still share; the listing's 403 was swallowed. The pull now carries the
+  server's reason (`PullOutcome::error`): the status line, the team's card and the daemon log say
+  "the team server refused this device (403: not a member)", and push failures are logged with
+  their reasons, not only counted.
+- **No way out.** A declined join waits forever (the server answers a declined key as a pending
+  one), and a revoked membership stayed configured. "Leave a team" (command list) removes a
+  membership's credential, unshares its sessions and takes the rows only that team's pulls brought
+  over off the Team list, or forgets a team managed here; Enter twice confirms. The share picker
+  also lists a team a session is still shared with after this machine left it, so the share can
+  be untied.
+- **The member list never moved.** A credential kept the list from its approval: the card said
+  "list v3" at v8, and the rollback guard only measured against the approval-time list. Every
+  pull and push step now keeps a newer verified list (`team_join::ratchet_list`).
+- **Files no harness lists.** A team import wrote `omp/sessions/<file>`, a level omp never
+  reads. Pi copies went to `-<absolute>-`, but Pi (1.1, `getDefaultSessionDirPath`) lists a
+  project only from `--<absolute>--`; omp (18.12) puts a cwd in the temp root under
+  `-tmp-<relative>` and any other cwd outside the home under `--<absolute>--`. The rules in the
+  converter and in `harness/journal.rs` now follow the harnesses' sources (a recorded copy in a
+  wrong folder counts as misplaced and is moved on the next pass), and an import goes to the
+  folder the harness lists for the session's cwd, named after its start time; an id the harness
+  already holds is refused. `sesync` and `sesync-conv` must be installed together.
+- **Two TUIs overwrote each other.** A TUI saved its whole set of shares, chosen targets and
+  deletes, so with two open the later save erased the earlier one's choices, and neither showed
+  the other's until restarted. Each now keeps the choices as it last read or wrote them
+  (`State::user_base`): a save writes only what changed in it (a three-way merge per
+  conversation and per session), a re-read of the file takes every other choice, and deletes are
+  only ever added.
+- **Leaving emptied the Team list.** A pulled row did not record its team, so leaving one emptied
+  the list until the next ctrl+r. The app now keeps each team's verified copies
+  (`TeamWatch::copies`) and builds the list from them: leaving removes only the rows no other team
+  holds, and a conversation another team holds too stays, as that team's copy.
+- **Pi leftovers.** Three Pi files from 2026-10-12 (copies an older tool wrote, recorded as
+  sources) sat in single-dash folders Pi never lists. They were deleted through the TUI, so their
+  records went with them, and the eleven empty single-dash folders were removed.
+- **Suites** (Windows, sandboxed): `sesync` 596 passed, 0 failed; `sesync-conv` 75 passed.
+
+## 2026-10-21: a deleted session leaves the list; live OpenCode sessions are not "missing"
+
+- **Why.** A delete in the TUI removed the file only. The record stayed, the list shows a record
+  without a file as "(missing)", and nothing could remove it: the daemon owns the records and the
+  TUI had no way to tell it, and deleting the "(missing)" row was refused (the path check needs
+  the file). Separately, every OpenCode session was flagged "(missing)": the list looked only at
+  harness files, and on narrow columns the tag was cut off with the title.
+- **Now.** A delete is recorded in the state's user-owned `deleted` (key and time). The TUI, its
+  save, and every daemon load and merge (`release_records`) forget each deleted session that is
+  gone: the record goes, its copies are released and listed as sessions of their own, and its
+  shares go. A deleted session whose file is back is kept; the marker lasts a day. Deleting a
+  "(missing)" row forgets it without touching any file. A database harness's session is missing
+  only when its database no longer lists it.
+- **Suites** (Windows, sandboxed): `sesync` 587 passed, 0 failed.
+
 ## 2026-10-21: the details pane previews the last messages; team dialogs show examples; titles
 
 - **Preview.** At 120 columns or more the details pane shows the highlighted session's last 20

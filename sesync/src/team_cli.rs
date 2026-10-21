@@ -191,6 +191,27 @@ pub fn remember_administered(config_dir: &Path, team: &AdminTeam) -> Result<(), 
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot save {}: {e}", path.display()))
 }
 
+/// Forget a team this machine administers: its record goes from `admin/teams.json`, so the
+/// members and invite dialogs stop offering it. The admin key and the team on the server stay.
+/// False when the team was not recorded.
+pub fn forget_administered(config_dir: &Path, team: &str) -> Result<bool, String> {
+    let mut all = administered(config_dir);
+    let before = all.len();
+    all.retain(|t| t.team != team);
+    if all.len() == before {
+        return Ok(false);
+    }
+    let rows: Vec<serde_json::Value> = all.iter()
+        .map(|t| serde_json::json!({"team": t.team, "server": t.server, "token_file": t.token_file}))
+        .collect();
+    let path = administered_path(config_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&rows).unwrap_or_default())
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot save {}: {e}", path.display()))?;
+    Ok(true)
+}
+
 fn device_of(file: &DeviceFile) -> Result<Device, String> {
     Device::from_keys(file.signing_pkcs8(), *file.box_secret())
         .map_err(|_| "the admin key on this machine is unreadable".to_string())

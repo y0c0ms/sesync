@@ -88,6 +88,8 @@ pub enum Mode {
     DeleteConfirm,
     /// The share picker: one row per team this machine belongs to, space ticks.
     SharePick,
+    /// The leave picker: one row per team record on this machine; Enter twice leaves it.
+    LeavePick,
     /// The team members dialog: the roster and the approve, refuse, revoke and remove keys.
     Members,
 }
@@ -109,6 +111,16 @@ impl SetupRequest {
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     }
+}
+
+/// What the caller removes on this machine when the user leaves a team (`App::take_leave_request`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveRequest {
+    pub team: String,
+    /// Remove the member credential: this machine stops syncing and pulling the team.
+    pub membership: bool,
+    /// Forget the administered-team record: the members and invite dialogs stop offering it.
+    pub admin: bool,
 }
 
 /// What the form dialog shows to the drawing code.
@@ -203,6 +215,8 @@ pub enum Ev {
     /// Scroll the preview of the highlighted session (shift+up/down, the wheel over the pane).
     PreviewUp,
     PreviewDown,
+    /// Open the leave-a-team picker (from the command list).
+    OpenLeave,
 }
 
 /// One row of the command list as the view draws it.
@@ -231,6 +245,9 @@ pub struct App {
     /// Team sessions from the last pull, as (id, bytes). Shown for display; written only when
     /// the user confirms an import.
     team: Vec<(String, Vec<u8>)>,
+    /// Every verified copy the last pull returned, by team. `team` is built from these (the
+    /// newest copy of each conversation), and leaving a team removes only that team's copies.
+    team_copies: Vec<crate::team_watch::TeamCopy>,
     /// Cursor into `team`, kept separate from the session cursor.
     team_index: usize,
     /// Ids imported in this run, in order. Recorded so the result can be shown.
@@ -324,6 +341,13 @@ pub struct App {
     admin_request: Option<AdminJob>,
     /// The highlighted session's last turns, read by the caller's preview worker.
     preview: crate::preview::Preview,
+    /// Why the last pull of a team failed (the server refused this device, or could not be
+    /// reached), by team. Shown on the team's card until a pull of it succeeds.
+    team_problems: std::collections::BTreeMap<String, String>,
+    /// The leave picker: its cursor, the row a first Enter armed, and the choice for the caller.
+    leave_cursor: usize,
+    leave_armed: Option<usize>,
+    leave_request: Option<LeaveRequest>,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -339,6 +363,9 @@ pub const TRANSCRIPT_MAX_LINES: usize = 4000;
 
 impl App {
     pub fn new(roots: Roots, state: State, lock_dir: PathBuf, sesync_lock: PathBuf) -> App {
+        let mut state = state;
+        // A session deleted in an earlier run whose record no daemon has dropped yet.
+        state.forget_deleted(unix_now());
         let mut titles = crate::manage::TitleCache::default();
         let groups = manage::list_groups_cached(&roots, &state, &mut titles);
         let visible: Vec<usize> = (0..groups.len()).collect();
@@ -347,6 +374,7 @@ impl App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
             team: Vec::new(),
+            team_copies: Vec::new(),
             team_index: 0,
             imported: Vec::new(),
             space: None,
@@ -397,6 +425,10 @@ impl App {
             admin_busy: false,
             admin_request: None,
             preview: Default::default(),
+            team_problems: Default::default(),
+            leave_cursor: 0,
+            leave_armed: None,
+            leave_request: None,
         }
     }
 
@@ -463,9 +495,15 @@ impl App {
         &self.groups
     }
 
-    /// Set the team sessions a pull returned. Display only; nothing is written by this.
+    /// Show these team sessions, with no team behind them (a caller that has rows only). Display
+    /// only; nothing is written by this, and leaving a team does not remove these rows.
     pub fn set_team_sessions(&mut self, sessions: Vec<(String, Vec<u8>)>) {
-        self.team = sessions;
+        self.team_copies.clear();
+        self.show_team_rows(sessions);
+    }
+
+    fn show_team_rows(&mut self, rows: Vec<(String, Vec<u8>)>) {
+        self.team = rows;
         self.clamp_team_index();
     }
 
@@ -504,9 +542,12 @@ impl App {
         self.pulling
     }
 
-    /// Record what a team pull returned: the verified sessions and how many the app refused.
-    pub fn set_pull_result(&mut self, sessions: Vec<(String, Vec<u8>)>, refused: usize) {
-        self.set_team_sessions(sessions);
+    /// Record what a team pull returned: every verified copy, by team (the list shows the newest
+    /// copy of each conversation), and how many records the app refused.
+    pub fn set_pull_result(&mut self, copies: Vec<crate::team_watch::TeamCopy>, refused: usize) {
+        let rows = crate::team_watch::newest_of(&copies);
+        self.team_copies = copies;
+        self.show_team_rows(rows);
         let shown = self.team.len();
         self.pulling = false;
         self.last_pull = Some((Instant::now(), shown, refused));
@@ -606,6 +647,7 @@ impl App {
             Mode::Transcript => "j/k scroll · esc close".to_string(),
             Mode::DeleteConfirm => "ctrl+d delete · any other key cancels".to_string(),
             Mode::SharePick => "space tick · a all · n none · enter keep · esc cancel".to_string(),
+            Mode::LeavePick => "up/down move · enter twice leaves · esc cancel".to_string(),
             Mode::Browse => match self.view {
                 View::Sessions => {
                     let view_key = match self.filter_scope {
@@ -855,7 +897,7 @@ impl App {
             self.say("no team is configured; join a team to share a session");
             return None;
         }
-        if self.teams.len() > 1 {
+        if self.share_rows(&id).len() > 1 {
             self.pick_shares = self.state.shares_of(&id);
             self.share_cursor = 0;
             self.mode = Mode::SharePick;
@@ -889,7 +931,7 @@ impl App {
     }
 
     fn handle_share_pick(&mut self, ev: Ev) {
-        let rows = self.teams.clone();
+        let rows = self.share_picker_rows();
         let last = rows.len().saturating_sub(1);
         match ev {
             Ev::Esc => {
@@ -930,6 +972,146 @@ impl App {
     pub fn share_cursor(&self) -> usize { self.share_cursor }
     pub fn share_is_picked(&self, team: &str) -> bool { self.pick_shares.contains(team) }
     pub fn teams(&self) -> &[String] { &self.teams }
+
+    /// The share picker's rows for a conversation: the teams this machine belongs to, and any
+    /// team it is still shared with that is not one of them any more, so that share can be untied.
+    pub fn share_rows(&self, conversation: &str) -> Vec<String> {
+        let mut rows = self.teams.clone();
+        for t in self.state.shares_of(conversation) {
+            if !rows.contains(&t) {
+                rows.push(t);
+            }
+        }
+        rows
+    }
+
+    /// `share_rows` for the highlighted session, as the picker draws them.
+    pub fn share_picker_rows(&self) -> Vec<String> {
+        self.selected().map(|g| self.share_rows(&self.state.team_id_of(&g.key))).unwrap_or_default()
+    }
+
+    /// Why the last pull of `team` failed, if it did.
+    pub fn team_problem(&self, team: &str) -> Option<&str> {
+        self.team_problems.get(team).map(String::as_str)
+    }
+
+    /// The failures of the last pull, by team (set by the caller from the pull's outcome).
+    pub fn set_team_problems(&mut self, problems: std::collections::BTreeMap<String, String>) {
+        self.team_problems = problems;
+    }
+
+    /// Every team record on this machine that can be left, as (label, what leaving removes): each
+    /// membership (listed or waiting) and each team managed here. Leaving a membership never
+    /// gives up managing the team, and the other way round.
+    pub fn leave_rows(&self) -> Vec<(String, LeaveRequest)> {
+        use crate::team_join::Standing;
+        let mut rows: Vec<(String, LeaveRequest)> = self.team_cards.iter().map(|c| {
+            let standing = match &c.standing {
+                Standing::Listed { .. } if self.team_problems.contains_key(&c.space) => "refused by the server",
+                Standing::Listed { .. } => "listed",
+                Standing::Waiting { .. } => "waiting for the admin",
+                Standing::Unreadable(_) => "unreadable",
+            };
+            let who = if c.member.is_empty() { String::new() } else { format!(" as {}@{}", c.member, c.machine) };
+            (format!("{}: leave the team on this machine{who} ({standing})", c.space),
+             LeaveRequest { team: c.space.clone(), membership: true, admin: false })
+        }).collect();
+        rows.extend(self.admin_teams.iter().map(|a| (
+            format!("{}: stop managing it here (the admin key stays)", a.team),
+            LeaveRequest { team: a.team.clone(), membership: false, admin: true },
+        )));
+        rows
+    }
+
+    fn open_leave(&mut self) {
+        if self.leave_rows().is_empty() {
+            self.say("no team on this machine");
+            return;
+        }
+        self.leave_cursor = 0;
+        self.leave_armed = None;
+        self.mode = Mode::LeavePick;
+        self.say("pick the team to leave; Enter twice leaves it, Esc cancels");
+    }
+
+    fn handle_leave_pick(&mut self, ev: Ev) {
+        let rows = self.leave_rows();
+        let last = rows.len().saturating_sub(1);
+        match ev {
+            Ev::Esc => {
+                self.mode = Mode::Browse;
+                self.leave_armed = None;
+                self.say("nothing left");
+            }
+            Ev::Up | Ev::Char('k') => {
+                self.leave_cursor = self.leave_cursor.saturating_sub(1);
+                self.leave_armed = None;
+            }
+            Ev::Down | Ev::Char('j') => {
+                self.leave_cursor = (self.leave_cursor + 1).min(last);
+                self.leave_armed = None;
+            }
+            Ev::Enter => {
+                let Some((label, req)) = rows.get(self.leave_cursor).cloned() else { return };
+                if self.leave_armed == Some(self.leave_cursor) {
+                    self.leave_armed = None;
+                    self.mode = Mode::Browse;
+                    self.say(format!("leaving: {label}"));
+                    self.leave_request = Some(req);
+                } else {
+                    self.leave_armed = Some(self.leave_cursor);
+                    self.say(if req.membership {
+                        format!("press enter again to leave '{}' on this machine; the team and its sessions stay on the server", req.team)
+                    } else {
+                        format!("press enter again to stop managing '{}' here; the team and the admin key stay", req.team)
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The leave picker's cursor and the row a first Enter armed, for drawing.
+    pub fn leave_cursor(&self) -> usize { self.leave_cursor }
+    pub fn leave_armed(&self) -> Option<usize> { self.leave_armed }
+
+    /// A leave the user confirmed, for the caller to carry out (it owns the configuration
+    /// directory), once.
+    pub fn take_leave_request(&mut self) -> Option<LeaveRequest> {
+        self.leave_request.take()
+    }
+
+    /// The caller left (or failed to leave) a team. A membership left drops the team from every
+    /// share, so nothing stays shared into a team this machine can no longer reach.
+    pub fn left_team(&mut self, req: &LeaveRequest, outcome: Result<String, String>) {
+        match outcome {
+            Ok(done) => {
+                let mut msg = done;
+                if req.membership {
+                    self.team_problems.remove(&req.team);
+                    // Only rows this team's pulls brought over leave the list; a conversation
+                    // another team holds too stays, as that team's copy.
+                    if self.team_copies.iter().any(|c| c.space == req.team) {
+                        let before = self.team.len();
+                        self.team_copies.retain(|c| c.space != req.team);
+                        let rows = crate::team_watch::newest_of(&self.team_copies);
+                        self.show_team_rows(rows);
+                        let gone = before - self.team.len();
+                        if gone > 0 {
+                            msg.push_str(&format!("; {gone} of its session(s) left the Team list"));
+                        }
+                    }
+                    let dropped = self.state.drop_team_shares(&req.team);
+                    if dropped > 0 {
+                        self.user_dirty = true;
+                        msg.push_str(&format!("; {dropped} session(s) no longer shared with it"));
+                    }
+                }
+                self.say(msg);
+            }
+            Err(e) => self.fail(format!("not left: {e}")),
+        }
+    }
 
     /// True once the user changed a field the app owns (a mark or a mirror choice), and
     /// clears the flag. The caller saves state only when this returns true.
@@ -978,6 +1160,7 @@ impl App {
             team_selected: self.team.get(self.team_index).is_some(),
             team_configured: self.team_configured,
             team_to_manage: !self.manageable_teams().is_empty(),
+            teams_here: !self.team_cards.is_empty() || !self.admin_teams.is_empty(),
             admin: self.admin,
         }
     }
@@ -1038,8 +1221,9 @@ impl App {
     }
 
     /// Take the daemon-owned parts of a state file into this app: mirror records, scan stamps,
-    /// team floors and subagents. The user-owned parts (marks, chosen targets) stay local, so
-    /// a mirror the daemon just wrote becomes visible without a restart.
+    /// team floors and subagents, so a mirror the daemon just wrote becomes visible without a
+    /// restart. The user's choices (shares, chosen targets, deletes) another TUI saved are taken
+    /// too, except the ones changed here and not saved yet (`State::absorb_user_choices`).
     pub fn absorb_daemon_state(&mut self, disk: &State) {
         self.state.mirror_keys = disk.mirror_keys.clone();
         self.state.subagents = disk.subagents.clone();
@@ -1067,6 +1251,36 @@ impl App {
         // binary — which turn-taking would then read as a fresh edit. An entry the TUI itself
         // created (a choice not scanned yet) survives.
         self.state.sources.retain(|key, s| disk.sources.contains_key(key) || s.tui_created);
+        self.state.absorb_user_choices(disk);
+        // A session deleted here stays forgotten even before the daemon has applied it. If its
+        // marker is missing from the file while the record is still there (the daemon saved over
+        // this app's save), the marker is saved again.
+        if self.state.deleted.keys().any(|k| disk.sources.contains_key(k) && !disk.deleted.contains_key(k)) {
+            self.user_dirty = true;
+        }
+        self.state.forget_deleted(unix_now());
+    }
+
+    /// Save the choices made here into the state file: each one made here goes in, every other
+    /// one keeps what the file holds (another TUI's choices, the daemon's records), and this app
+    /// then shows the merged choices.
+    pub fn save_user(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let before = (self.state.user_choices(), self.state.deleted.clone());
+        self.state.save_user(path)?;
+        if (self.state.user_choices(), self.state.deleted.clone()) != before {
+            self.refresh_rows();
+        }
+        Ok(())
+    }
+
+    /// Fold a pre-multi-team `marked` list into shares (`State::migrate_legacy_team_state`). The
+    /// folded shares are this app's own change, so they go out with its next save.
+    pub fn migrate_legacy_team_state(&mut self, teams: &[String]) {
+        let had = !self.state.legacy_marked.is_empty();
+        self.state.migrate_legacy_team_state(teams);
+        if had && self.state.legacy_marked.is_empty() {
+            self.user_dirty = true;
+        }
     }
 
     /// Re-list the local sessions and keep the cursor on the same session, without a status
@@ -1135,6 +1349,7 @@ impl App {
             Mode::Transcript => self.handle_transcript(ev),
             Mode::DeleteConfirm => self.handle_delete_confirm(ev),
             Mode::SharePick => self.handle_share_pick(ev),
+            Mode::LeavePick => self.handle_leave_pick(ev),
             Mode::Browse => self.handle_browse(ev, now),
         }
     }
@@ -1168,6 +1383,7 @@ impl App {
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
             Ev::OpenInvite => self.open_invite(),
             Ev::OpenMembers => self.open_members(),
+            Ev::OpenLeave => self.open_leave(),
             Ev::CtrlD => {
                 if self.view != View::Sessions {
                     self.say("delete works on local sessions only; press tab");
@@ -2137,28 +2353,7 @@ impl App {
                 let pending = self.pending_import.take();
                 self.mode = Mode::Browse;
                 if let Some((id, bytes)) = pending {
-                    // The harness lists only `<timestamp>_<uuid>.jsonl`. A team id that cannot
-                    // be written in that form is refused, so no file is written that nothing shows.
-                    let name = format!("{}_{}.jsonl", "2026-01-01T00-00-00-000Z", id);
-                    if !crate::harness::journal::is_listed_session_name(&name) {
-                        self.mode = Mode::Browse;
-                        self.say(format!("not imported: team session id {id} is not a harness session id"));
-                        return;
-                    }
-                    // A pulled session is a canonical journal: it goes, as it is, into the first
-                    // harness whose own files are journals.
-                    let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
-                        self.fail("not imported: no harness keeps canonical journals");
-                        return;
-                    };
-                    let target = self.roots.locations.sessions_dir(h.id()).join(name);
-                    match crate::team_import::import_confirmed(&target, &bytes, true) {
-                        Ok(_) => {
-                            self.imported.push(id.clone());
-                            self.say(format!("imported team session {id}"));
-                        }
-                        Err(e) => self.fail(format!("not imported: {e:?}")),
-                    }
+                    self.import_team_session(&id, &bytes);
                 }
             }
             _ => {
@@ -2166,6 +2361,50 @@ impl App {
                 self.mode = Mode::Browse;
                 self.say("import cancelled");
             }
+        }
+    }
+
+    /// Write a confirmed team session, as it is (a canonical journal), into the first harness
+    /// whose own files are journals, filed the way that harness files its own: in the folder it
+    /// lists for the project directory the session's header records (the home when there is
+    /// none), under the start-time name its listing reads. A session that harness already holds
+    /// is left alone.
+    fn import_team_session(&mut self, id: &str, bytes: &[u8]) {
+        use crate::harness::journal;
+        let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
+            self.fail("not imported: no harness keeps canonical journals");
+            return;
+        };
+        let loc = self.roots.locations.of(h.id());
+        let head = journal::session_head(bytes);
+        let home = self.roots.home.display().to_string();
+        let cwd = head.cwd.clone().unwrap_or_else(|| home.clone());
+        let Some(folder) = h.folder_for_cwd(loc, &home, &cwd) else {
+            self.fail(format!("not imported: {} has no project folder to file it in", h.id()));
+            return;
+        };
+        // The harness lists only `<timestamp>_<uuid>.jsonl`. A header without a usable start time
+        // takes the import's; an id that cannot be written in that form is refused, so no file
+        // is written that nothing shows.
+        let mut name = journal::journal_filename(head.timestamp.as_deref().unwrap_or_default(), id);
+        if !journal::is_listed_session_name(&name) {
+            name = journal::journal_filename(&journal::now_iso_ms(), id);
+        }
+        if !journal::is_listed_session_name(&name) {
+            self.say(format!("not imported: team session id {id} is not a harness session id"));
+            return;
+        }
+        if h.sessions(loc).iter().any(|p| h.id_in(&p.display().to_string()).as_deref() == Some(id)) {
+            self.fail(format!("not imported: {} already holds session {id}", h.id()));
+            return;
+        }
+        match crate::team_import::import_confirmed(&folder.join(name), bytes, true) {
+            Ok(_) => {
+                self.imported.push(id.to_string());
+                self.say(format!("imported team session {id} into {}", h.id()));
+                self.refresh_rows();
+            }
+            Err(e) => self.fail(format!("not imported: {e:?}")),
         }
     }
 
@@ -2207,9 +2446,27 @@ impl App {
     }
 
     fn delete_selected(&mut self, g: &Group) {
-        match manage::delete_group(&self.roots, g, &self.lock_dir, &self.sesync_lock) {
+        // A session already gone (its file, or its row in a harness's store) has nothing left to
+        // delete: only its record goes. Anything else is deleted on disk first.
+        let removed = if g.orphan {
+            Ok(Vec::new())
+        } else {
+            manage::delete_group(&self.roots, g, &self.lock_dir, &self.sesync_lock)
+        };
+        match removed {
             Ok(done) => {
-                self.say(format!("deleted {} item(s) for '{}'", done.len(), g.title));
+                // The record goes with the file, or the session would be listed as missing from
+                // now on; its copies stay and are listed as sessions of their own. The daemon
+                // learns of it through the saved state.
+                let now = unix_now();
+                self.state.deleted.insert(g.key.clone(), now);
+                self.state.forget_deleted(now);
+                self.user_dirty = true;
+                self.say(if g.orphan {
+                    format!("forgot '{}': it was already gone", g.title)
+                } else {
+                    format!("deleted {} item(s) for '{}'", done.len(), g.title)
+                });
                 self.reload();
             }
             Err(e) => self.fail(format!("refused: {e}")),
@@ -2219,6 +2476,11 @@ impl App {
 
 #[allow(dead_code)]
 fn _unused(_: ClaimOutcome<()>) {}
+
+/// Seconds since the epoch, for the records that carry wall time.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
 
 /// The status while the members dialog waits for the team's list.
 const READING_ROSTER: &str = "reading the team's list…";
