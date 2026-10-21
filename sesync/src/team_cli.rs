@@ -355,7 +355,9 @@ pub struct RosterView {
 /// Read a team's roster as structured rows. Nothing is signed.
 pub fn roster_view(base: &str, token: &str, name: &str, config_dir: &Path) -> Result<RosterView, String> {
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
-    let base = base.trim_end_matches('/');
+    // Whatever the caller was handed: surrounding whitespace is never part of a URL, and a
+    // trailing space used to surface as "cannot reach the team server".
+    let base = base.trim().trim_end_matches('/');
     let auth = format!("Bearer {token}");
     let admin = admin_device(config_dir)?;
     let roster = fetch_roster(&agent, base, &auth, name, &admin)?;
@@ -405,7 +407,9 @@ pub fn render_roster(view: &RosterView) -> String {
 /// team the one-time authenticator URI (nothing else ever returns it).
 pub fn run_detailed(cmd: &Command, base: &str, token: &str, config_dir: &Path) -> Result<(String, Option<String>), String> {
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
-    let base = base.trim_end_matches('/');
+    // Whatever the caller was handed: surrounding whitespace is never part of a URL, and a
+    // trailing space used to surface as "cannot reach the team server".
+    let base = base.trim().trim_end_matches('/');
     let auth = format!("Bearer {token}");
     match cmd {
         Command::Create { name, members } => {
