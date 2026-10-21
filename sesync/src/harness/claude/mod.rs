@@ -5,7 +5,7 @@
 pub mod compaction;
 
 use super::journal::{self, is_uuid, one_level_down, user_text};
-use super::{Harness, Location, Tools};
+use super::{Harness, Location, Message, Role, Tools};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,31 @@ impl Harness for Claude {
         let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let rec = serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": session_id});
         journal::rewrite(path, title, |text| journal::append_record(text, rec)).map(|()| None)
+    }
+    /// Read from the transcript's end: converting a transcript of hundreds of megabytes to show
+    /// its last turns would take seconds. Meta records, sidechains (subagent work), compaction
+    /// summaries and Claude's own command wrappers are not turns.
+    fn recent_messages(&self, _loc: &Location, _tools: &Tools, key: &str, _scratch: &Path, max: usize) -> Result<Vec<Message>, String> {
+        let lines = journal::tail_lines(Path::new(key), max * 4, |l| l.contains("\"user\"") || l.contains("\"assistant\""))?;
+        let mut out = Vec::new();
+        for line in &lines {
+            let Ok(r) = serde_json::from_str::<Value>(line) else { continue };
+            let role = match r.get("type").and_then(Value::as_str) {
+                Some("user") => Role::User,
+                Some("assistant") => Role::Assistant,
+                _ => continue,
+            };
+            let flag = |k: &str| r.get(k).and_then(Value::as_bool).unwrap_or(false);
+            if flag("isMeta") || flag("isSidechain") || flag("isCompactSummary") {
+                continue;
+            }
+            let text = journal::content_text(r.pointer("/message/content"));
+            if text.is_empty() || (role == Role::User && text.starts_with('<')) {
+                continue;
+            }
+            out.push(Message { role, text, at: journal::record_time(&r).unwrap_or(0.0) });
+        }
+        Ok(super::last_turns(out, max))
     }
 }
 

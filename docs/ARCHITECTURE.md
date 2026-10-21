@@ -312,7 +312,15 @@ The trait, by what sesync does with a harness:
 | List and read files | `sessions_dir`, `sessions`, `subagents`, `files_of` and `side_files` (a conversation of several files), `title`, `title_stamp`, `cwd`, `placed_by_cwd` and `misplaced` |
 | List and read a database | `rows`, `row_title`, `fingerprint`, `export`, `remove` |
 | Move a conversation | `to_journal`, `install`, `mirror_id`, `id_in`, `copy_exists` |
-| Follow the user | `newest_prompt` (turn-taking), `rename` |
+| Follow the user | `newest_prompt` (turn-taking), `rename`, `recent_messages` (the TUI's preview) |
+
+The TUI's details pane previews the highlighted session's last turns (`preview::Worker`, a
+thread of its own): `recent_messages` reads the end of the canonical journal by default (the
+file itself, or the conversion), Claude reads its transcript's end and OpenCode its database
+rather than convert a large file or export through the CLI. The worker checks the session's
+stamp (`mirror::copy_stamp`, or the store fingerprint) every second and reads again when it
+moves, so a new message shows without a key press. The converter's output is captured, never
+printed onto the screen.
 
 Every conversation crosses harnesses as one canonical journal (the omp/Pi format):
 `to_journal` makes it from the source (`sesync-conv from-<id>`, or nothing when the source

@@ -6,7 +6,7 @@
 pub mod rename;
 pub mod store;
 
-use super::{Harness, Kind, Location, Row, Tools};
+use super::{Harness, Kind, Location, Message, Row, Tools};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -97,6 +97,10 @@ impl Harness for OpenCode {
     fn remove(&self, loc: &Location, id: &str) -> Result<(), String> {
         let dir = store::session_directory(&loc.root, id).unwrap_or_default();
         store::remove_opencode_session(&Self::cli(loc), id, &dir, None)
+    }
+    /// Read from the database: an export through the CLI takes seconds.
+    fn recent_messages(&self, loc: &Location, _tools: &Tools, key: &str, _scratch: &Path, max: usize) -> Result<Vec<Message>, String> {
+        store::recent_messages(&loc.root, key, max)
     }
 }
 

@@ -94,10 +94,13 @@ daemon retries by itself), and `pi!` when its last write failed. SYNCED shows th
 good write to every chosen copy (`ok` until that time is known), or `waiting` or `failing`. On a
 narrow terminal the columns go in this order: TEAM, UPDATED, MIRRORS, SYNCED. At 120 columns or
 more a details pane shows the selected session and, per copy, when it was last written or why it
-failed. The tab bar says when the daemon last ran a pass and how many copies are in place or
+failed. Below that it previews the session's last messages, newest at the bottom, and updates by
+itself when the session changes, so a new message shows up without a key press; shift+up/down or
+the wheel over the pane scrolls back. The tab bar says when the daemon last ran a pass and how many copies are in place or
 failing. A session whose file is gone is listed by its name with `(missing)`. Emoji and icon glyphs
 in titles are left out of the display, because terminals draw them at different widths; the stored
-title is unchanged. The mouse selects a row, the wheel scrolls, and a double-click works like Enter.
+title is unchanged. The mouse selects a row, the wheel scrolls the list (or the preview, over the
+details pane), and a double-click works like Enter.
 
 Team commands. `join` and `renew` run on a member's machine; every other command runs on the
 admin's machine (the one that created the team, which holds the admin key) and also needs
@@ -122,8 +125,10 @@ once and the revoked key is refused at every later join, so nobody re-scans the 
 leaves.
 
 The same work is available in the TUI (`sesync --tui`) on the command list (ctrl+p), with no
-environment needed. "Start a team" asks for the team, its members, the admin token file and the
-server, then shows the one-time authenticator QR on a screen of its own, black on white, with the
+environment needed. "Start a team" asks for the team, its members (the people allowed to join,
+comma-separated: include yourself to sync this machine too, and invite others later), the admin
+token file and the server. An empty field shows a made-up example; it is never used as a value,
+so Enter on an empty required field is refused. It then shows the one-time authenticator QR on a screen of its own, black on white, with the
 setup key below it for typing. An 80 by 24 terminal holds the code; a smaller one says the size it
 needs and shows the key. With `NO_COLOR` set the code is drawn in the terminal's own colours with
 the light modules painted, which reads the right way round on a dark terminal. The machine that

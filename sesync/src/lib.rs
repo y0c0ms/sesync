@@ -29,6 +29,7 @@ pub mod form;
 pub mod keys;
 pub mod manage;
 pub mod palette;
+pub mod preview;
 pub mod qr;
 pub mod remote;
 pub mod remote_http;

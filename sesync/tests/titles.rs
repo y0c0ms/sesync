@@ -138,3 +138,16 @@ fn without_a_rename_the_slot_still_names_the_session() {
     assert_eq!(sesync::harness::journal::omp_title_from_lines(&lines).0, "Old name");
     let _ = std::fs::remove_file(&p);
 }
+
+/// The slot is rewritten when omp saves, so it can be newer than the renames near the head. An
+/// old rename read in the head window must not revive a name the user has replaced since: a 44 MB
+/// session read as its July name, and the rename form offered that name back.
+#[test]
+fn an_old_rename_near_the_head_does_not_override_a_newer_slot() {
+    let lines = [
+        r#"{"type":"title","v":1,"title":"PC Config","source":"user","updatedAt":"2026-10-20T09:47:11.217Z"}"#,
+        r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-07-27T10:35:21.365Z","title":"PC Config"}"#,
+        r#"{"type":"title_change","id":"t1","timestamp":"2026-07-27T10:38:34.575Z","title":"waveterm configuration options","source":"auto"}"#,
+    ];
+    assert_eq!(sesync::harness::journal::omp_title_from_lines(&lines).0, "PC Config");
+}

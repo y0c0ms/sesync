@@ -100,29 +100,34 @@ pub(super) fn user_text(msg: &Value) -> Option<String> {
     })
 }
 
-/// (title, _) for an omp/Pi journal. The title record (omp's slot) or the last
-/// `title_change` (a rename made inside omp; omp overlays it over the slot on
-/// read, and the slot can lag behind the rename until omp saves again) wins over
-/// the header, which can hold an older name. Falls back to the first user
-/// message. Never the filename.
+/// (title, _) for an omp/Pi journal. The newest name record wins: omp's slot (`title`, stamped
+/// `updatedAt`), a rename made inside omp (`title_change`; omp overlays it over the slot on read,
+/// and the slot lags until omp saves again) or Pi's `session_info`. An old rename near the head
+/// never overrides a slot rewritten since: the head window holds the first renames, and the last
+/// one can lie beyond what the tail walk reads, so file order alone would revive a stale name.
+/// Records without a time keep file order. Then the header, which can hold an older name, then
+/// the first user message. Never the filename.
 pub fn omp_title_from_lines(lines: &[&str]) -> (String, bool) {
     let (mut header, mut slot, mut fallback) = (String::new(), String::new(), String::new());
+    let mut slot_at = 0.0;
     for line in lines {
         let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
-        match rec.get("type").and_then(Value::as_str).unwrap_or("") {
+        let kind = rec.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
             "session" => {
                 if let Some(t) = rec.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()) {
                     header = t.to_string();
                 }
             }
-            "title" | "title_change" => {
-                if let Some(t) = rec.get("title").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
-                    slot = t.to_string();
-                }
-            }
-            "session_info" => {
-                if let Some(t) = rec.get("name").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
-                    slot = t.to_string();
+            "title" | "title_change" | "session_info" => {
+                let field = if kind == "session_info" { "name" } else { "title" };
+                if let Some(t) = rec.get(field).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+                    let at = rec.get("updatedAt").or_else(|| rec.get("timestamp"))
+                        .and_then(Value::as_str).and_then(crate::prompts::parse_rfc3339).unwrap_or(0.0);
+                    if at == 0.0 || slot_at == 0.0 || at >= slot_at {
+                        slot = t.to_string();
+                        slot_at = at;
+                    }
                 }
             }
             "message" if fallback.is_empty() => {
@@ -172,6 +177,77 @@ pub fn message_prompt_time(r: &serde_json::Value) -> Option<f64> {
 /// A record's `timestamp`, in seconds since the epoch.
 pub fn record_time(r: &serde_json::Value) -> Option<f64> {
     r.get("timestamp").and_then(serde_json::Value::as_str).and_then(crate::prompts::parse_rfc3339)
+}
+
+/// The first window the preview reads from a conversation's end, and how far back it may grow.
+const PREVIEW_WINDOW: u64 = 256 * 1024;
+const PREVIEW_TAIL_MAX: u64 = 8 * 1024 * 1024;
+
+/// The last whole lines of a file, in file order: the window from the end doubles until `want`
+/// of its lines pass `counts`, it reaches the start, or it reaches `PREVIEW_TAIL_MAX` bytes.
+pub(super) fn tail_lines(path: &Path, want: usize, counts: impl Fn(&str) -> bool) -> Result<Vec<String>, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut window = PREVIEW_WINDOW.min(len);
+    loop {
+        let start = len - window;
+        let mut buf = Vec::with_capacity(window as usize);
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        (&mut f).take(window).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&buf);
+        // A window that starts mid-file starts mid-line: that first line is not whole.
+        let lines: Vec<&str> = text.lines().skip(usize::from(start > 0)).collect();
+        if start == 0 || window >= PREVIEW_TAIL_MAX || lines.iter().filter(|l| counts(l)).count() >= want {
+            return Ok(lines.into_iter().map(str::to_string).collect());
+        }
+        window = (window * 2).min(len).min(PREVIEW_TAIL_MAX);
+    }
+}
+
+/// A message's content as the preview shows it: a string as it is; from a list of blocks, each
+/// text block, a tool call as `[tool: name]` and an image as `[image]`, with thinking and tool
+/// results left out. The journal and Claude's transcript share the block shapes under different
+/// names (`toolCall`, `tool_use`).
+pub(super) fn content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Array(blocks)) => blocks.iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str)? {
+                "text" => b.get("text").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string),
+                "toolCall" | "tool_use" => Some(format!("[tool: {}]", b.get("name").and_then(Value::as_str).unwrap_or("?"))),
+                "image" => Some("[image]".to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The last `max` turns of a canonical journal, oldest first, read from the file's end: user and
+/// assistant messages, with tool results and sesync's own compaction note left out.
+pub fn recent_messages(path: &Path, max: usize) -> Result<Vec<super::Message>, String> {
+    use super::{Message, Role};
+    // An assistant turn spans several records (one per tool round): read well past `max`.
+    let lines = tail_lines(path, max * 4, |l| l.contains("\"message\""))?;
+    let mut out = Vec::new();
+    for line in &lines {
+        let Ok(r) = serde_json::from_str::<Value>(line) else { continue };
+        if r.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let role = match r.pointer("/message/role").and_then(Value::as_str) {
+            Some("user") => Role::User,
+            Some("assistant") => Role::Assistant,
+            _ => continue,
+        };
+        let text = content_text(r.pointer("/message/content"));
+        if text.is_empty() || (role == Role::User && text.starts_with(crate::prompts::COMPACTION_NOTE_PREFIX)) {
+            continue;
+        }
+        out.push(Message { role, text, at: record_time(&r).unwrap_or(0.0) });
+    }
+    Ok(super::last_turns(out, max))
 }
 
 /// The folder a copy sits in: its project bucket.
@@ -339,16 +415,23 @@ pub fn append_record(text: &str, rec: serde_json::Value) -> String {
 }
 
 /// Convert a harness's own file into a canonical journal with `sesync-conv from-<id>`, written to
-/// `<scratch>/canonical.jsonl`.
+/// `<scratch>/canonical.jsonl`. The converter's output is captured, never inherited: the TUI's
+/// preview converts too, and anything printed would land on its screen.
 pub fn convert_from(sesync_conv: &Path, verb: &str, src: &Path, scratch: &Path, what: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let out = scratch.join("canonical.jsonl");
-    let status = Command::new(sesync_conv)
+    let run = Command::new(sesync_conv)
         .arg(verb).arg(src).arg("--out").arg(&out)
-        .status()
+        .stdin(std::process::Stdio::null())
+        .output()
         .map_err(|e| format!("cannot run sesync-conv: {e}"))?;
-    if !status.success() {
-        return Err(format!("sesync-conv could not convert this {what}"));
+    if !run.status.success() {
+        let why = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        return Err(if why.is_empty() {
+            format!("sesync-conv could not convert this {what}")
+        } else {
+            format!("sesync-conv could not convert this {what}: {why}")
+        });
     }
     Ok(out)
 }

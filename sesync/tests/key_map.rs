@@ -48,6 +48,12 @@ fn navigation_and_editing_keys_map() {
     assert_eq!(key_to_ev(KeyCode::F(1), KeyModifiers::NONE), None);
 }
 
+#[test]
+fn shift_arrows_scroll_the_preview_not_the_list() {
+    assert_eq!(key_to_ev(KeyCode::Up, KeyModifiers::SHIFT), Some(Ev::PreviewUp));
+    assert_eq!(key_to_ev(KeyCode::Down, KeyModifiers::SHIFT), Some(Ev::PreviewDown));
+}
+
 /// An app with one session on disk, so rename has a row to act on.
 fn empty_app() -> App {
     let d: PathBuf = std::env::temp_dir().join(format!("sesync-keymap-{}", std::process::id()));

@@ -160,6 +160,52 @@ pub fn first_prompt(db: &Path, session_id: &str) -> String {
     String::new()
 }
 
+/// The session's last `max` turns, oldest first: text parts as written and tool parts by name;
+/// reasoning, synthetic text (OpenCode's own reminders) and sesync's compaction note left out.
+/// Read-only, like every read of this store.
+pub fn recent_messages(db: &Path, session_id: &str, max: usize) -> Result<Vec<crate::harness::Message>, String> {
+    use crate::harness::{Message, Role};
+    let con = open_ro(db).ok_or_else(|| format!("cannot open {}", db.display()))?;
+    let newest: Vec<(String, i64, String)> = {
+        let mut stmt = con.prepare(
+            "select id, time_created, coalesce(json_extract(data, '$.role'), '') from message \
+             where session_id = ?1 order by time_created desc, id desc limit ?2",
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map(rusqlite::params![session_id, (max * 4) as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        rows.flatten().collect()
+    };
+    let mut parts = con.prepare("select data from part where message_id = ?1 order by time_created, id")
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (id, at, role) in newest.into_iter().rev() {
+        let role = match role.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            _ => continue,
+        };
+        let texts: Vec<String> = parts.query_map([&id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .filter_map(|data| serde_json::from_str::<Value>(&data).ok())
+            .filter_map(|p| match p.get("type").and_then(Value::as_str)? {
+                "text" if p.get("synthetic").and_then(Value::as_bool) != Some(true) => {
+                    p.get("text").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+                }
+                "tool" => Some(format!("[tool: {}]", p.get("tool").and_then(Value::as_str).unwrap_or("?"))),
+                "file" => Some("[file]".to_string()),
+                _ => None,
+            })
+            .collect();
+        let text = texts.join("\n");
+        if text.is_empty() || (role == Role::User && text.starts_with(crate::prompts::COMPACTION_NOTE_PREFIX)) {
+            continue;
+        }
+        out.push(Message { role, text, at: at as f64 / 1000.0 });
+    }
+    Ok(crate::harness::last_turns(out, max))
+}
+
 /// Test hook: attempt a write through a connection opened the way the reader opens
 /// its store. Returns the error the database gives, which must be an error.
 pub fn write_probe(db: &Path) -> Result<(), String> {

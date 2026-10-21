@@ -157,6 +157,22 @@ fn the_register_dialog_asks_for_the_admin_fields() {
     assert!(text.contains("a QR code for your authenticator app, shown only once"), "the QR warning is shown:\n{text}");
 }
 
+/// The dialog shows made-up examples in its empty fields. They are never values: Enter on an
+/// untouched dialog is refused, so a stray Enter cannot start a team.
+#[test]
+fn an_untouched_start_a_team_dialog_shows_examples_and_refuses_enter() {
+    let mut a = open_register();
+    let text = screen(&a, 110, 26);
+    assert!(text.contains("e.g. design-team") && text.contains("e.g. ana, rui"), "examples are shown:\n{text}");
+    a.handle(Ev::Tab, Instant::now()); // -> members
+    assert!(screen(&a, 110, 26).contains("who may join"), "the focused field says what it is for");
+    a.handle(Ev::Enter, Instant::now());
+    assert_eq!(a.mode(), Mode::Form, "the dialog stays open");
+    assert!(a.take_setup_request().is_none(), "no team is started");
+    assert!(a.status().contains("'team' is empty"), "{}", a.status());
+    assert_eq!(a.form_value("team"), "", "the example is not a value");
+}
+
 #[test]
 fn the_dialog_can_be_prefilled_by_the_caller() {
     let mut a = app();

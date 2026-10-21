@@ -110,7 +110,8 @@ HS_E2E=1 sh build-test.sh
   `prompts`, `lock`, `archive`, `archive_store`.
 - **TUI**: `tui`, `app`, `ui`, `keys`, `palette`, `form`, `theme`, `session_cols` (columns,
   `display_safe`), `manage`, `members` (members dialog state), `team_actions` (the network work
-  behind the team dialogs, run on worker threads), `qr`, `clipboard`, `remote`, `remote_http`.
+  behind the team dialogs, run on worker threads), `preview` (the highlighted session's last
+  turns, read on a worker thread), `qr`, `clipboard`, `remote`, `remote_http`.
 - **Team client**: `team_cli` (admin commands), `team_join`, `device_keys`, `sealed`,
   `team_pull_verified` (the live pull), `team_watch`, `team_push`, `team_sync` (trigger),
   `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`.
@@ -153,7 +154,7 @@ Each one has a test; if you change the area, keep the test and add one for the n
 | 19 | A copy is all of its files: an Antigravity conversation is `<id>.db` plus `<id>.db-wal` (agy's live turns sit in the WAL). Change detection, fingerprints, archives and removal cover both, and sesync never creates `-wal`/`-shm` next to agy's file. | `mirror::copy_files`/`copy_hash`/`copy_stamp`, `Harness::files_of`, `harness::antigravity::store::read_only` |
 | 20 | A retired harness (Gemini CLI) is only released, never deleted: its sources move to a surviving copy with the same conversation id, its targets and copies are dropped from the records, its files stay on disk. | `State::retire_harness`, `harness::RETIRED`, `bin/sesync.rs::retire_harnesses` |
 | 21 | No glyph whose width terminals disagree on reaches the screen (emoji, variation selectors, private-use icons): session text is drawn through `display_safe`, and the finished frame is scrubbed, so one title cannot shift or garble the rest of the screen. | `session_cols::display_safe`, `session_cols::is_unsafe_glyph`, `ui::scrub_unsafe_glyphs` |
-| 22 | The TUI never blocks on the network: team calls run on worker threads and their answers are applied between frames. | `team_actions`, `bin/sesync.rs::TeamJobs`, `request_team_pull` |
+| 22 | The TUI never blocks on the network or a conversion: team calls and the session preview run on worker threads and their answers are applied between frames. | `team_actions`, `bin/sesync.rs::TeamJobs`, `request_team_pull`, `preview::Worker` |
 
 ## Change recipes
 
@@ -193,13 +194,15 @@ module and nothing else:
    `install`, `rename`. A file harness adds `sessions` and `title`, plus `files_of`/`side_files`
    when a conversation is more than one file and `placed_by_cwd`/`misplaced` when copies are
    filed by project. A database harness returns `Kind::Store` and adds `rows`, `row_title`,
-   `fingerprint`, `export`, `remove`, `copy_exists`. `harness/journal.rs` has the JSONL helpers.
+   `fingerprint`, `export`, `remove`, `copy_exists`. The TUI's preview (`recent_messages`) works
+   through `to_journal` by default; override it when the end of the store can be read directly
+   (a large transcript, a database). `harness/journal.rs` has the JSONL helpers.
 2. Declare it in `harness/mod.rs` and list it in `ALL` (the picker's order).
 3. Test its own reads and writes under `sesync/tests/` with a fake CLI and the real converter;
    never the real CLI.
 
 The scan, turn-taking, mirror writes and cleanup, the team push, and the TUI's list, picker,
-titles, renames and icons all come from the registry.
+titles, renames, icons and preview all come from the registry.
 
 **Retiring a harness** (as Gemini CLI on 2026-06-18): delete its module and its `ALL` entry,
 and add a `Retired` entry (its id and the shape of its conversation files) to

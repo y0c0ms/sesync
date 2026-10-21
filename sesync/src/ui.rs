@@ -289,7 +289,131 @@ fn draw_details(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             Span::styled(detail, dim),
         ]));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // The details take the rows they need (a line that wraps gets a spare row); the last turns
+    // fill the rest of the pane.
+    let width = inner.width.max(1) as usize;
+    let top: usize = lines.iter().map(|l| match l.width() {
+        w if w <= width => 1,
+        w => w.div_ceil(width) + 1,
+    }).sum();
+    let parts = Layout::vertical([Constraint::Length((top as u16).min(inner.height)), Constraint::Min(0)]).split(inner);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
+    draw_preview(f, app, th, parts[1]);
+}
+
+/// The highlighted session's last turns, newest at the bottom, below its details. The caller's
+/// worker reads them and reads them again when the session changes, so a new message shows by
+/// itself; shift+up/down or the wheel over the pane scroll back.
+fn draw_preview(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::harness::Role;
+    use crate::session_cols::{display_safe, relative};
+    if area.height < 4 {
+        return;
+    }
+    let p = app.preview();
+    let dim = Style::default().fg(th.dim);
+    // A blank row, the heading, then the turns.
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).split(area);
+    f.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled("Last messages", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("  shift+↑↓ scroll", dim),
+    ])), rows[1]);
+    let width = rows[2].width as usize;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if p.messages.is_empty() {
+        let note = match (&p.error, p.loading) {
+            (Some(e), _) => display_safe(e),
+            (None, true) => "reading…".to_string(),
+            (None, false) => "No messages yet.".to_string(),
+        };
+        body.push(Line::from(Span::styled(format!("  {note}"), dim)));
+    }
+    for m in &p.messages {
+        if !body.is_empty() {
+            body.push(Line::from(""));
+        }
+        let (who, color) = match m.role {
+            Role::User => ("user", th.accent),
+            Role::Assistant => ("assistant", th.text),
+        };
+        let when = if m.at > 0.0 { format!(" · {}", relative(now, m.at)) } else { String::new() };
+        body.push(Line::from(vec![
+            Span::styled(who, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(when, dim),
+        ]));
+        for raw in m.text.lines() {
+            let safe = display_safe(raw);
+            for piece in wrap_words(&safe, width.saturating_sub(2)) {
+                body.push(Line::from(Span::styled(format!("  {piece}"), Style::default().fg(th.text))));
+            }
+        }
+    }
+    let height = rows[2].height as usize;
+    let max = body.len().saturating_sub(height);
+    p.max_scroll.set(max);
+    let end = body.len() - p.scroll.min(max);
+    let start = end.saturating_sub(height);
+    f.render_widget(Paragraph::new(body[start..end].to_vec()), rows[2]);
+}
+
+/// Text broken into lines of at most `width` cells, at spaces where it can be; a word wider than
+/// a line is cut.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split(' ') {
+        let w = crate::session_cols::text_width(word);
+        if used > 0 && used + 1 + w <= width {
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + w;
+            continue;
+        }
+        if used > 0 {
+            out.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        for c in word.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > width {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(c);
+            used += cw;
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// The area between the tab bar and the status rows: the same split as `draw`.
+fn main_area(screen: Rect) -> Rect {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(screen)[1]
+}
+
+/// Whether a screen cell is on the details pane, so the wheel there scrolls the preview.
+pub fn details_pane_at(app: &App, screen: Rect, col: u16, row: u16) -> bool {
+    if !matches!(app.view(), View::Sessions) {
+        return false;
+    }
+    let (_, details) = sessions_panes(main_area(screen));
+    details.is_some_and(|d| col >= d.x && col < d.x + d.width && row >= d.y && row < d.y + d.height)
 }
 
 /// The index of the session row under a screen cell, for mouse clicks. None when the cell is on
@@ -298,15 +422,7 @@ pub fn session_row_at(app: &App, screen: Rect, col: u16, row: u16) -> Option<usi
     if !matches!(app.view(), View::Sessions) {
         return None;
     }
-    // Same split as `draw`: tab bar, list, status line, key help.
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(screen);
-    let (list_pane, _) = sessions_panes(chunks[1]);
+    let (list_pane, _) = sessions_panes(main_area(screen));
     let in_cols = col >= list_pane.x && col < list_pane.x + list_pane.width;
     let first = list_pane.y as usize + 1; // row 0 of the pane is the column header
     let height = (list_pane.height as usize).saturating_sub(1);
@@ -565,7 +681,8 @@ fn draw_theme(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     hint(f, "up/down preview · enter apply · esc revert", th, parts[2]);
 }
 
-/// The join/start dialog: one input row per field, the current one highlighted.
+/// The join/start dialog: one input row per field, the current one highlighted. An empty field
+/// shows an example, dimmed; it is never a value, so Enter on an untouched dialog is refused.
 fn draw_form(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let Some(view) = app.form_view() else { return };
     let title = match view.kind {
@@ -573,39 +690,45 @@ fn draw_form(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Kind::Register => "Start a team",
         Kind::Invite => "Invite a member",
     };
-    let outer = centered(76, (view.fields.len() as u16) + if view.kind == Kind::Register { 7 } else { 6 }, area);
-    let inner = dialog(f, title, th, outer);
-    let rows_n = if view.kind == Kind::Register { 2 } else { 1 };
-    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(rows_n)]).split(inner);
-    // The label column fits the longest label plus a gap; a value longer than what is left shows
-    // its end, so a long path being typed keeps its newest characters in view.
-    let label_w = view.fields.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0) + 2;
-    let value_w = (parts[0].width as usize).saturating_sub(1 + label_w);
-    let rows: Vec<Line<'static>> = view.fields.iter().map(|(name, value)| {
-        let here = view.cursor_here(name);
-        let label = format!("{name:<label_w$}");
-        let rest = tail_fit(&if here { format!("{value}_") } else { value.clone() }, value_w);
-        Line::from(vec![
-            Span::styled(format!(" {label}"), if here { on_accent(th, true) } else { Style::default().fg(th.dim) }),
-            Span::styled(rest, if here { on_accent(th, false) } else { Style::default().fg(th.text) }),
-        ])
-    }).collect();
-    let cursor = view.cursor;
-    let shown: Vec<ListItem> = show_window(&rows, parts[0].height as usize, cursor);
-    f.render_widget(List::new(shown), parts[0]);
+    let dim = Style::default().fg(th.dim);
     let warning = match view.kind {
         Kind::Register => "next: a QR code for your authenticator app, shown only once",
         Kind::Enroll | Kind::Invite => "",
     };
-    if warning.is_empty() {
-        hint(f, "tab next field · enter submit · esc cancel", th, parts[1]);
-    } else {
-        let tw = Paragraph::new(vec![
-            Line::from(Span::styled(format!(" {warning}"), Style::default().fg(th.dim))),
-            Line::from(Span::styled(" tab next field · enter submit · esc cancel", Style::default().fg(th.dim))),
-        ]);
-        f.render_widget(tw, parts[1]);
+    // Below the fields: what the current field is for, the warning, then the keys.
+    let mut bottom = vec![Line::from(Span::styled(format!(" {}", view.help), Style::default().fg(th.text)))];
+    if !warning.is_empty() {
+        bottom.push(Line::from(Span::styled(format!(" {warning}"), dim)));
     }
+    bottom.push(Line::from(Span::styled(" tab next field · enter submit · esc cancel", dim)));
+    let bottom_n = bottom.len() as u16;
+    let outer = centered(76, (view.fields.len() as u16) + 5 + bottom_n, area);
+    let inner = dialog(f, title, th, outer);
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_n)]).split(inner);
+    // The label column fits the longest label plus a gap; a value longer than what is left shows
+    // its end, so a long path being typed keeps its newest characters in view.
+    let label_w = view.fields.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0) + 2;
+    let value_w = (parts[0].width as usize).saturating_sub(1 + label_w);
+    let example_style = dim.add_modifier(Modifier::ITALIC);
+    let rows: Vec<Line<'static>> = view.fields.iter().enumerate().map(|(i, (name, value))| {
+        let here = view.cursor_here(name);
+        let label = format!("{name:<label_w$}");
+        let label = Span::styled(format!(" {label}"), if here { on_accent(th, true) } else { dim });
+        let value_style = if here { on_accent(th, false) } else { Style::default().fg(th.text) };
+        let example = view.examples.get(i).copied().unwrap_or("");
+        if value.is_empty() && !example.is_empty() {
+            let cursor = if here { "_" } else { "" };
+            let shown = crate::session_cols::fit(&format!("e.g. {example}"), value_w.saturating_sub(cursor.len()));
+            Line::from(vec![label, Span::styled(cursor, value_style), Span::styled(shown, example_style)])
+        } else {
+            let rest = tail_fit(&if here { format!("{value}_") } else { value.clone() }, value_w);
+            Line::from(vec![label, Span::styled(rest, value_style)])
+        }
+    }).collect();
+    let cursor = view.cursor;
+    let shown: Vec<ListItem> = show_window(&rows, parts[0].height as usize, cursor);
+    f.render_widget(List::new(shown), parts[0]);
+    f.render_widget(Paragraph::new(bottom), parts[1]);
 }
 
 /// The end of a text that fits `width` cells, behind "…" when the start had to go.

@@ -119,6 +119,10 @@ pub struct FormView {
     pub cursor: usize,
     /// One entry per field: (label, value).
     pub fields: Vec<(String, String)>,
+    /// One entry per field: the example drawn, dimmed, while the field is empty. Never a value.
+    pub examples: Vec<&'static str>,
+    /// What the field under the cursor is for.
+    pub help: &'static str,
 }
 
 impl FormView {
@@ -196,6 +200,9 @@ pub enum Ev {
     PageDown,
     Home,
     End,
+    /// Scroll the preview of the highlighted session (shift+up/down, the wheel over the pane).
+    PreviewUp,
+    PreviewDown,
 }
 
 /// One row of the command list as the view draws it.
@@ -315,6 +322,8 @@ pub struct App {
     admin_busy: bool,
     /// Admin work waiting for the caller to run it, once.
     admin_request: Option<AdminJob>,
+    /// The highlighted session's last turns, read by the caller's preview worker.
+    preview: crate::preview::Preview,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -387,6 +396,7 @@ impl App {
             members: None,
             admin_busy: false,
             admin_request: None,
+            preview: Default::default(),
         }
     }
 
@@ -769,6 +779,45 @@ impl App {
         self.visible.get(self.model.selected()).and_then(|i| self.groups.get(*i))
     }
 
+    /// The conversation the preview should show, as (harness, key): the highlighted session when
+    /// it is on disk. None on the Team tab.
+    pub fn preview_wanted(&self) -> Option<(String, String)> {
+        if self.view != View::Sessions {
+            return None;
+        }
+        let g = self.selected_row().filter(|g| !g.orphan)?;
+        Some((g.fmt.clone(), g.key.clone()))
+    }
+
+    /// The caller asked its worker for `key`: show it as loading until the answer arrives.
+    pub fn preview_requested(&mut self, key: &str) {
+        self.preview = crate::preview::Preview { key: key.to_string(), loading: true, ..Default::default() };
+    }
+
+    /// An answer from the preview worker. One for a conversation no longer highlighted is dropped;
+    /// a later answer for the same one replaces the turns and keeps the scroll.
+    pub fn apply_preview(&mut self, loaded: crate::preview::Loaded) {
+        if loaded.key != self.preview.key {
+            return;
+        }
+        self.preview.loading = false;
+        match loaded.messages {
+            Ok(m) => {
+                self.preview.messages = m;
+                self.preview.error = None;
+            }
+            Err(e) => {
+                self.preview.messages.clear();
+                self.preview.error = Some(e);
+            }
+        }
+    }
+
+    /// The preview the details pane draws.
+    pub fn preview(&self) -> &crate::preview::Preview {
+        &self.preview
+    }
+
     /// Move the highlight to a visible row, for mouse clicks. Out-of-range rows are ignored.
     pub fn select_row(&mut self, idx: usize) {
         if idx < self.visible.len() {
@@ -1144,6 +1193,9 @@ impl App {
             Ev::PageDown => self.move_cursor(10),
             Ev::Home => self.move_cursor(isize::MIN / 2),
             Ev::End => self.move_cursor(isize::MAX / 2),
+            // The preview scrolls by a few lines; the drawing measured how far it can go.
+            Ev::PreviewUp => self.preview.scroll = (self.preview.scroll + 3).min(self.preview.max_scroll.get()),
+            Ev::PreviewDown => self.preview.scroll = self.preview.scroll.saturating_sub(3),
             // Enter on a local session opens its options; ctrl+p always opens the command list.
             // Tab switches the pane.
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
@@ -1370,6 +1422,7 @@ impl App {
                 ("/", "filter the list by title; enter keeps it, esc clears it"),
                 ("f", "cycle what is listed: all, marked, mirrored, failing"),
                 ("ctrl+r", "re-list the files, so harness-side renames show"),
+                ("shift+↑↓", "scroll the last messages in the details pane (wide screens)"),
                 ("ctrl+d", "delete the session's source file (press twice); mirrors stay"),
                 ("ctrl+c", "copy the session's path; runs in every mode"),
                 ("ctrl+t", "change the colour scheme"),
@@ -1665,6 +1718,8 @@ impl App {
             kind: f.kind,
             cursor: f.cursor,
             fields: f.entries().into_iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
+            examples: f.fields.iter().map(|x| x.example).collect(),
+            help: f.current().map_or("", |x| x.help),
         })
     }
 

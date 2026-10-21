@@ -109,6 +109,27 @@ pub struct Row {
     pub directory: String,
 }
 
+/// Who wrote a message, as the preview labels it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// One turn of a conversation as the TUI's preview shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Message {
+    pub role: Role,
+    /// What was written: text as typed, a tool call by name (`[tool: bash]`), thinking left out.
+    pub text: String,
+    /// When, in seconds since the epoch; 0 when the harness does not record it.
+    pub at: f64,
+}
+
+/// How many characters of one turn the preview keeps. A longer turn keeps its end: an agent's
+/// answer grows at the end, and the newest part is what a glance at the preview is for.
+const PREVIEW_TEXT_MAX: usize = 2000;
+
 /// Everything sesync needs from one harness. The defaults suit a file harness that keeps no
 /// project directory; a store harness overrides the row and fingerprint hooks.
 pub trait Harness: Send + Sync {
@@ -206,6 +227,18 @@ pub trait Harness: Send + Sync {
     fn copy_exists(&self, _loc: &Location, key: &str) -> bool {
         Path::new(key).is_file()
     }
+    /// The conversation's last `max` turns, oldest first, for the TUI's preview. By default the
+    /// end of its canonical journal: the file itself when it is one, else the conversion. A
+    /// harness that reads the end of its own store more cheaply overrides this.
+    fn recent_messages(&self, loc: &Location, tools: &Tools, key: &str, scratch: &Path, max: usize) -> Result<Vec<Message>, String> {
+        let converted = self.to_journal(loc, tools, key, scratch)?;
+        let path = converted.clone().unwrap_or_else(|| PathBuf::from(key));
+        let messages = journal::recent_messages(&path, max);
+        if let Some(c) = converted {
+            let _ = std::fs::remove_file(c);
+        }
+        messages
+    }
 
     // ----- a store harness's conversations -----------------------------------------------------
 
@@ -259,6 +292,32 @@ pub fn is_store(id: &str) -> bool {
 /// The update time of one row of a store harness. None when the row is gone.
 pub fn row_updated(h: &dyn Harness, loc: &Location, id: &str) -> Option<f64> {
     h.rows(loc).into_iter().find(|r| r.id == id).map(|r| r.updated)
+}
+
+/// The last `max` turns of a run of messages, oldest first. Assistant messages in a row are one
+/// turn (a harness stores one answer as several records, one per block or tool round); each user
+/// message is a turn of its own. Each turn's text is clipped for the preview.
+pub fn last_turns(messages: Vec<Message>, max: usize) -> Vec<Message> {
+    let mut turns: Vec<Message> = Vec::new();
+    for m in messages {
+        match turns.last_mut() {
+            Some(last) if last.role == Role::Assistant && m.role == Role::Assistant => {
+                last.text.push('\n');
+                last.text.push_str(&m.text);
+                last.at = last.at.max(m.at);
+            }
+            _ => turns.push(m),
+        }
+    }
+    let cut = turns.len().saturating_sub(max);
+    turns.drain(..cut);
+    for t in &mut turns {
+        let n = t.text.chars().count();
+        if n > PREVIEW_TEXT_MAX {
+            t.text = "…".to_string() + &t.text.chars().skip(n - PREVIEW_TEXT_MAX).collect::<String>();
+        }
+    }
+    turns
 }
 
 /// Size and modification time of a file, for title stamps.

@@ -3,6 +3,29 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-21: the details pane previews the last messages; team dialogs show examples; titles
+
+- **Preview.** At 120 columns or more the details pane shows the highlighted session's last 20
+  turns, newest at the bottom; shift+up/down or the wheel over the pane scrolls back. A worker
+  thread (`preview::Worker`) reads them and checks the session's stamp every second, so a new
+  message appears by itself. Each harness reads its own end (`Harness::recent_messages`): omp and
+  Pi read the journal, agy goes through `from-antigravity`, Claude reads the transcript's end and
+  OpenCode its database (no CLI export). Thinking, tool results, meta and subagent records are
+  left out; an assistant answer split over records is one turn, and a long one keeps its newest
+  2000 characters.
+- **Converter output** is captured in `journal::convert_from` instead of inherited, so nothing
+  the converter prints can land on the TUI's screen; a failure now carries its reason.
+- **Team dialogs.** Every empty field shows a made-up example (`e.g. design-team`,
+  `e.g. ana, rui`) and the focused field says what it is for. Examples are never values, so
+  Enter on an untouched "Start a team" is refused ("'team' is empty"). "members" are the people
+  allowed to join; the admin lists themselves too to sync their own machine.
+- **Titles.** An omp/Pi title is now the newest name record by time (the slot's `updatedAt`, a
+  rename's `timestamp`), not the last one read. A July rename near the head of the 44 MB "PC
+  Config" session overrode the slot rewritten on 10-20 (the newest rename sits 16.7 MB from the
+  end, past the 8 MB tail walk), so the list showed the July name and the rename form offered it
+  back: the 10-19 overwrite of that title came this way.
+- **Suites** (Windows, sandboxed): `sesync` 582 passed, 0 failed.
+
 ## 2026-10-21: one module per harness
 
 - **Why.** What sesync knew about each harness was spread over a dozen places (discovery,

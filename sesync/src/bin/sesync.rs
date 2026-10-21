@@ -961,6 +961,9 @@ fn handle_mouse(
         return;
     }
     match m.kind {
+        // The wheel over the details pane scrolls the preview; anywhere else it moves the list.
+        MouseEventKind::ScrollUp if sesync::ui::details_pane_at(app, screen, m.column, m.row) => app.handle(Ev::PreviewUp, now),
+        MouseEventKind::ScrollDown if sesync::ui::details_pane_at(app, screen, m.column, m.row) => app.handle(Ev::PreviewDown, now),
         MouseEventKind::ScrollUp => app.handle(Ev::Up, now),
         MouseEventKind::ScrollDown => app.handle(Ev::Down, now),
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1026,6 +1029,9 @@ fn run_tui(
     // The daemon's file is merged in while the TUI runs; retired harnesses are released from it
     // with the same locations the TUI was started with.
     let locations = roots.locations.clone();
+    // The details pane previews the highlighted session; a worker reads its last turns, so the
+    // list never waits on a large transcript or a conversion.
+    let preview = sesync::preview::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
     // The Team tab and "Refresh team" exist before the first pull; without configuration they
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
@@ -1061,6 +1067,16 @@ fn run_tui(
     let mut jobs = TeamJobs::default();
     loop {
         jobs.tick(&mut app, &config_dir);
+        // A newly highlighted session goes to the worker; whatever it has read since is shown.
+        if let Some((fmt, key)) = app.preview_wanted() {
+            if app.preview().key != key {
+                preview.select(&fmt, &key);
+                app.preview_requested(&key);
+            }
+        }
+        if let Some(loaded) = preview.take() {
+            app.apply_preview(loaded);
+        }
         term.draw(|f| sesync::ui::draw(f, &app))?;
         if !event::poll(Duration::from_millis(200))? {
             tr("poll timeout", &mut trace);
