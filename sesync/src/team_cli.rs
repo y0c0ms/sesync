@@ -105,9 +105,31 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     }
 }
 
+/// Expand a leading `~` or `~/` with the user's home, the way a shell would. A path typed into
+/// a dialog is taken literally otherwise, and `~/...` is what people type: the daemon then
+/// reported "cannot read the admin token file" while the file was right there.
+pub fn expand_user_path(input: &str) -> std::path::PathBuf {
+    expand_with(input, std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from).unwrap_or_default().as_path())
+}
+
+/// The pure part of the expansion, so it can be tested without touching the environment.
+pub fn expand_with(input: &str, home: &Path) -> std::path::PathBuf {
+    if input == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = input.strip_prefix("~/").or_else(|| input.strip_prefix("~\\")) {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(input)
+}
+
 /// Read the admin token from a file that only its owner can read. Refuses a file that other
 /// users can read, since the token would then be exposed.
 pub fn read_admin_token(path: &Path) -> Result<String, String> {
+    // A path typed into the TUI dialog may start with `~`; expand it before any file access.
+    let expanded = expand_user_path(&path.to_string_lossy());
+    let path = expanded.as_path();
     let meta = std::fs::metadata(path).map_err(|_| "cannot read the admin token file".to_string())?;
     #[cfg(unix)]
     {

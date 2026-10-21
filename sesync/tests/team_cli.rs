@@ -100,3 +100,29 @@ fn a_missing_token_file_is_an_error_that_names_no_secret() {
     let err = read_admin_token(std::path::Path::new("/nonexistent/admin.token")).unwrap_err();
     assert!(!err.contains("/nonexistent"), "the error does not echo the path: {err}");
 }
+
+#[test]
+fn a_tilde_in_a_typed_path_is_expanded() {
+    use sesync::team_cli::expand_with;
+    use std::path::Path;
+    let home = Path::new("/home/tester");
+    assert_eq!(expand_with("~/.config/sesync/admin.token", home),
+        std::path::PathBuf::from("/home/tester/.config/sesync/admin.token"));
+    assert_eq!(expand_with("~", home), std::path::PathBuf::from("/home/tester"));
+    assert_eq!(expand_with("/etc/team.token", home), std::path::PathBuf::from("/etc/team.token"),
+        "an absolute path is left alone");
+    assert_eq!(expand_with("./local.token", home), std::path::PathBuf::from("./local.token"));
+    assert_eq!(expand_with("~someone/x", home), std::path::PathBuf::from("~someone/x"),
+        "another user's home is not guessed");
+}
+
+#[test]
+fn the_admin_token_file_can_be_named_with_a_tilde() {
+    // The token file itself is refused unless it is owner-only, so this asserts the expansion
+    // reaches the file system: a tilde path to a missing file still fails as unreadable, but a
+    // literal `~` directory never exists either. The point is the error is about the EXPANDED
+    // path, i.e. no file was found where the shell would have looked.
+    let e = sesync::team_cli::read_admin_token(std::path::Path::new("~/definitely-not-there.token"))
+        .unwrap_err();
+    assert_eq!(e, "cannot read the admin token file");
+}
