@@ -18,15 +18,10 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &PathBuf) -> Roots {
-    let r = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    fs::create_dir_all(&r.omp).unwrap();
-    fs::create_dir_all(&r.pi).unwrap();
-    fs::create_dir_all(&r.claude).unwrap();
+    let r = Roots::under(&sb, sb.join("no-sesync-conv"));
+    fs::create_dir_all(&r.locations.sessions_dir("omp")).unwrap();
+    fs::create_dir_all(&r.locations.sessions_dir("pi")).unwrap();
+    fs::create_dir_all(&r.locations.sessions_dir("claude")).unwrap();
     r
 }
 
@@ -53,7 +48,7 @@ fn sesync_lock() -> PathBuf {
 fn delete_never_touches_a_mirror_even_one_outside_the_roots() {
     let sb = sandbox("mirror-outside");
     let r = roots(&sb);
-    let src = r.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let src = r.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "source").unwrap();
     let outside = sb.join("elsewhere.jsonl");
@@ -97,7 +92,7 @@ fn a_delete_is_refused_while_another_harness_holds_the_conversation() {
         .output().unwrap();
     assert!(claim.status.success());
 
-    let src = r.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let src = r.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "source").unwrap();
     let g = Group::file("omp", src.display().to_string(), "t");
@@ -124,7 +119,7 @@ fn a_rename_is_refused_while_another_harness_holds_the_conversation() {
         .output().unwrap();
     assert!(claim.status.success());
 
-    let src = r.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let src = r.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     let body = format!("{{\"type\":\"session\",\"id\":\"{SID}\",\"title\":\"Old\"}}\n");
     fs::write(&src, &body).unwrap();
@@ -140,7 +135,7 @@ fn a_rename_that_is_not_written_back_is_an_error_not_a_success() {
     // whose header has no session record, so the rewrite cannot place the title.
     let sb = sandbox("unwritten");
     let r = roots(&sb);
-    let src = r.omp.join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
+    let src = r.locations.sessions_dir("omp").join("-tmp").join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"no header\"}}\n").unwrap();
     let g = Group::file("omp", src.display().to_string(), "x");

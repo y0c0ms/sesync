@@ -22,8 +22,8 @@ async fn a_member_reads_back_the_exact_record_bytes() {
     svc.pin_admin_key("personal", &admin.public_key()).unwrap();
     svc.store_trust_list("personal", &MemberList::new(1, vec![device_entry(&admin), device_entry(&writer)]).sign(&admin).to_bytes()).unwrap();
     let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
-    let token = svc.enrol("personal", "writer", "box-w", &code, T0).unwrap();
-    svc.bind_device("personal", "box-w", device_entry(&writer));
+    let token = svc.enrol("personal", "writer", "box-w", &code, Some(&device_entry(&writer)), T0)
+        .map(|a| a.token().to_string()).unwrap();
     let lease = svc.acquire("personal", "ses_r", "box-w", T0).unwrap();
     let key = DataKey::random();
     let body = seal_session_bound(&key, &session_aad("personal", "ses_r", lease.version), b"x").unwrap();

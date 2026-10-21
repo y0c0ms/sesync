@@ -6,23 +6,20 @@
 // Shared persistent state (local sources and team floors/push records).
 pub mod state;
 
-// Local pipeline: discovery, change detection, mirrors and locks.
+// The harnesses, one module each behind one interface; everything else asks the registry.
+pub mod harness;
+
+// Local pipeline: change detection, mirrors and locks.
 pub mod archive;
 pub mod archive_store;
-pub mod buckets;
-pub mod claude_source;
-pub mod discovery;
 pub mod divergence;
-pub mod install;
 pub mod lock;
 pub mod mirror;
 pub mod mirror_cleanup;
 pub mod mirror_write;
-pub mod opencode;
-pub mod opencode_rename;
 pub mod pass;
+pub mod prompts;
 pub mod scan;
-pub mod titles;
 pub mod turn;
 
 // Manage TUI: state, key handling, rendering, dialogs.
@@ -43,7 +40,9 @@ pub mod ui;
 // Team client: admin CLI, join, sealing, push/pull, daemon pass.
 // team_conflict and team_pull are test-only today (see AGENTS.md).
 pub mod device_keys;
+pub mod members;
 pub mod sealed;
+pub mod team_actions;
 pub mod team_backoff;
 pub mod team_cli;
 pub mod team_conflict;

@@ -1,6 +1,7 @@
 //! A device's keys live in its config directory: created once, owner-only, and reloaded on later
 //! runs so the device keeps its identity. A loose key file is refused, and nothing prints a key.
 use sesync::device_keys::{load_or_create, DeviceFile};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 fn dir(name: &str) -> std::path::PathBuf {
@@ -20,6 +21,8 @@ fn the_first_run_creates_keys_and_a_later_run_reloads_the_same_device() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Unix only: device_keys has no Windows permission bits to set or check.
+#[cfg(unix)]
 #[test]
 fn the_key_file_is_owner_only() {
     let d = dir("mode");
@@ -29,6 +32,7 @@ fn the_key_file_is_owner_only() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_loose_key_file_is_refused() {
     let d = dir("loose");
@@ -44,6 +48,7 @@ fn a_damaged_key_file_is_refused_without_echoing_it() {
     let d = dir("damaged");
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(d.join("device.key"), "signing=not-hex-secretvalue\n").unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(d.join("device.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
     let err = load_or_create(&d).err().expect("refused");
     assert!(!err.contains("secretvalue"), "the key is never echoed: {err}");

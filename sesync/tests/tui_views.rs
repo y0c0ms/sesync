@@ -24,12 +24,7 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &Path) -> Roots {
-    Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    }
+    Roots::under(&sb, sb.join("no-sesync-conv"))
 }
 
 fn write_session(sb: &Path, sid: &str, title: &str) {
@@ -235,12 +230,13 @@ fn the_screen_shows_both_tabs_and_points_at_the_palette() {
 }
 
 #[test]
-fn the_team_tab_says_why_it_is_empty_when_no_server_is_configured() {
+fn the_team_tab_says_how_to_join_when_this_machine_is_in_no_team() {
     let sb = sandbox("empty-team");
     let mut a = app(&sb);
     a.handle(Ev::Tab, Instant::now());
     let text = screen(&a, 120, 10);
-    assert!(text.contains("No team server configured"), "{text}");
+    assert!(text.contains("Not in a team yet"), "{text}");
+    assert!(text.contains("Join a team"), "it names the command to use:\n{text}");
     let _ = fs::remove_dir_all(&sb);
 }
 
@@ -323,7 +319,7 @@ fn question_mark_opens_the_help_for_the_current_tab() {
     a.handle(Ev::Char('?'), Instant::now());
     assert_eq!(a.mode(), Mode::Help, "? opens the help overlay");
     let text = screen(&a, 140, 30);
-    assert!(text.contains("Keys — sessions"), "{text}");
+    assert!(text.contains("Keys: sessions"), "{text}");
     assert!(text.contains("re-list"), "the local keys are listed:\n{text}");
     a.handle(Ev::Esc, Instant::now());
     assert_eq!(a.mode(), Mode::Browse);
@@ -338,7 +334,7 @@ fn the_help_overlay_names_the_team_keys_on_the_team_tab() {
     a.handle(Ev::Char('?'), Instant::now());
     assert_eq!(a.mode(), Mode::Help, "? opens the help overlay on the team tab too");
     let text = screen(&a, 140, 30);
-    assert!(text.contains("Keys — team"), "{text}");
+    assert!(text.contains("Keys: team"), "{text}");
     assert!(text.contains("pull the team"), "the team keys are listed:\n{text}");
     let _ = fs::remove_dir_all(&sb);
 }

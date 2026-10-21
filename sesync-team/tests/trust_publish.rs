@@ -45,13 +45,13 @@ async fn create(app: &axum::Router, admin: &Device, members: &[&str], devices: &
     })).await.1
 }
 
-/// A member token, straight from the service, for the machine given, with its device bound.
+/// A member token, straight from the service, for the machine given. The device joins with its
+/// key; a key the list names is bound to the machine, a new key waits for the admin.
 fn token(state: &Arc<AppState<MemoryStore>>, member: &str, machine: &str, device: &Device) -> String {
     let mut svc = state.service.lock().unwrap();
     let code = sesync_team::totp::code_at(&svc.space_secret("personal").unwrap(), T0);
-    let token = svc.enrol("personal", member, machine, &code, T0).unwrap();
-    svc.bind_device("personal", machine, device_entry(device));
-    token
+    svc.enrol("personal", member, machine, &code, Some(&device_entry(device)), T0)
+        .map(|a| a.token().to_string()).unwrap()
 }
 
 #[tokio::test]
@@ -164,48 +164,44 @@ async fn fetching_a_list_a_team_never_had_is_not_found() {
 }
 
 #[tokio::test]
-async fn the_admin_reads_enrolled_devices_and_forgets_one() {
+async fn the_roster_names_listed_and_pending_devices_and_only_the_admin_reads_it() {
     let (app, state) = app();
     let admin = Device::generate();
     let writer = Device::generate();
     let reader = Device::generate();
-    create(&app, &admin, &["writer", "reader"], &[&admin]).await;
+    create(&app, &admin, &["writer", "reader"], &[&admin, &writer]).await;
     let w_token = token(&state, "writer", "box-w", &writer);
-    let r_token = token(&state, "reader", "box-r", &reader);
+    let _ = token(&state, "reader", "box-r", &reader);
 
-    // Admin only: the device list names every machine in the team.
-    let (st, _) = post(&app, "/admin/devices", None, serde_json::json!({"space":"personal"})).await;
-    assert_eq!(st, StatusCode::FORBIDDEN, "members do not enumerate the team's machines");
+    // Admin only: names, machines and requests stay inside the team's administration.
+    let (st, _) = post(&app, "/admin/roster", None, serde_json::json!({"space":"personal"})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "no token, no roster");
+    let (st, _) = post(&app, "/admin/roster", Some(&format!("Bearer {w_token}")), serde_json::json!({"space":"personal"})).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a listed member does not read the roster");
     let admin_auth = format!("Bearer {ADMIN_TOKEN}");
-    let (st, j) = post(&app, "/admin/devices", Some(&admin_auth), serde_json::json!({"space":"personal"})).await;
+    let (st, j) = post(&app, "/admin/roster", Some(&admin_auth), serde_json::json!({"space":"personal"})).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     assert_eq!(j["version"], 1, "the current list version comes along");
-    let names: Vec<&str> = j["devices"].as_array().unwrap().iter()
-        .map(|d| d["machine"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["box-r", "box-w"], "sorted by machine");
-    assert_eq!(unhex(j["devices"][1]["entry"].as_str().unwrap()), device_entry(&writer));
+    let signed = SignedList::from_bytes(&unhex(j["signed_list"].as_str().unwrap())).unwrap();
+    assert!(Device::verify(&admin.public_key(), &signed.list.encode(), &signed.signature));
+    let listed = j["listed"].as_array().unwrap();
+    assert_eq!(listed.len(), 2, "{j}");
+    let w = listed.iter().find(|d| d["machine"] == "box-w").expect("the writer's machine is named");
+    assert_eq!(w["member"], "writer");
+    assert_eq!(w["fingerprint"], sesync_team::membership::fingerprint(&device_entry(&writer)));
+    assert!(listed.iter().any(|d| d["machine"].is_null() && unhex(d["entry"].as_str().unwrap()) == device_entry(&admin)),
+        "the admin key is listed with no machine: {j}");
+    let pending = j["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{j}");
+    assert_eq!((pending[0]["member"].as_str(), pending[0]["machine"].as_str()), (Some("reader"), Some("box-r")));
+    assert_eq!(pending[0]["fingerprint"], sesync_team::membership::fingerprint(&device_entry(&reader)));
+    assert_eq!(unhex(pending[0]["entry"].as_str().unwrap()), device_entry(&reader));
 
-    // Publish v2 naming both devices: that is what makes the bound devices members.
-    let v2 = MemberList::new(2, vec![device_entry(&admin), device_entry(&writer), device_entry(&reader)]).sign(&admin);
-    let (st, _) = post(&app, "/admin/list", Some(&admin_auth), serde_json::json!({
-        "space":"personal","signed_list": hex(&v2.to_bytes())})).await;
-    assert_eq!(st, StatusCode::OK);
-    let mut svc = state.service.lock().unwrap();
-    assert!(svc.authenticate("personal", &w_token, "box-w", T0).is_ok(), "the published writer is a member");
-    assert!(svc.authenticate("personal", &r_token, "box-r", T0).is_ok());
-    drop(svc);
-
-    // Forgetting a machine kills its token at once and removes it from the next list.
-    let (st, j) = post(&app, "/admin/forget", Some(&admin_auth), serde_json::json!({"space":"personal","machine":"box-w"})).await;
-    assert_eq!(st, StatusCode::OK, "{j}");
-    let mut svc = state.service.lock().unwrap();
-    assert!(svc.authenticate("personal", &w_token, "box-w", T0).is_err(), "the writer token is dead at once");
-    assert!(svc.authenticate("personal", &r_token, "box-r", T0).is_ok(), "the reader is untouched");
-    drop(svc);
-    let (_, j) = post(&app, "/admin/devices", Some(&admin_auth), serde_json::json!({"space":"personal"})).await;
-    let names: Vec<&str> = j["devices"].as_array().unwrap().iter()
-        .map(|d| d["machine"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["box-r"], "the forgotten machine is gone from the admin view");
+    // The removed routes are gone: revocation is a list change, nothing else.
+    for gone in ["/admin/devices", "/admin/forget"] {
+        let (st, _) = post(&app, gone, Some(&admin_auth), serde_json::json!({"space":"personal","machine":"box-w"})).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{gone} no longer exists");
+    }
 }
 
 fn unhex(s: &str) -> Vec<u8> {

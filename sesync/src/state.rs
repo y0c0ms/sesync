@@ -34,6 +34,31 @@ pub struct TeamPush {
     pub pushed_at: f64,
 }
 
+/// The outcome of the daemon's last attempts to write one mirror target of a session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TargetSync {
+    /// When a write to this target last succeeded, seconds since the epoch. 0 when never.
+    pub ok_at: f64,
+    /// The message of the last failed write; empty once a later write succeeds.
+    pub problem: String,
+    /// When that failure happened, seconds since the epoch.
+    pub problem_at: f64,
+}
+
+fn parse_sync(v: Option<&Value>) -> BTreeMap<String, TargetSync> {
+    v.and_then(Value::as_object).map(|m| m.iter().map(|(t, e)| (t.clone(), TargetSync {
+        ok_at: e.get("ok_at").and_then(Value::as_f64).unwrap_or(0.0),
+        problem: e.get("problem").and_then(Value::as_str).unwrap_or("").to_string(),
+        problem_at: e.get("problem_at").and_then(Value::as_f64).unwrap_or(0.0),
+    })).collect()).unwrap_or_default()
+}
+
+fn sync_json(sync: &BTreeMap<String, TargetSync>) -> Value {
+    Value::Object(sync.iter().map(|(t, e)| (t.clone(), serde_json::json!({
+        "ok_at": e.ok_at, "problem": e.problem, "problem_at": e.problem_at,
+    }))).collect())
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Source {
     pub fmt: String,
@@ -67,11 +92,33 @@ pub struct Source {
     pub turn_at: f64,
     /// The name to show for this session, when its source does not carry one on disk (O-penCode).
     pub title: String,
+    /// What the daemon last learned about each mirror target of this session, keyed by target
+    /// name. Written by the daemon after every pass that tried a target; empty in older files.
+    pub sync: BTreeMap<String, TargetSync>,
 }
 
 impl Source {
     pub fn new(fmt: &str, key: &str) -> Self {
         Source { fmt: fmt.into(), key: key.into(), ..Default::default() }
+    }
+}
+
+impl Source {
+    /// Record the outcome of one write to `target`. A success clears the problem; a failure keeps
+    /// the time of the last good write so the TUI can say when the target last worked.
+    pub fn record_sync(&mut self, target: &str, outcome: Result<(), &str>, now: f64) {
+        let e = self.sync.entry(target.to_string()).or_default();
+        match outcome {
+            Ok(()) => {
+                e.ok_at = now;
+                e.problem.clear();
+                e.problem_at = 0.0;
+            }
+            Err(msg) => {
+                e.problem = msg.to_string();
+                e.problem_at = now;
+            }
+        }
     }
 }
 
@@ -96,6 +143,11 @@ pub struct State {
     /// Runtime only: conversation ids read from a pre-multi-team `marked` list. The caller
     /// folds them into `shares` once it knows the machine's teams. Never saved.
     pub legacy_marked: BTreeSet<String>,
+    /// Runtime only: every source key this process has held, from the file it loaded and from
+    /// its own passes. A key missing from memory but present on disk is the TUI's new choice only
+    /// when it is NOT in here; otherwise this process removed it (a promotion demoted it to a
+    /// mirror, or a tangle collapsed) and adopting it back recreates the tangle. Never saved.
+    pub seen_keys: BTreeSet<String>,
 }
 
 /// The key for the per-team maps: one conversation can be shared into more than one team, and
@@ -248,6 +300,89 @@ impl State {
             .find(|(_, s)| s.conv == id || crate::manage::session_id_of(&s.key) == id || s.key == id)
             .map(|(k, _)| k.clone())
     }
+
+    /// Every copy recorded as some source's mirror: file paths and OpenCode session ids alike.
+    /// `mirror_keys` deliberately holds files only, so this is the set to ask "is this a copy?".
+    pub fn mirror_paths(&self) -> std::collections::HashSet<String> {
+        self.sources.values().flat_map(|s| s.mirrors.values().map(|m| m.path.clone())).collect()
+    }
+
+    /// Whether `key` is recorded as a mirror of another source.
+    pub fn is_recorded_mirror(&self, key: &str) -> bool {
+        self.sources.iter().any(|(k, s)| k != key && s.mirrors.values().any(|m| m.path == key))
+    }
+
+    /// Retire a harness sesync no longer supports (`harness::RETIRED`). Its files on disk are
+    /// never touched; only sesync's records move:
+    /// * a source in the retired format is re-keyed to its best surviving copy, the first harness
+    ///   in `harness::ALL` whose recorded copy `exists` and is not already a
+    ///   source of its own. It keeps its conversation id (so mirror ids, locks and the team
+    ///   conversation stay), its title and its shares; its chosen targets lose the retired harness
+    ///   and the new format, and its mirrors lose the new format's record (that copy is the
+    ///   source now). With no surviving copy the entry is dropped;
+    /// * every other source drops the retired harness from its chosen targets and its mirrors (a
+    ///   release: the copy stays where it is, as a session of that harness);
+    /// * `mirror_keys` loses every path of the retired harness, and the new source's own key.
+    ///
+    /// Idempotent, so it is safe on every load and after every merge. Returns one line per change.
+    pub fn retire_harness(&mut self, retired: &crate::harness::Retired, exists: impl Fn(&str, &str) -> bool) -> Vec<String> {
+        let fmt = retired.id;
+        let mut log = Vec::new();
+        let mut retired_paths: BTreeSet<String> = BTreeSet::new();
+        let mut retired_keys: Vec<String> = self.sources.iter()
+            .filter(|(_, s)| s.fmt == fmt)
+            .map(|(k, _)| k.clone())
+            .collect();
+        retired_keys.sort();
+        for key in retired_keys {
+            let conv = self.team_id_of(&key);
+            let Some(old) = self.sources.remove(&key) else { continue };
+            retired_paths.insert(key.clone());
+            let successor = crate::harness::ALL.iter().map(|h| h.id()).find_map(|t| {
+                let m = old.mirrors.get(t)?;
+                (!m.path.is_empty() && !self.sources.contains_key(&m.path) && exists(t, &m.path))
+                    .then(|| (t.to_string(), m.path.clone()))
+            });
+            let Some((new_fmt, new_key)) = successor else {
+                log.push(format!("dropped the {fmt} session {key}: no copy of it survives in another harness"));
+                continue;
+            };
+            let mut new = Source::new(&new_fmt, &new_key);
+            new.conv = conv;
+            new.title = old.title.clone();
+            new.last_seen_change = old.last_seen_change;
+            new.turn_at = old.turn_at;
+            new.chosen_targets = old.chosen_targets.iter()
+                .filter(|t| *t != fmt && **t != new_fmt)
+                .cloned()
+                .collect();
+            new.mirrors = old.mirrors.into_iter()
+                .filter(|(t, _)| *t != fmt && *t != new_fmt)
+                .collect();
+            self.mirror_keys.remove(&new_key);
+            self.seen_keys.insert(new_key.clone());
+            log.push(format!("moved the {fmt} session {key} to its {new_fmt} copy {new_key}"));
+            self.sources.insert(new_key, new);
+        }
+        let mut keys: Vec<String> = self.sources.keys().cloned().collect();
+        keys.sort();
+        for key in keys {
+            let src = self.sources.get_mut(&key).expect("listed above");
+            if src.chosen_targets.remove(fmt) {
+                log.push(format!("stopped mirroring {key} into {fmt}"));
+            }
+            if let Some(m) = src.mirrors.remove(fmt) {
+                log.push(format!("released the {fmt} copy {} of {key} (left on disk)", m.path));
+                retired_paths.insert(m.path);
+            }
+        }
+        let before = self.mirror_keys.len();
+        self.mirror_keys.retain(|p| !retired_paths.contains(p) && !(retired.is_session_path)(p));
+        if self.mirror_keys.len() != before {
+            log.push(format!("forgot {} {fmt} path(s) sesync had recorded as copies", before - self.mirror_keys.len()));
+        }
+        log
+    }
 }
 
 fn invalid(e: impl std::fmt::Display) -> io::Error {
@@ -282,6 +417,7 @@ impl State {
                     tui_created: false,
                     turn_at: v.get("turn_at").and_then(Value::as_f64).unwrap_or(0.0),
                     conv: s("conv"),
+                    sync: parse_sync(v.get("sync")),
                 };
                 if let Some(ms) = v.get("mirrors").and_then(Value::as_object) {
                     for (t, mv) in ms {
@@ -333,21 +469,23 @@ impl State {
         } else if let Some(marked) = raw.get("marked").and_then(Value::as_array) {
             st.legacy_marked = marked.iter().filter_map(Value::as_str).map(str::to_string).collect();
         }
+        st.seen_keys = st.sources.keys().cloned().collect();
         Ok(st)
     }
 
-    /// Adopt the fields the user owns from the file on disk: the marked set and each source's
-    /// chosen mirror targets. The daemon calls this before a pass and again just before saving,
-    /// so a choice made in a running TUI is never overwritten by the daemon's next save.
-    /// A missing file changes nothing; a corrupt file is an error the caller reports.
-    /// Whether a state entry the daemon has not scanned can be adopted from disk: store-backed
-    /// keys always (OpenCode has no file); file-backed keys never when the daemon already
-    /// created that file as a mirror — a promotion superseded that copy, and its stale
-    /// fingerprints would read as a fresh edit every pass.
+    /// Whether a disk entry this process does not hold can be adopted. Only when it is a choice
+    /// the TUI made for a session this process never held, and no copy sesync keeps. A key the
+    /// daemon removed (a promotion turned it into a mirror) must stay removed: adopting it back
+    /// is what made a conversation both the source and the mirror of its own copy, and the two
+    /// entries then promoted each other on every pass.
     fn adoptable(&self, key: &str) -> bool {
-        !self.mirror_keys.contains(key)
+        !self.seen_keys.contains(key) && !self.mirror_keys.contains(key) && !self.is_recorded_mirror(key)
     }
 
+    /// Adopt the fields the user owns from the file on disk: the shares and each source's chosen
+    /// mirror targets. The daemon calls this before a pass and again just before saving, so a
+    /// choice made in a running TUI is never overwritten by the daemon's next save. A missing
+    /// file changes nothing; a corrupt file is an error the caller reports.
     pub fn absorb_user_edits(&mut self, path: &Path) -> io::Result<()> {
         if !path.exists() {
             return Ok(());
@@ -359,15 +497,14 @@ impl State {
         if self.legacy_marked.is_empty() {
             self.legacy_marked = disk.legacy_marked.clone();
         }
+        self.seen_keys.extend(self.sources.keys().cloned());
         for (key, dsrc) in &disk.sources {
             if let Some(s) = self.sources.get_mut(key) {
                 s.chosen_targets = dsrc.chosen_targets.clone();
             } else if self.adoptable(key) {
-                // The TUI records a choice for a session the daemon has not scanned yet.
-                // A file-backed key the daemon already created as a mirror is a copy a
-                // promotion superseded; its stale fingerprints would read as a fresh edit
-                // every pass. The component resolution in turn.rs still absorbs leftovers.
+                // The TUI recorded a choice for a session this process has not scanned yet.
                 self.sources.insert(key.clone(), dsrc.clone());
+                self.seen_keys.insert(key.clone());
             }
         }
         Ok(())
@@ -375,12 +512,19 @@ impl State {
 
     /// Save from the app (the TUI): everything the daemon owns comes from the file on disk, so
     /// this never rolls back a scan, a mirror record or a team floor. Only the fields the user
-    /// owns — marks and chosen targets — come from this state. A source the app knows before
-    /// the daemon does is added so the choice is not lost.
+    /// owns (shares and chosen targets) come from this state. A source the app created itself,
+    /// before the daemon scanned it, is added so the choice is not lost; any other key missing
+    /// on disk was removed by the daemon and is not brought back, and a copy the daemon keeps
+    /// as a mirror never becomes a source.
     pub fn save_user(&self, path: &Path) -> io::Result<()> {
         let mut disk = State::load(path)?;
         disk.shares = self.shares.clone();
         for (key, mine) in &self.sources {
+            if !disk.sources.contains_key(key)
+                && (!mine.tui_created || disk.mirror_keys.contains(key) || disk.is_recorded_mirror(key))
+            {
+                continue;
+            }
             let d = disk.sources.entry(key.clone())
                 .or_insert_with(|| Source::new(&mine.fmt, &mine.key));
             d.chosen_targets = mine.chosen_targets.clone();
@@ -404,6 +548,7 @@ impl State {
                 "last_failure": s.last_failure,
                 "mirrors": mirrors, "chosen_targets": s.chosen_targets.iter().collect::<Vec<_>>(),
                 "title": s.title, "turn_at": s.turn_at, "conv": s.conv,
+                "sync": sync_json(&s.sync),
             }))
         }).collect();
         let data = serde_json::json!({

@@ -12,6 +12,7 @@ sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "v5"] }
 hex = "0.4"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 [profile.release]
 opt-level = 2

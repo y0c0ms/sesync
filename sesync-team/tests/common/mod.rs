@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use sesync_team::backup::BackupPolicy;
-use sesync_team::service::{MemoryStore, Store};
+use sesync_team::service::{JoinRequest, MemoryStore, Store};
 use sesync_team::spaces::Space;
 use sesync_team::totp::JoinGate;
 use std::cell::Cell;
@@ -124,6 +124,24 @@ impl Store for TestStore {
     }
     fn remove_device(&mut self, space: &str, machine: &str) {
         if !self.down() { self.inner.remove_device(space, machine) }
+    }
+    fn requests(&self, space: &str) -> Vec<JoinRequest> {
+        if self.down() { Vec::new() } else { self.inner.requests(space) }
+    }
+    fn save_request(&mut self, space: &str, request: &JoinRequest) {
+        if !self.down() { self.inner.save_request(space, request) }
+    }
+    fn remove_request(&mut self, space: &str, machine: &str) {
+        if !self.down() { self.inner.remove_request(space, machine) }
+    }
+    fn is_tombstoned(&self, space: &str, entry: &[u8]) -> bool {
+        !self.down() && self.inner.is_tombstoned(space, entry)
+    }
+    fn save_tombstone(&mut self, space: &str, entry: &[u8]) {
+        if !self.down() { self.inner.save_tombstone(space, entry) }
+    }
+    fn remove_tombstone(&mut self, space: &str, entry: &[u8]) {
+        if !self.down() { self.inner.remove_tombstone(space, entry) }
     }
 }
 

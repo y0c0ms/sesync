@@ -16,21 +16,16 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &PathBuf) -> Roots {
-    Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    }
+    Roots::under(&sb, sb.join("no-sesync-conv"))
 }
 
 #[test]
 fn a_source_in_state_with_no_file_is_listed_as_an_orphan_with_its_mirror() {
     let sb = sandbox("orphan");
     let r = roots(&sb);
-    fs::create_dir_all(&r.omp).unwrap();
-    let gone = r.omp.join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
-    let mirror = r.pi.join("-tmp").join("mirror.jsonl");
+    fs::create_dir_all(&r.locations.sessions_dir("omp")).unwrap();
+    let gone = r.locations.sessions_dir("omp").join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
+    let mirror = r.locations.sessions_dir("pi").join("-tmp").join("mirror.jsonl");
     let mut state = State::default();
     let mut src = Source::new("omp", &gone.display().to_string());
     src.mirrors.insert("pi".into(), Mirror {
@@ -52,8 +47,8 @@ fn a_source_in_state_with_no_file_is_listed_as_an_orphan_with_its_mirror() {
 fn renaming_an_orphan_is_refused_because_there_is_nothing_to_rename() {
     let sb = sandbox("rename-orphan");
     let r = roots(&sb);
-    fs::create_dir_all(&r.omp).unwrap();
-    let gone = r.omp.join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
+    fs::create_dir_all(&r.locations.sessions_dir("omp")).unwrap();
+    let gone = r.locations.sessions_dir("omp").join("-tmp").join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl");
     let mut state = State::default();
     state.sources.insert(gone.display().to_string(), Source::new("omp", &gone.display().to_string()));
     let g = list_groups(&r, &state).into_iter().find(|g| g.orphan).expect("orphan listed");
@@ -66,7 +61,7 @@ fn renaming_an_orphan_is_refused_because_there_is_nothing_to_rename() {
 fn a_mirror_path_is_never_listed_as_a_source() {
     let sb = sandbox("mirror");
     let r = roots(&sb);
-    let dir = r.pi.join("-tmp");
+    let dir = r.locations.sessions_dir("pi").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let mirror = dir.join("2026-10-01T10-00-00-000Z_bbbbbbbb-1111-2222-3333-444444444444.jsonl");
     fs::write(&mirror, "{\"type\":\"session\"}\n").unwrap();
@@ -81,7 +76,7 @@ fn a_mirror_path_is_never_listed_as_a_source() {
 fn a_live_session_is_listed_and_not_an_orphan() {
     let sb = sandbox("live");
     let r = roots(&sb);
-    let dir = r.omp.join("-tmp");
+    let dir = r.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join("2026-10-01T10-00-00-000Z_cccccccc-1111-2222-3333-444444444444.jsonl");
     fs::write(&p, "{\"type\":\"session\",\"title\":\"Live\"}\n").unwrap();
@@ -95,7 +90,7 @@ fn a_live_session_is_listed_and_not_an_orphan() {
 fn a_session_lists_its_subagent_transcripts_read_only_and_they_are_not_groups() {
     let sb = sandbox("subs");
     let r = roots(&sb);
-    let dir = r.claude.join("-proj");
+    let dir = r.locations.sessions_dir("claude").join("-proj");
     let parent = "ec447302-155c-4280-9c34-2b5122fcd4a4";
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{parent}.jsonl"));
@@ -114,7 +109,7 @@ fn deleting_a_session_leaves_its_subagent_transcripts_alone() {
     // Subagent transcripts are read-only history; deleting the session must not remove them.
     let sb = sandbox("subs-delete");
     let r = roots(&sb);
-    let dir = r.claude.join("-proj");
+    let dir = r.locations.sessions_dir("claude").join("-proj");
     let parent = "ec447302-155c-4280-9c34-2b5122fcd4a4";
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{parent}.jsonl"));
@@ -149,12 +144,12 @@ fn an_opencode_session_shows_its_recorded_title_not_its_id() {
 }
 
 #[test]
-fn an_opencode_session_without_a_recorded_title_falls_back_to_its_id() {
+fn an_opencode_session_without_a_recorded_title_is_listed_as_untitled() {
     let sb = sandbox("opencode-noname");
     let r = roots(&sb);
     let mut state = State::default();
     state.sources.insert("ses_x".into(), Source::new("opencode", "ses_x"));
     let groups = list_groups(&r, &state);
     let g = groups.iter().find(|g| g.key == "ses_x").expect("listed");
-    assert_eq!(g.title, "ses_x", "with no recorded name, the id is the only honest label");
+    assert_eq!(g.title, "untitled", "a store id is not a name; the details pane shows the id");
 }

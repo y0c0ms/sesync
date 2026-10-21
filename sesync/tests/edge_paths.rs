@@ -3,10 +3,10 @@
 //! produces no file is an error; a lock command that fails unexpectedly does not block
 //! the daemon (fail open, as the Python did).
 
-use sesync::install::install_journal;
-use sesync::install::InstallTarget;
+use sesync::harness::opencode::store::{first_prompt, sessions};
+#[cfg(unix)]
+use sesync::harness::{Location, Tools};
 use sesync::lock::{with_claim, ClaimOutcome};
-use sesync::opencode::{first_prompt, sessions};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
@@ -45,6 +45,7 @@ fn a_prompt_row_with_broken_json_is_skipped_and_the_next_prompt_is_used() {
     assert_eq!(first_prompt(&db, "s"), "the real prompt", "a broken row must not stop the search");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_converter_that_writes_no_file_is_an_error_and_leaves_no_mirror() {
     let _exec = exec_guard();
@@ -56,7 +57,8 @@ fn a_converter_that_writes_no_file_is_an_error_and_leaves_no_mirror() {
     fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     stage_exec(&fake);
     let store = sb.join("pi-agent");
-    let r = install_journal(&fake, &src, InstallTarget::Pi { agent_dir: store.clone() }, "/", "id-x", "t");
+    let pi = sesync::harness::get("pi").expect("pi is a harness");
+    let r = pi.install(&Location { root: store.clone(), cli: None }, &Tools { home: &sb, sesync_conv: &fake }, &src, "id-x", "t");
     let err = r.expect_err("a converter that prints no file must be an error");
     assert!(err.contains("printed no output file"),
         "the guard must be what stops it, not a later failure: {err}");
@@ -79,6 +81,7 @@ fn a_lock_command_that_fails_unexpectedly_runs_the_work_fail_open() {
 }
 
 /// Make a fake CLI executable. Callers hold exec_guard(), so no fork races the write.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn stage_exec(p: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;

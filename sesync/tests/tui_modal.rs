@@ -19,12 +19,7 @@ fn app() -> App {
         .join("2026-10-01T10-00-00-000Z_aaaaaaaa-1111-2222-3333-444444444444.jsonl"),
         "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"cwd\":\"/tmp\",\"title\":\"one\"}\n").unwrap();
     App::new(
-        sesync::manage::Roots {
-            omp: d.join("omp").join("sessions"),
-            pi: d.join("pi"),
-            claude: d.join("claude"),
-            gemini: d.join("gemini"),
-        },
+        sesync::manage::Roots::under(&d, d.join("no-sesync-conv")),
         sesync::state::State::default(),
         d.join("locks"),
         d.join("no-sesync_lock"),

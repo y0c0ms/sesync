@@ -26,7 +26,7 @@ fn a_code_for_one_space_does_not_join_another() {
     s.create_space("team-a", &["alice"]).unwrap();
     s.create_space("team-b", &["alice"]).unwrap();
     let code_a = code_at(&s.space_secret("team-a").unwrap(), T0);
-    assert!(s.join("team-b", "alice", "box-1", &code_a, T0).is_err(),
+    assert!(s.enrol("team-b", "alice", "box-1", &code_a, None, T0).is_err(),
         "a code from team-a must not join team-b");
 }
 
@@ -36,11 +36,11 @@ fn join_state_survives_a_restart_so_a_used_code_stays_used() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    s.join("team-a", "alice", "box-1", &code, T0).unwrap();
+    s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|_| ()).unwrap();
     let store = s.into_store();
     let mut restarted = Service::new(store);
     assert_eq!(
-        restarted.join("team-a", "alice", "box-1", &code, T0),
+        restarted.enrol("team-a", "alice", "box-1", &code, None, T0).map(|_| ()),
         Err(ServiceError::Auth("AlreadyUsed".into())),
         "a used code must stay used across a restart"
     );
@@ -51,12 +51,12 @@ fn a_lockout_survives_a_restart() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     for _ in 0..5 {
-        let _ = s.join("team-a", "alice", "box-1", "000000", T0);
+        let _ = s.enrol("team-a", "alice", "box-1", "000000", None, T0).map(|_| ());
     }
     let store = s.into_store();
     let mut restarted = Service::new(store);
     let good = code_at(&restarted.space_secret("team-a").unwrap(), T0 + 1);
-    assert!(matches!(restarted.join("team-a", "alice", "box-1", &good, T0 + 1), Err(ServiceError::Auth(_))),
+    assert!(matches!(restarted.enrol("team-a", "alice", "box-1", &good, None, T0 + 1), Err(ServiceError::Auth(_))),
         "the lockout must survive a restart");
 }
 
@@ -77,9 +77,9 @@ fn enrol_issues_a_token_only_after_the_authenticator_code() {
     use sesync_team::service::TOKEN_LIFETIME_SECS;
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
-    assert!(s.enrol("team-a", "alice", "box-1", "000000", T0).is_err(), "a wrong code issues nothing");
+    assert!(s.enrol("team-a", "alice", "box-1", "000000", None, T0).is_err(), "a wrong code issues nothing");
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let token = s.enrol("team-a", "alice", "box-1", &code, T0).expect("the right code enrols");
+    let token = s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).expect("the right code enrols");
     assert_eq!(s.authenticate("team-a", &token, "box-1", T0 + 1).unwrap(), "alice");
     assert!(s.authenticate("team-a", &token, "box-1", T0 + TOKEN_LIFETIME_SECS + 1).is_err(),
         "the token expires after its lifetime");
@@ -91,7 +91,7 @@ fn a_token_works_only_on_its_machine_and_its_space() {
     s.create_space("team-a", &["alice"]).unwrap();
     s.create_space("team-b", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let token = s.enrol("team-a", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     assert!(s.authenticate("team-a", &token, "box-2", T0).is_err(), "another machine is refused");
     assert!(s.authenticate("team-b", &token, "box-1", T0).is_err(), "another space is refused");
 }
@@ -101,7 +101,7 @@ fn a_restarted_service_still_accepts_an_issued_token() {
     let mut s = Service::new(MemoryStore::default());
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let token = s.enrol("team-a", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     let restarted = Service::new(s.into_store());
     assert_eq!(restarted.authenticate("team-a", &token, "box-1", T0 + 1).unwrap(), "alice",
         "a token must survive a restart");

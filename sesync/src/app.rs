@@ -9,6 +9,9 @@ use crate::state::State;
 use crate::tui::{Key, Model};
 use std::path::PathBuf;
 use std::time::Instant;
+use crate::members::{Act, Members, Step};
+use crate::team_actions::{AdminDone, AdminJob, SetupDone};
+use crate::team_cli::Command;
 
 /// How long an informational status message stays before the view fades it. Failures stay.
 pub const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
@@ -85,6 +88,8 @@ pub enum Mode {
     DeleteConfirm,
     /// The share picker: one row per team this machine belongs to, space ticks.
     SharePick,
+    /// The team members dialog: the roster and the approve, refuse, revoke and remove keys.
+    Members,
 }
 
 /// Which dialog the form serves: joining a team or starting one (admin side).
@@ -179,6 +184,10 @@ pub enum Ev {
     OpenEnroll,
     /// Open the start-a-team dialog (from the command list).
     OpenRegister,
+    /// Open the invite dialog (from the command list, admin only).
+    OpenInvite,
+    /// Open the team members dialog (from the command list, admin only).
+    OpenMembers,
     Esc,
     /// Move the selection in the session list.
     Up,
@@ -241,6 +250,9 @@ pub struct App {
     /// The teams this machine belongs to, as space names, set by the caller at start-up.
     /// Empty means no team is configured. One team toggles directly; several open the picker.
     teams: Vec<String>,
+    /// Each joined team with where this machine stands, for the Team tab. Read from the
+    /// credentials by the caller, never from the network.
+    team_cards: Vec<crate::team_join::TeamCard>,
     /// Cursor and ticks of the share picker (one row per configured team).
     share_cursor: usize,
     pick_shares: std::collections::BTreeSet<String>,
@@ -256,6 +268,8 @@ pub struct App {
     /// Cursor and picks for the per-session menu and the mirror-target picker.
     menu_cursor: usize,
     installed_targets: Vec<String>,
+    /// When the state file was last read from disk, in seconds since the epoch. Drawn in the tab bar.
+    state_written: Option<f64>,
     pick_cursor: usize,
     pick_chosen: std::collections::BTreeSet<String>,
     /// The colour scheme name in use. Previewing while browsing is done by writing here.
@@ -285,6 +299,22 @@ pub struct App {
     pulling: bool,
     /// The session key behind the open delete confirmation.
     armed_delete: Option<String>,
+    /// Server address and admin token file the team dialogs and admin jobs use by default.
+    team_server: String,
+    admin_token_file: String,
+    /// The teams this machine administers, each with its server and admin token file (set by
+    /// the caller from `team_cli::administered`).
+    admin_teams: Vec<crate::team_cli::AdminTeam>,
+    /// The terminal draws without colours (see `set_monochrome`).
+    monochrome: bool,
+    /// Whether this machine holds the team admin key (set by the caller).
+    admin: bool,
+    /// The open members dialog, if any.
+    members: Option<Members>,
+    /// True while an admin job runs on the caller's worker; the dialog refuses changes meanwhile.
+    admin_busy: bool,
+    /// Admin work waiting for the caller to run it, once.
+    admin_request: Option<AdminJob>,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -323,6 +353,7 @@ impl App {
             quit: false,
             pending_import: None,
             teams: Vec::new(),
+            team_cards: Vec::new(),
             share_cursor: 0,
             pick_shares: Default::default(),
             refresh_requested: false,
@@ -331,6 +362,7 @@ impl App {
             palette_cursor: 0,
             menu_cursor: 0,
             installed_targets: Vec::new(),
+            state_written: None,
             pick_cursor: 0,
             pick_chosen: Default::default(),
             theme_name: crate::theme::DEFAULT.to_string(),
@@ -347,6 +379,14 @@ impl App {
             prefs_dirty: false,
             pulling: false,
             armed_delete: None,
+            admin: false,
+            team_server: String::new(),
+            admin_token_file: String::new(),
+            admin_teams: Vec::new(),
+            monochrome: false,
+            members: None,
+            admin_busy: false,
+            admin_request: None,
         }
     }
 
@@ -550,6 +590,7 @@ impl App {
             Mode::Theme => "up/down preview · enter apply · esc revert".to_string(),
             Mode::Form => "tab next field · enter submit · esc cancel".to_string(),
             Mode::Qr => "scan now · the secret is shown once · esc close".to_string(),
+            Mode::Members => "a approve · d refuse · r revoke · m remove · t next team · esc close".to_string(),
             Mode::Filter => "type to filter · enter keep · esc clear".to_string(),
             Mode::Help => "esc close".to_string(),
             Mode::Transcript => "j/k scroll · esc close".to_string(),
@@ -624,13 +665,22 @@ impl App {
         self.say(if self.filter_text.is_empty() {
             format!("showing {shown} of {total} session(s)")
         } else {
-            format!("filter '{}' — {shown} of {total} session(s)", self.filter_text)
+            format!("filter '{}': {shown} of {total} session(s)", self.filter_text)
         });
     }
 
     /// The teams this machine belongs to (set by the caller at start-up).
     pub fn set_teams(&mut self, teams: Vec<String>) {
         self.teams = teams;
+    }
+
+    /// Each joined team with where this machine stands (set by the caller from the credentials).
+    pub fn set_team_cards(&mut self, cards: Vec<crate::team_join::TeamCard>) {
+        self.team_cards = cards;
+    }
+
+    pub fn team_cards(&self) -> &[crate::team_join::TeamCard] {
+        &self.team_cards
     }
 
     /// Whether a listed group is shared with any team. The view uses this to show the mark.
@@ -658,34 +708,91 @@ impl App {
         let pushed_at = self.state.shares_of(&id).iter()
             .filter_map(|space| self.state.team_pushed_at(space, &id))
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        use crate::session_cols::{is_transient, MirrorState};
+        let src = self.state.sources.get(&g.key);
+        // A target's state comes from the daemon's per-target record: a recorded problem makes it
+        // failing, or busy when the target was only in use. A chosen target with no install and
+        // no record yet (a state written before per-target records) is failing once the daemon
+        // has counted failed attempts on the source.
+        let state_of = |t: &str, base: MirrorState| {
+            match src.and_then(|s| s.sync.get(t)) {
+                Some(e) if !e.problem.is_empty() => {
+                    if is_transient(&e.problem) { MirrorState::Busy } else { MirrorState::Failing }
+                }
+                Some(_) => base,
+                None if base == MirrorState::Pending && src.map_or(false, |s| s.failures > 0) => MirrorState::Failing,
+                None => base,
+            }
+        };
+        let mut mirror_targets: Vec<(String, MirrorState)> =
+            g.mirrors.iter().map(|(t, _)| (t.clone(), state_of(t, MirrorState::Mirrored))).collect();
+        // A chosen target with no install yet is listed too, so a first write that failed shows.
+        // A target the user no longer chose is not, whatever record it still has.
+        if let Some(s) = src {
+            for t in &s.chosen_targets {
+                if !s.mirrors.contains_key(t) {
+                    mirror_targets.push((t.clone(), state_of(t, MirrorState::Pending)));
+                }
+            }
+        }
+        // Unknown write times (0) do not count: they would pin the column to "never".
+        let synced_at = mirror_targets.iter()
+            .filter_map(|(t, _)| src.and_then(|s| s.sync.get(t)).map(|e| e.ok_at).filter(|at| *at > 0.0))
+            .reduce(f64::min)
+            .unwrap_or(0.0);
         crate::session_cols::columns(&crate::session_cols::Input {
             marked: self.state.is_shared(&id),
             pushed_at,
             last_change,
             now,
-            quiet_secs: crate::team_pass::team_quiet_secs(),
-            // A chosen target with no mirror yet shows with a marker so the user can see the
-            // write is still pending ("?") or has been failing ("!").
-            mirror_targets: {
-                use crate::session_cols::MirrorState;
-                let src = self.state.sources.get(&g.key);
-                let failures = src.map_or(0, |s| s.failures);
-                let mut targets: Vec<(String, MirrorState)> =
-                    g.mirrors.iter().map(|(t, _)| (t.clone(), MirrorState::Mirrored)).collect();
-                if let Some(s) = src {
-                    for t in &s.chosen_targets {
-                        if !s.mirrors.contains_key(t) {
-                            targets.push((t.clone(), if failures > 0 { MirrorState::Failing } else { MirrorState::Pending }));
-                        }
-                    }
-                }
-                targets
-            },
+            mirror_targets,
+            synced_at,
         })
     }
 
     pub fn is_selected_marked(&self) -> bool {
         self.selected().map_or(false, |g| self.state.is_shared(&self.state.team_id_of(&g.key)))
+    }
+
+    /// Record when the state file was last read (seconds since the epoch), for the tab bar.
+    pub fn set_state_written(&mut self, at: Option<f64>) {
+        self.state_written = at;
+    }
+
+    /// When the state file was last read, if known.
+    pub fn state_written_at(&self) -> Option<f64> {
+        self.state_written
+    }
+
+    /// The highlighted session, borrowed, for the details pane.
+    pub fn selected_row(&self) -> Option<&Group> {
+        self.visible.get(self.model.selected()).and_then(|i| self.groups.get(*i))
+    }
+
+    /// Move the highlight to a visible row, for mouse clicks. Out-of-range rows are ignored.
+    pub fn select_row(&mut self, idx: usize) {
+        if idx < self.visible.len() {
+            let delta = idx as isize - self.model.selected() as isize;
+            self.move_selection(delta);
+        }
+    }
+
+    /// Copy counts over every session, for the tab bar: (copies in place, copies whose last write
+    /// failed). A copy that was only busy (in use, retried by the daemon) counts as in place.
+    pub fn sync_counts(&self) -> (usize, usize) {
+        let mut ok = 0;
+        let mut failing = 0;
+        for s in self.state.sources.values() {
+            for t in s.chosen_targets.iter().filter(|t| **t != s.fmt) {
+                let problem = s.sync.get(t).map_or("", |e| e.problem.as_str());
+                if !problem.is_empty() && !crate::session_cols::is_transient(problem) {
+                    failing += 1;
+                } else if s.mirrors.contains_key(t) {
+                    ok += 1;
+                }
+            }
+        }
+        (ok, failing)
     }
 
     /// Share, or stop sharing, the selected session. With one team on this machine it toggles
@@ -806,22 +913,29 @@ impl App {
         self.team.iter().map(|(id, bytes)| {
             let text = String::from_utf8_lossy(bytes);
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            let (title, found) = crate::titles::omp_title_from_lines(&lines);
+            let (title, found) = crate::harness::journal::omp_title_from_lines(&lines);
             let title = if found && !title.trim().is_empty() { title } else { "untitled".to_string() };
             let short: String = id.chars().take(8).collect();
             format!("{title} · {short}…")
         }).collect()
     }
 
-    /// The command list as the view draws it, filtered by what has been typed.
-    pub fn palette_rows(&self) -> Vec<PaletteRow> {
-        let ctx = palette::Ctx {
+    /// What the command list needs to know about the current state.
+    fn palette_ctx(&self) -> palette::Ctx {
+        palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
             session_shared: self.is_selected_marked(),
             team_selected: self.team.get(self.team_index).is_some(),
             team_configured: self.team_configured,
-        };
+            team_to_manage: !self.manageable_teams().is_empty(),
+            admin: self.admin,
+        }
+    }
+
+    /// The command list as the view draws it, filtered by what has been typed.
+    pub fn palette_rows(&self) -> Vec<PaletteRow> {
+        let ctx = self.palette_ctx();
         palette::filter(&self.palette_query).into_iter().enumerate().map(|(i, action)| {
             let (why, ok) = match palette::enabled(action, &ctx) {
                 Ok(()) => (String::new(), true),
@@ -888,8 +1002,12 @@ impl App {
                 s.last_hash = dsrc.last_hash.clone();
                 s.last_stamp = dsrc.last_stamp.clone();
                 s.failures = dsrc.failures;
+                s.sync = dsrc.sync.clone();
                 s.mirrors = dsrc.mirrors.clone();
                 if !dsrc.title.is_empty() { s.title = dsrc.title.clone(); }
+                // The daemon holds the entry now; if it later removes it (a promotion turned it
+                // into a mirror), this app must let it go instead of saving it back.
+                s.tui_created = false;
             } else {
                 self.state.sources.insert(key.clone(), dsrc.clone());
             }
@@ -943,7 +1061,7 @@ impl App {
         }
         // ctrl+t opens the colour scheme picker from anywhere except the questions and dialogs
         // that own the screen; inside them it stays out of the way.
-        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr) {
+        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members) {
             self.disarm(now);
             self.open_theme();
             return;
@@ -962,6 +1080,7 @@ impl App {
             Mode::Theme => self.handle_theme(ev),
             Mode::Form => self.handle_form(ev),
             Mode::Qr => self.handle_qr(ev),
+            Mode::Members => self.handle_members(ev),
             Mode::Filter => self.handle_filter(ev),
             Mode::Help => self.handle_help(ev),
             Mode::Transcript => self.handle_transcript(ev),
@@ -998,6 +1117,8 @@ impl App {
             }
             Ev::OpenEnroll => self.open_form(Kind::Enroll, &[]),
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
+            Ev::OpenInvite => self.open_invite(),
+            Ev::OpenMembers => self.open_members(),
             Ev::CtrlD => {
                 if self.view != View::Sessions {
                     self.say("delete works on local sessions only; press tab");
@@ -1092,7 +1213,7 @@ impl App {
                 self.recompute_visible();
                 self.rebuild_model_keep(None);
                 self.say(format!(
-                    "view: {} — {} of {} session(s)",
+                    "view: {}, {} of {} session(s)",
                     self.filter_scope.label(), self.visible.len(), self.groups.len()
                 ));
             }
@@ -1477,13 +1598,7 @@ impl App {
     fn run_palette_choice(&mut self, now: Instant) {
         let filtered = palette::filter(&self.palette_query);
         let Some(&action) = filtered.get(self.palette_cursor) else { return };
-        let ctx = palette::Ctx {
-            view: self.view,
-            session_selected: self.selected().is_some(),
-            session_shared: self.is_selected_marked(),
-            team_selected: self.team.get(self.team_index).is_some(),
-            team_configured: self.team_configured,
-        };
+        let ctx = self.palette_ctx();
         if let Err(reason) = palette::enabled(action, &ctx) {
             self.say(format!("{} not available here: {reason}", palette::title_of(action)));
             return;
@@ -1612,10 +1727,18 @@ impl App {
 
     // ----- the team dialogs ----------------------------------------------------------------
 
-    /// Open the join/create dialog, optionally with values prefilled by label.
+    /// Open the join/create/invite dialog, optionally with values prefilled by label. The team
+    /// server and admin token file last used fill in first, so a dialog does not ask twice.
     pub fn open_form(&mut self, kind: Kind, prefill: &[(&str, &str)]) {
         if self.form.is_some() { return; }
-        self.form = Some(crate::form::Form::new(kind, prefill));
+        let mut form = crate::form::Form::new(kind, &[
+            ("server url", self.team_server.as_str()),
+            ("admin token file", self.admin_token_file.as_str()),
+        ]);
+        for (name, value) in prefill {
+            form.set_value(name, value);
+        }
+        self.form = Some(form);
         self.mode = Mode::Form;
         self.say("");
     }
@@ -1641,11 +1764,15 @@ impl App {
         std::mem::take(&mut self.setup)
     }
 
-    /// What the caller reports after performing a request: the message the status shows.
-    pub fn finish_setup(&mut self, result: Result<String, String>) {
-        match result {
+    /// What the caller reports after performing a team dialog: the message the status shows,
+    /// and the authenticator QR when a team was created.
+    pub fn finish_setup(&mut self, done: SetupDone) {
+        match done.result {
             Ok(msg) => self.say(msg),
             Err(e) => self.fail(e),
+        }
+        if let Some((team, uri)) = done.created {
+            self.show_qr(&team, &uri);
         }
     }
 
@@ -1696,11 +1823,25 @@ impl App {
         let values = f.collected();
         self.form = None;
         self.mode = Mode::Browse;
+        self.remember_team_fields(&values);
         self.say(match kind {
             Kind::Enroll => "joining the team…",
             Kind::Register => "starting the team…",
+            Kind::Invite => "inviting…",
         });
         self.setup = Some(SetupRequest { kind, values });
+    }
+
+    /// Keep the server address and admin token file a dialog was given, for the next dialog.
+    fn remember_team_fields(&mut self, values: &[(String, String)]) {
+        for (name, value) in values {
+            if value.is_empty() { continue; }
+            match name.as_str() {
+                "server url" => self.team_server = value.clone(),
+                "admin token file" => self.admin_token_file = value.clone(),
+                _ => {}
+            }
+        }
     }
 
     // ----- the authenticator QR ------------------------------------------------------------
@@ -1722,6 +1863,216 @@ impl App {
         }
     }
 
+    // ----- team members and invites (admin only) -------------------------------------------
+
+    /// Open the members dialog for the first configured team and ask the server for its list.
+    pub fn open_members(&mut self) {
+        if self.members.is_some() { return; }
+        if self.admin_busy {
+            self.fail("the team server is still answering; try again in a moment");
+            return;
+        }
+        let Some(team) = self.manageable_teams().first().cloned() else {
+            self.fail("no team to manage here; start one first");
+            return;
+        };
+        let (server, token_file) = self.admin_target(&team);
+        if server.is_empty() || token_file.is_empty() {
+            self.fail("the team server or admin token file is not known here: start the team from this machine, or set SESYNC_TEAM_URL and SESYNC_ADMIN_TOKEN_FILE");
+            return;
+        }
+        self.members = Some(Members::new(&team));
+        self.mode = Mode::Members;
+        self.queue_roster();
+        self.say(READING_ROSTER);
+    }
+
+    /// Open the invite dialog for the first team this machine manages, with that team's server
+    /// and admin token file (the command list checks admin).
+    fn open_invite(&mut self) {
+        let team = self.manageable_teams().first().cloned().unwrap_or_default();
+        let (server, token_file) = self.admin_target(&team);
+        self.open_form(Kind::Invite, &[
+            ("team", team.as_str()), ("server url", server.as_str()), ("admin token file", token_file.as_str()),
+        ]);
+    }
+
+    /// The teams the admin dialogs can work on: the ones this machine administers, then the
+    /// ones it joined, each once.
+    pub fn manageable_teams(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.admin_teams.iter().map(|t| t.team.clone()).collect();
+        for t in &self.teams {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+        out
+    }
+
+    /// The server and admin token file for an admin action on `team`: the ones the team was
+    /// created with on this machine, else the dialogs' defaults.
+    fn admin_target(&self, team: &str) -> (String, String) {
+        let rec = self.admin_teams.iter().find(|t| t.team == team);
+        let pick = |own: Option<&String>, default: &String| {
+            own.filter(|v| !v.is_empty()).unwrap_or(default).clone()
+        };
+        (pick(rec.map(|r| &r.server), &self.team_server), pick(rec.map(|r| &r.token_file), &self.admin_token_file))
+    }
+
+    /// The teams this machine administers (set by the caller from `team_cli::administered`).
+    pub fn set_admin_teams(&mut self, teams: Vec<crate::team_cli::AdminTeam>) {
+        self.admin_teams = teams;
+    }
+
+    pub fn admin_teams(&self) -> &[crate::team_cli::AdminTeam] {
+        &self.admin_teams
+    }
+
+    /// Whether the terminal draws without colours (NO_COLOR is set): the QR then paints its light
+    /// modules, since no explicit black-on-white can reach the screen. Set by the caller.
+    pub fn set_monochrome(&mut self, yes: bool) {
+        self.monochrome = yes;
+    }
+
+    pub fn monochrome(&self) -> bool {
+        self.monochrome
+    }
+
+    /// The open members dialog, if any.
+    pub fn members(&self) -> Option<&Members> {
+        self.members.as_ref()
+    }
+
+    /// Whether an admin job is running on the caller's worker.
+    pub fn admin_busy(&self) -> bool {
+        self.admin_busy
+    }
+
+    /// Whether this machine holds the team admin key. Set by the caller.
+    pub fn set_admin(&mut self, yes: bool) {
+        self.admin = yes;
+    }
+
+    /// The team server and admin token file the dialogs and admin jobs use by default.
+    pub fn set_team_defaults(&mut self, server: &str, token_file: &str) {
+        self.team_server = server.to_string();
+        self.admin_token_file = token_file.to_string();
+    }
+
+    /// Take the admin job the caller should run on a worker thread, once.
+    pub fn take_admin_request(&mut self) -> Option<AdminJob> {
+        self.admin_request.take()
+    }
+
+    /// What the caller reports after an admin job: the roster to show, or a message to show.
+    pub fn finish_admin(&mut self, result: Result<AdminDone, String>) {
+        self.admin_busy = false;
+        match result {
+            Ok(AdminDone::Roster(view)) => {
+                if let Some(m) = self.members.as_mut() {
+                    m.set_roster(&view);
+                }
+                // The list is on screen now; a message from the change that led here stays.
+                if self.status() == READING_ROSTER {
+                    self.say("");
+                }
+            }
+            Ok(AdminDone::Message(text)) => {
+                self.say(text);
+                if self.members.is_some() { self.queue_roster(); }
+            }
+            Err(e) => self.fail(e),
+        }
+    }
+
+    fn queue_roster(&mut self) {
+        let Some(team) = self.members.as_ref().map(|m| m.team.clone()) else { return };
+        self.queue_admin(Command::Roster { name: team });
+    }
+
+    fn queue_admin(&mut self, command: Command) {
+        let team = self.members.as_ref().map(|m| m.team.clone()).unwrap_or_default();
+        let (server, token_file) = self.admin_target(&team);
+        self.admin_request = Some(AdminJob { command, server, token_file });
+        self.admin_busy = true;
+    }
+
+    /// Keys in the members dialog. The change keys need two presses on the same row (see
+    /// [`Members::press`]); any other key cancels a pending change.
+    fn handle_members(&mut self, ev: Ev) {
+        let act = match &ev {
+            Ev::Char(c) => Act::from_key(*c),
+            _ => None,
+        };
+        if act.is_none() {
+            if let Some(m) = self.members.as_mut() { m.disarm(); }
+        }
+        match ev {
+            Ev::Esc => {
+                self.members = None;
+                self.mode = Mode::Browse;
+                self.say("");
+            }
+            Ev::Up | Ev::Char('k') => self.members_move(-1),
+            Ev::Down | Ev::Char('j') => self.members_move(1),
+            Ev::CtrlR => {
+                if self.admin_busy {
+                    self.say("the team server is still answering; wait a moment");
+                } else {
+                    self.queue_roster();
+                    self.say(READING_ROSTER);
+                }
+            }
+            Ev::Char('t') => self.next_members_team(),
+            Ev::Char(_) => {
+                if let Some(act) = act { self.members_press(act); }
+            }
+            _ => {}
+        }
+    }
+
+    fn members_move(&mut self, by: isize) {
+        if let Some(m) = self.members.as_mut() { m.move_cursor(by); }
+    }
+
+    fn members_press(&mut self, act: Act) {
+        if self.admin_busy {
+            self.say("the team server is still answering; wait a moment");
+            return;
+        }
+        let step = match self.members.as_mut() {
+            Some(m) => m.press(act),
+            None => return,
+        };
+        match step {
+            Step::Armed(prompt) => self.say(prompt),
+            Step::Refused(why) => self.fail(why),
+            Step::Run(command) => {
+                self.say("working…");
+                self.queue_admin(command);
+            }
+        }
+    }
+
+    /// Move the members dialog to the next configured team, when there is more than one.
+    fn next_members_team(&mut self) {
+        if self.admin_busy {
+            self.say("the team server is still answering; wait a moment");
+            return;
+        }
+        let Some(current) = self.members.as_ref().map(|m| m.team.clone()) else { return };
+        let teams = self.manageable_teams();
+        if teams.len() < 2 {
+            self.say("only one team is managed here");
+            return;
+        }
+        let at = teams.iter().position(|t| *t == current).unwrap_or(0);
+        let next = teams[(at + 1) % teams.len()].clone();
+        self.members = Some(Members::new(&next));
+        self.queue_roster();
+        self.say(READING_ROSTER);
+    }
+
     // ----- confirm and rename -------------------------------------------------------------
 
     /// Confirm or cancel the pending import. Only `y` writes; everything else cancels.
@@ -1734,12 +2085,18 @@ impl App {
                     // The harness lists only `<timestamp>_<uuid>.jsonl`. A team id that cannot
                     // be written in that form is refused, so no file is written that nothing shows.
                     let name = format!("{}_{}.jsonl", "2026-01-01T00-00-00-000Z", id);
-                    if !crate::discovery::is_listed_session_name(&name) {
+                    if !crate::harness::journal::is_listed_session_name(&name) {
                         self.mode = Mode::Browse;
                         self.say(format!("not imported: team session id {id} is not a harness session id"));
                         return;
                     }
-                    let target = self.roots.omp.join(name);
+                    // A pulled session is a canonical journal: it goes, as it is, into the first
+                    // harness whose own files are journals.
+                    let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
+                        self.fail("not imported: no harness keeps canonical journals");
+                        return;
+                    };
+                    let target = self.roots.locations.sessions_dir(h.id()).join(name);
                     match crate::team_import::import_confirmed(&target, &bytes, true) {
                         Ok(_) => {
                             self.imported.push(id.clone());
@@ -1774,11 +2131,14 @@ impl App {
                     return;
                 };
                 let title = self.input.clone();
-                match manage::rename_group(&self.roots, &g, &title, &self.lock_dir, &self.sesync_lock) {
-                    Ok(saved) => {
+                match manage::rename_group_noted(&self.roots, &g, &title, &self.lock_dir, &self.sesync_lock) {
+                    Ok((saved, note)) => {
                         self.mode = Mode::Browse;
                         self.input.clear();
-                        self.say(format!("renamed to '{saved}'"));
+                        match note {
+                            Some(note) => self.say(format!("renamed to '{saved}'. {note}")),
+                            None => self.say(format!("renamed to '{saved}'")),
+                        }
                         self.reload();
                     }
                     Err(e) => {
@@ -1804,3 +2164,6 @@ impl App {
 
 #[allow(dead_code)]
 fn _unused(_: ClaimOutcome<()>) {}
+
+/// The status while the members dialog waits for the team's list.
+const READING_ROSTER: &str = "reading the team's list…";

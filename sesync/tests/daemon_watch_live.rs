@@ -98,10 +98,12 @@ fn the_watch_loop_pushes_a_marked_session_and_raises_the_floor_on_the_next_pull(
     let svc = Service::new(PgStore::connect(&scoped, MASTER).unwrap());
     let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let code = code_at(&svc.space_secret("personal").unwrap(), now);
-    team_join::join(&base, "personal", "writer", "writer-box", &code, &config)
+    let joined = team_join::join(&base, "personal", "writer", "writer-box", &code, &config)
         .expect("join the writer");
-    sesync::team_cli::run_detailed(&Command::Publish { name: "personal".into() }, &base, ADMIN_TOKEN, &config)
-        .expect("publish the member list");
+    let approve = Command::Approve { name: "personal".into(), member: "writer".into(), machine: "writer-box".into(),
+                                     fingerprint: Some(joined.fingerprint.clone()) };
+    sesync::team_cli::run_detailed(&approve, &base, ADMIN_TOKEN, &config).expect("approve the writer");
+    team_join::check_approval(None, &config, "personal").expect("the writer picks up its approval");
 
     // Source layout: one omp journal, old enough that the team quiet rule (0 here) is satisfied.
     let omp = dir.join("omp");

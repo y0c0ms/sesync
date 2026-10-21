@@ -3,7 +3,8 @@
 //! Expected values were computed by daemon/sesync.py mirror_uuid and
 //! mirror_opencode_id.
 
-use sesync::mirror::{file_hash_bytes, mirror_opencode_id, mirror_uuid};
+use sesync::harness::opencode::mirror_opencode_id;
+use sesync::mirror::{file_hash_bytes, mirror_uuid};
 
 #[test]
 fn mirror_uuid_matches_python() {

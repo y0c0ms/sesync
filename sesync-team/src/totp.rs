@@ -2,7 +2,8 @@
 //!
 //! The check proves the joining user holds the authenticator. It is not the encryption key:
 //! a 6-digit code has only a million values, so it cannot carry or derive a key. A code is
-//! accepted once, and five wrong codes lock joining for 15 minutes.
+//! accepted once per machine, and five wrong codes lock joining for 15 minutes: on that machine,
+//! and for that member whatever machine name the next attempt uses.
 
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -130,6 +131,32 @@ impl JoinGate {
     }
 }
 
+/// Wrong codes counted per member, across every machine name. The gate above is per machine, and
+/// the joining client names the machine, so without this a guesser could take five fresh guesses
+/// under each new machine name. Five wrong codes for one member lock that member's joining for
+/// LOCK_SECS, whatever machine the next attempt names; other members are not affected.
+#[derive(Debug, Default, Clone)]
+pub struct MemberAttempts {
+    failures: u32,
+    locked_until: u64,
+}
+
+impl MemberAttempts {
+    /// Refused while the member is locked.
+    pub fn check(&self, now: u64) -> Result<(), JoinError> {
+        if now < self.locked_until { Err(JoinError::Locked { until: self.locked_until }) } else { Ok(()) }
+    }
+
+    /// Count one wrong code at `now`; the MAX_FAILURES-th locks the member for LOCK_SECS.
+    pub fn wrong(&mut self, now: u64) {
+        self.failures += 1;
+        if self.failures >= MAX_FAILURES {
+            self.locked_until = now + LOCK_SECS;
+            self.failures = 0;
+        }
+    }
+}
+
 /// RFC 4648 base32 (no padding), the encoding authenticator apps expect for a TOTP secret.
 pub fn base32(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -149,9 +176,24 @@ pub fn base32(bytes: &[u8]) -> String {
     out
 }
 
+/// Percent-encode everything but RFC 3986 unreserved characters, so a team name with spaces,
+/// `?`, `#`, `&`, `/`, `:` or non-ASCII letters stays one label an authenticator app can parse.
+fn uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// The otpauth URI an authenticator app imports: a 30-second, 6-digit, SHA-1 TOTP for the
-/// space. Shown once at creation; the label carries the space name, never the secret.
+/// space. Shown once at creation; the label carries the space name, never the secret. The name is
+/// percent-encoded: the issuer prefix `sesync:` is the only raw colon in the label.
 pub fn otpauth_uri(secret: &[u8], space: &str) -> String {
-    format!("otpauth://totp/sesync:{space}?secret={}&issuer=sesync&algorithm=SHA1&digits=6&period=30",
-            base32(secret))
+    format!("otpauth://totp/sesync:{}?secret={}&issuer=sesync&algorithm=SHA1&digits=6&period=30",
+            uri_component(space), base32(secret))
 }

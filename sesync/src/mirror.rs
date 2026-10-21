@@ -14,21 +14,6 @@ pub fn mirror_uuid(source_key: &str, target: &str) -> String {
     Uuid::new_v5(&ns, format!("{source_key}|{target}").as_bytes()).to_string()
 }
 
-const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-/// "ses_" + 12 hex of sha256("<key>|opencode") + 14 base62 characters, the shape
-/// OpenCode uses for session ids. Mirrors Python's byte pairs at [12..40) step 2.
-pub fn mirror_opencode_id(source_key: &str) -> String {
-    let digest = Sha256::digest(format!("{source_key}|opencode").as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    let mut tail = String::new();
-    for i in (12..40).step_by(2) {
-        let v = u8::from_str_radix(&hex[i..i + 2], 16).expect("hex") as usize;
-        tail.push(ALPHABET[v % 62] as char);
-    }
-    format!("ses_{}{}", &hex[..12], tail)
-}
-
 /// Lowercase sha256 hex of a byte slice (the Python file_hash, for one buffer).
 pub fn file_hash_bytes(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -59,4 +44,62 @@ pub fn file_hash(path: &std::path::Path) -> std::io::Result<String> {
         h.update(&buf[..n]);
     }
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The files that hold one file-backed conversation copy, main file first, as its harness names
+/// them (an Antigravity conversation is its database and its write-ahead log). A format sesync
+/// does not know is its one file.
+pub fn copy_files(fmt: &str, path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    crate::harness::get(fmt).map_or_else(|| vec![path.to_path_buf()], |h| h.files_of(path))
+}
+
+/// The content hash of a copy, over every file `copy_files` names. A copy that is one file
+/// hashes exactly as `file_hash`, so records written before this existed still match.
+pub fn copy_hash(fmt: &str, path: &std::path::Path) -> std::io::Result<String> {
+    let hashes = copy_files(fmt, path).iter().map(|f| file_hash(f)).collect::<std::io::Result<Vec<_>>>()?;
+    Ok(combine_hashes(&hashes))
+}
+
+/// One hash for a copy from the hashes of its files, in `copy_files` order: the file's own hash
+/// for a one-file copy, else the hash of the `:`-joined list.
+pub fn combine_hashes(hashes: &[String]) -> String {
+    match hashes {
+        [one] => one.clone(),
+        many => file_hash_bytes(many.join(":").as_bytes()),
+    }
+}
+
+/// The cheap stamp of a copy: `size:mtime_ns` of each file `copy_files` names, joined with `+`.
+/// "missing" when the main file is gone. One file stamps exactly as `divergence::fingerprint`.
+pub fn copy_stamp(fmt: &str, path: &std::path::Path) -> String {
+    let files = copy_files(fmt, path);
+    let main = crate::divergence::fingerprint(&files[0]);
+    if main == "missing" {
+        return main;
+    }
+    files[1..].iter().fold(main, |acc, f| format!("{acc}+{}", crate::divergence::fingerprint(f)))
+}
+
+/// The newest modification time among a copy's files, in seconds since the epoch (0.0 when
+/// none can be read).
+pub fn copy_mtime(fmt: &str, path: &std::path::Path) -> f64 {
+    copy_files(fmt, path).iter().map(|f| crate::divergence::mtime_secs(f)).fold(0.0, f64::max)
+}
+
+/// Remove a copy's files: the main file first, then the rest `copy_files` names, plus the files
+/// its harness keeps beside it that are not content (a database index). A file already gone is
+/// not an error.
+pub fn remove_copy(fmt: &str, path: &std::path::Path) -> std::io::Result<()> {
+    let mut files = copy_files(fmt, path);
+    if let Some(h) = crate::harness::get(fmt) {
+        files.extend(h.side_files(path));
+    }
+    for f in files {
+        match std::fs::remove_file(&f) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }

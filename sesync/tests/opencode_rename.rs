@@ -3,7 +3,7 @@
 //! running, and must stop only a server it started itself.
 //! A small fake HTTP server stands in for `opencode serve`, so no real store is touched.
 
-use sesync::opencode_rename::{rename_session, RenameError};
+use sesync::harness::opencode::rename::{rename_session, RenameError};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};

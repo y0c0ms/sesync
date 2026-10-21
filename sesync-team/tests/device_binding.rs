@@ -4,7 +4,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use sesync_team::membership::{device_entry, Device, MemberList, SignedList};
+use sesync_team::membership::{device_entry, enrol_message, Device, MemberList, SignedList};
 use sesync_team::server::{self, AppState, Clock};
 use sesync_team::service::{MemoryStore, Service};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,15 @@ fn code(state: &Arc<AppState<MemoryStore>>) -> String {
     sesync_team::totp::code_at(&svc.space_secret(SPACE).unwrap(), T0)
 }
 
+/// A join request as a real client sends it: the device entry and the device's signature over
+/// the join message, made with `signer` (the device itself, unless a test forges it).
+fn join_body(device: &Device, signer: &Device, member: &str, machine: &str, code: &str) -> serde_json::Value {
+    let entry = device_entry(device);
+    let proof = signer.sign(&enrol_message(SPACE, member, machine, code, &entry));
+    serde_json::json!({"space": SPACE, "member": member, "machine": machine, "code": code,
+        "device": hex(&entry), "proof": hex(&proof)})
+}
+
 #[tokio::test]
 async fn a_team_with_a_trust_root_requires_the_device_key_at_enrolment() {
     let (app, state) = app();
@@ -74,9 +83,7 @@ async fn the_enrol_reply_carries_the_trust_root_for_the_joining_device_to_pin() 
     let writer = Device::generate();
     create_with_root(&app, &admin, &["writer"], &[&admin, &writer]).await;
 
-    let (st, j) = post(&app, "/enrol", None, serde_json::json!({
-        "space": SPACE, "member": "writer", "machine": "box-w", "code": code(&state),
-        "device": hex(&device_entry(&writer))})).await;
+    let (st, j) = post(&app, "/enrol", None, join_body(&writer, &writer, "writer", "box-w", &code(&state))).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     assert!(j["token"].as_str().is_some());
     assert_eq!(j["list_version"], 1);
@@ -91,15 +98,48 @@ async fn the_enrol_reply_carries_the_trust_root_for_the_joining_device_to_pin() 
 }
 
 #[tokio::test]
+async fn a_join_must_prove_it_holds_the_device_key() {
+    let (app, state) = app();
+    let admin = Device::generate();
+    let writer = Device::generate();
+    create_with_root(&app, &admin, &["writer", "eve"], &[&admin, &writer]).await;
+    let code = code(&state);
+
+    // An old client sends the entry without a proof.
+    let (st, j) = post(&app, "/enrol", None, serde_json::json!({
+        "space": SPACE, "member": "writer", "machine": "box-w", "code": code,
+        "device": hex(&device_entry(&writer))})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{j}");
+    assert!(j["error"].as_str().unwrap().contains("proof"), "{j}");
+
+    // A member who knows the writer's listed public keys, but not its private key, signs with
+    // their own key: refused, no token.
+    let eve = Device::generate();
+    let (st, j) = post(&app, "/enrol", None, join_body(&writer, &eve, "writer", "box-w", &code)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{j}");
+    assert!(j.get("token").is_none(), "{j}");
+
+    // A genuine signature over other fields does not carry over: signed for one machine name,
+    // sent under another.
+    let mut moved = join_body(&writer, &writer, "writer", "box-x", &code);
+    moved["machine"] = serde_json::json!("box-w");
+    let (st, _) = post(&app, "/enrol", None, moved).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // The forged attempts spent nothing: the real device joins with the same code.
+    let (st, j) = post(&app, "/enrol", None, join_body(&writer, &writer, "writer", "box-w", &code)).await;
+    assert_eq!(st, StatusCode::OK, "{j}");
+    assert!(j["token"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn a_revoked_device_is_stopped_at_once_despite_a_live_token() {
     let (app, state) = app();
     let admin = Device::generate();
     let writer = Device::generate();
     create_with_root(&app, &admin, &["writer"], &[&admin, &writer]).await;
 
-    let (st, j) = post(&app, "/enrol", None, serde_json::json!({
-        "space": SPACE, "member": "writer", "machine": "box-w", "code": code(&state),
-        "device": hex(&device_entry(&writer))})).await;
+    let (st, j) = post(&app, "/enrol", None, join_body(&writer, &writer, "writer", "box-w", &code(&state))).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     let auth = format!("Bearer {}", j["token"].as_str().unwrap());
 

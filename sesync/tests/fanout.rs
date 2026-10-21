@@ -3,7 +3,7 @@
 //! the O-penCode store. Uses the real sesync_conv and the real opencode CLI; skipped without
 //! the CLI.
 
-use sesync::mirror::mirror_opencode_id;
+use sesync::harness::opencode::mirror_opencode_id;
 use sesync::state::{Source, State};
 use std::fs;
 use std::path::{Path, PathBuf};

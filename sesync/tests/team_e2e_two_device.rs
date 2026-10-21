@@ -104,23 +104,30 @@ fn two_devices_share_a_session_through_a_real_server() {
     assert!(text.contains("team 'personal' created"), "{text}");
     assert!(dir.join("admin/device.key").exists(), "the admin key lives on this machine");
 
-    // Both member devices enrol with the team code, through the daemon's own join code. Each
-    // machine's join config is the directory holding its device key, so the device the join
-    // binds is the one the admin's list names.
+    // Both member devices ask to join with the team code, through the daemon's own join code. Each
+    // machine's join config is the directory holding its device key. A new key only asks: the
+    // admin approves each one after comparing its fingerprint, and that is the step that makes a
+    // joining device a member. Each device then picks up the signed list as the daemon does.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let svc = Service::new(PgStore::connect(&scoped, MASTER).unwrap());
     let code = code_at(&svc.space_secret("personal").unwrap(), now);
-    let writer_path = team_join::join(&base, "personal", "writer", "writer-box", &code, &dir.join("keys/writer")).unwrap();
-    let reader_path = team_join::join(&base, "personal", "reader", "reader-box", &code, &dir.join("keys/reader")).unwrap();
-    let writer_cred = team_join::load(&writer_path).unwrap();
-    let reader_cred = team_join::load(&reader_path).unwrap();
-    let pinned = team_join::trust_of(&reader_cred).expect("the join pinned the trust root");
-
-    // The admin signs the enrolled devices into the member list: publish is the step that makes
-    // a joining device a member.
-    let publish = sesync::team_cli::Command::Publish { name: "personal".into() };
-    let (text, _) = sesync::team_cli::run_detailed(&publish, &base, ADMIN_TOKEN, &dir).unwrap();
-    assert!(text.contains("published list v2"), "the joins become members: {text}");
+    let writer_join = team_join::join(&base, "personal", "writer", "writer-box", &code, &dir.join("keys/writer")).unwrap();
+    let reader_join = team_join::join(&base, "personal", "reader", "reader-box", &code, &dir.join("keys/reader")).unwrap();
+    assert!(writer_join.pending && reader_join.pending, "new keys wait for the admin");
+    for (member, machine, joined) in [("writer", "writer-box", &writer_join), ("reader", "reader-box", &reader_join)] {
+        let approve = sesync::team_cli::Command::Approve {
+            name: "personal".into(), member: member.into(), machine: machine.into(),
+            fingerprint: Some(joined.fingerprint.clone()),
+        };
+        sesync::team_cli::run_detailed(&approve, &base, ADMIN_TOKEN, &dir).expect("the admin approves the device");
+    }
+    for keys in ["keys/writer", "keys/reader"] {
+        let r = team_join::check_approval(None, &dir.join(keys), "personal").unwrap();
+        assert!(matches!(r, Some(team_join::Approval::Approved { version: 3 })), "{keys}: {r:?}");
+    }
+    let writer_cred = team_join::load(&writer_join.path).unwrap();
+    let reader_cred = team_join::load(&reader_join.path).unwrap();
+    let pinned = team_join::trust_of(&reader_cred).expect("the approval pinned the trust root");
 
     // The writer catches up to the published list before sealing: records must be signed under
     // the current list version, so revocation stays meaningful.
@@ -187,14 +194,13 @@ fn two_devices_share_a_session_through_a_real_server() {
     assert_eq!(out.shown[0].text, renamed, "the reader sees the renamed session");
     assert!(out.accepted["ses_live"] > floors["ses_live"], "the floor rises to the new sequence");
 
-    // The admin revokes the writer: forget its device, then sign the next list. The reader's
-    // pull catches up to the current list on its own, and the writer's stored session is
-    // dropped and counted, never shown. A device that pinned the old list cannot be rolled
-    // back: the newer, admin-signed list is the one used.
-    let forget = sesync::team_cli::Command::Forget { name: "personal".into(), machine: "writer-box".into() };
-    sesync::team_cli::run_detailed(&forget, &base, ADMIN_TOKEN, &dir).unwrap();
-    let (text, _) = sesync::team_cli::run_detailed(&publish, &base, ADMIN_TOKEN, &dir).unwrap();
-    assert!(text.contains("published list v3"), "the revocation is signed: {text}");
+    // The admin revokes the writer: the next list, signed on the admin machine, leaves it out. The
+    // reader's pull catches up to the current list on its own, and the writer's stored session is
+    // dropped and counted, never shown. A device that pinned the old list cannot be rolled back:
+    // the newer, admin-signed list is the one used.
+    let revoke = sesync::team_cli::Command::Revoke { name: "personal".into(), member: "writer".into(), machine: "writer-box".into() };
+    let (text, _) = sesync::team_cli::run_detailed(&revoke, &base, ADMIN_TOKEN, &dir).unwrap();
+    assert!(text.contains("list v4"), "the revocation is signed: {text}");
 
     let watch = TeamWatch {
         base: base.clone(),
@@ -219,7 +225,7 @@ fn two_devices_share_a_session_through_a_real_server() {
         .env("OMP_AGENT_DIR", sandbox.join("omp"))
         .env("PI_AGENT_DIR", sandbox.join("pi"))
         .env("CLAUDE_CONFIG_DIR", sandbox.join("claude"))
-        .env("GEMINI_CLI_HOME", sandbox.join("gemini"))
+        .env("ANTIGRAVITY_CLI_HOME", sandbox.join("antigravity"))
         .env("OPENCODE_DB", sandbox.join("no-opencode").join("opencode.db"))
         .env("SESYNC_TEAM_URL", &base)
         .env("SESYNC_TEAM_TOKEN", &reader_cred.token)

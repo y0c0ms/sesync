@@ -8,12 +8,7 @@ use std::time::Instant;
 
 fn app_with_one_session(root: &PathBuf) -> App {
     // Roots are <agent>/sessions and <claude>/projects, as in the real layout.
-    let roots = Roots {
-        omp: root.join("omp").join("sessions"),
-        pi: root.join("pi").join("sessions"),
-        claude: root.join("claude").join("projects"),
-        gemini: root.join("gemini").join("tmp"),
-    };
+    let roots = Roots::under(&root, root.join("no-sesync-conv"));
     let dir = root.join("omp").join("sessions").join("proj");
     std::fs::create_dir_all(&dir).unwrap();
     let id = "11111111-2222-3333-4444-555555555555";

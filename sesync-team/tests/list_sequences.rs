@@ -5,7 +5,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use sesync_team::membership::{device_entry, Device, MemberList};
+use sesync_team::membership::{device_entry, enrol_message, Device, MemberList};
 use sesync_team::server::{self, AppState, Clock};
 use sesync_team::service::{MemoryStore, Service};
 use sesync_team::session_keys::{seal_session_bound, session_aad, DataKey};
@@ -56,9 +56,11 @@ async fn team_with_enrolled_writer(app: &axum::Router, state: &Arc<AppState<Memo
         let svc = state.service.lock().unwrap();
         code_at(&svc.space_secret(SPACE).unwrap(), T0)
     };
+    let entry = device_entry(writer);
+    let proof = writer.sign(&enrol_message(SPACE, "writer", "box-w", &code, &entry));
     let (st, j) = post_json(app, "/enrol", None, serde_json::json!({
         "space": SPACE, "member": "writer", "machine": "box-w", "code": code,
-        "device": hex(&device_entry(writer))})).await;
+        "device": hex(&entry), "proof": hex(&proof)})).await;
     assert_eq!(st, StatusCode::OK, "{j}");
     format!("Bearer {}", j["token"].as_str().unwrap())
 }

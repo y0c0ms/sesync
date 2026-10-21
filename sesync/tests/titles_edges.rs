@@ -3,7 +3,9 @@
 //! protects a name the user sees, so a regression here shows a date or a banner as a
 //! title.
 
-use sesync::titles::{clean_opencode_title, claude_title_from_lines, omp_title_from_lines};
+use sesync::harness::claude::claude_title_from_lines;
+use sesync::harness::journal::omp_title_from_lines;
+use sesync::harness::opencode::store::clean_title;
 
 #[test]
 fn default_name_with_a_bad_timestamp_is_kept_as_a_real_title() {
@@ -18,13 +20,13 @@ fn default_name_with_a_bad_timestamp_is_kept_as_a_real_title() {
         "New session - 2026-10-14T16:52:39.24xZ",  // non-digit fraction
         "New session -",                           // truncated
     ] {
-        assert_eq!(clean_opencode_title(Some(name)), name, "{name:?} must be kept");
+        assert_eq!(clean_title(name), name, "{name:?} must be kept");
     }
 }
 
 #[test]
 fn default_name_with_no_fraction_is_untitled() {
-    assert_eq!(clean_opencode_title(Some("New session - 2026-10-14T16:52:39Z")), "");
+    assert_eq!(clean_title("New session - 2026-10-14T16:52:39Z"), "");
 }
 
 #[test]

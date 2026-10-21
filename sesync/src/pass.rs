@@ -57,13 +57,15 @@ pub fn format_status(state: &State) -> String {
     let mut out = String::new();
     for key in keys {
         let src = &state.sources[key];
-        let name = if src.fmt == "opencode" { key.clone() } else { file_name(key) };
+        // A store harness's key is its session id; a file is shown by its name.
+        let shown_key = |fmt: &str, key: &str| if crate::harness::is_store(fmt) { key.to_string() } else { file_name(key) };
+        let name = shown_key(&src.fmt, key);
         out.push_str(&format!("{:<9} {}\n", src.fmt, name));
         let mut targets: Vec<&String> = src.mirrors.keys().collect();
         targets.sort();
         for t in targets {
             let m = &src.mirrors[t];
-            let shown = if t == "opencode" { m.path.clone() } else { file_name(&m.path) };
+            let shown = shown_key(t, &m.path);
             out.push_str(&format!("    -> {:<9} {}\n", t, shown));
         }
         if src.failures > 0 {

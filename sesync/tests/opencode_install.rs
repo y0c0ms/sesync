@@ -3,7 +3,7 @@
 //! Every test runs the real CLI with XDG_* pointed at a sandbox, so the real store
 //! is never written. Skipped when the CLI is not installed.
 
-use sesync::install::install_opencode;
+use sesync::harness::opencode::store::install_opencode;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -52,7 +52,7 @@ fn a_mirror_is_imported_into_the_sandbox_store_and_listed() {
     let sb = sandbox("import");
     let src = omp_journal(&sb);
     let id = "ses_installtest0000000000000000";
-    let sid = install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", id, "Install test", Some(&sb.join("xdg-env")))
+    let sid = install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", "", id, "Install test", Some(&sb.join("xdg-env")))
         .expect("install must succeed");
     assert_eq!(sid, id);
     let mut list = Command::new(&cli);
@@ -62,18 +62,30 @@ fn a_mirror_is_imported_into_the_sandbox_store_and_listed() {
     assert!(out.contains("Install test"), "the mirror must be listed by opencode: {out}");
 }
 
+#[cfg(unix)]
 #[test]
-fn a_failed_import_is_an_error() {
+fn a_refused_bundle_is_an_error_and_never_deletes_the_existing_session() {
+    // On 2026-10-21 a bundle the importer refused ("Missing key at [parentID]") cost a real
+    // session all 6926 of its messages: the delete ran first, the import failed half way. The
+    // bundle is now proven importable in a throwaway store before anything is deleted.
     let _exec = exec_guard();
     let sb = sandbox("failimport");
     let src = omp_journal(&sb);
     let fake = sb.join("fake-opencode");
-    fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = import ]; then echo 'bad bundle' >&2; exit 4; fi\nexit 0\n").unwrap();
+    let log = sb.join("oc.log");
+    fs::write(&fake, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = import ]; then echo 'bad bundle' >&2; exit 4; fi\nexit 0\n",
+        log.display()
+    )).unwrap();
     stage_exec(&fake);
-    let r = install_opencode(&fake, &sesync_conv(), &src, "/tmp", "ses_failimport00000000000000000", "t", Some(&sb.join("xdg-env")));
-    assert!(r.is_err(), "a failed import must surface as an error");
+    let r = install_opencode(&fake, &sesync_conv(), &src, "/tmp", "", "ses_failimport00000000000000000", "t", Some(&sb.join("xdg-env")));
+    let err = r.expect_err("a refused import must surface as an error");
+    assert!(err.contains("left as it is"), "{err}");
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(!calls.contains("session delete"), "the existing session must not be deleted: {calls}");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_import_that_does_not_say_imported_is_an_error() {
     let _exec = exec_guard();
@@ -84,7 +96,7 @@ fn an_import_that_does_not_say_imported_is_an_error() {
     let fake = sb.join("quiet-opencode");
     fs::write(&fake, "#!/bin/sh\necho 'something else'\nexit 0\n").unwrap();
     stage_exec(&fake);
-    let r = install_opencode(&fake, &sesync_conv(), &src, "/tmp", "ses_noline0000000000000000000", "t", Some(&sb.join("xdg-env")));
+    let r = install_opencode(&fake, &sesync_conv(), &src, "/tmp", "", "ses_noline0000000000000000000", "t", Some(&sb.join("xdg-env")));
     assert!(r.is_err(), "no 'Imported session' line means the import is not confirmed");
 }
 
@@ -96,14 +108,14 @@ fn a_reimport_replaces_the_session_content_instead_of_mixing_turns() {
     let xdg = sb.join("xdg-env");
     let src = omp_journal(&sb);
     let id = "ses_refreshtest0000000000000000";
-    install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", id, "Refresh test", Some(&xdg))
+    install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", "", id, "Refresh test", Some(&xdg))
         .expect("first install must succeed");
 
     // The same mirror id with different content. `opencode import` on its own would keep the
     // old messages (conflict-ignore); the writer must delete first so the session is replaced.
     fs::write(&src, "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"timestamp\":\"2026-10-01T10:00:00.000Z\",\"cwd\":\"/tmp/proj\"}\n\
 {\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T10:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"second version of the conversation\"}}\n").unwrap();
-    install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", id, "Refresh test", Some(&xdg))
+    install_opencode(&cli, &sesync_conv(), &src, "/tmp/proj", "", id, "Refresh test", Some(&xdg))
         .expect("re-import must succeed");
 
     let db = xdg.join("data").join("opencode").join("opencode.db");
@@ -124,6 +136,7 @@ fn a_reimport_replaces_the_session_content_instead_of_mixing_turns() {
 }
 
 /// Make a fake CLI executable. Callers hold exec_guard(), so no fork races the write.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn stage_exec(p: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;

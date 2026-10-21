@@ -20,21 +20,21 @@ fn svc() -> Service<MemoryStore> {
 fn a_machine_joins_with_a_valid_code_and_not_otherwise() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    assert!(matches!(s.join("team-alpha", "alice", "laptop-a", "000000", T0), Err(ServiceError::Auth(_))));
-    s.join("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), T0).expect("valid code joins");
+    assert!(matches!(s.enrol("team-alpha", "alice", "laptop-a", "000000", None, T0), Err(ServiceError::Auth(_))));
+    s.enrol("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).expect("valid code joins");
 }
 
 #[test]
 fn an_unknown_space_is_refused() {
     let mut s = svc();
-    assert!(matches!(s.join("nope", "alice", "laptop-a", "000000", T0), Err(ServiceError::NoSpace(_))));
+    assert!(matches!(s.enrol("nope", "alice", "laptop-a", "000000", None, T0), Err(ServiceError::NoSpace(_))));
 }
 
 #[test]
 fn a_non_member_cannot_join_a_space() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    assert!(matches!(s.join("team-alpha", "mallory", "laptop-m", &code_at(&secret_of(&s, "team-alpha"), T0), T0),
+    assert!(matches!(s.enrol("team-alpha", "mallory", "laptop-m", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0),
         Err(ServiceError::NotMember(_))));
 }
 
@@ -42,8 +42,8 @@ fn a_non_member_cannot_join_a_space() {
 fn a_turn_on_one_machine_blocks_another_through_the_service() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    s.join("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), T0).unwrap();
-    s.join("team-alpha", "alice", "laptop-b", &code_at(&secret_of(&s, "team-alpha"), T0 + 30), T0 + 30).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-b", &code_at(&secret_of(&s, "team-alpha"), T0 + 30), None, T0 + 30).map(|_| ()).unwrap();
     s.acquire("team-alpha", "ses_1", "laptop-a", T0).unwrap();
     assert!(matches!(s.acquire("team-alpha", "ses_1", "laptop-b", T0 + 1),
         Err(ServiceError::Lease(_))));
@@ -53,7 +53,7 @@ fn a_turn_on_one_machine_blocks_another_through_the_service() {
 fn a_write_needs_the_live_lease() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    s.join("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), T0).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).unwrap();
     let lease = s.acquire("team-alpha", "ses_1", "laptop-a", T0).unwrap();
     s.put_record("team-alpha", "ses_1", "laptop-a", lease.version, b"sealed bytes".to_vec(), T0).unwrap();
     s.release("team-alpha", "ses_1", "laptop-a").unwrap();
@@ -65,8 +65,8 @@ fn a_write_needs_the_live_lease() {
 fn a_stale_write_is_refused_after_takeover() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    s.join("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), T0).unwrap();
-    s.join("team-alpha", "alice", "laptop-b", &code_at(&secret_of(&s, "team-alpha"), T0 + 30), T0 + 30).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-b", &code_at(&secret_of(&s, "team-alpha"), T0 + 30), None, T0 + 30).map(|_| ()).unwrap();
     let a = s.acquire("team-alpha", "ses_1", "laptop-a", T0).unwrap();
     let after = T0 + 30 * 60;
     s.acquire("team-alpha", "ses_1", "laptop-b", after).unwrap();
@@ -78,7 +78,7 @@ fn a_stale_write_is_refused_after_takeover() {
 fn records_are_stored_sealed_and_read_back_only_by_members() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice", "bob"]).unwrap();
-    s.join("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), T0).unwrap();
+    s.enrol("team-alpha", "alice", "laptop-a", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).unwrap();
     let lease = s.acquire("team-alpha", "ses_1", "laptop-a", T0).unwrap();
     s.put_record("team-alpha", "ses_1", "laptop-a", lease.version, b"plain session".to_vec(), T0).unwrap();
     let raw = s.raw_stored("team-alpha", "ses_1").unwrap();
@@ -101,7 +101,7 @@ fn a_machine_writes_as_the_member_who_joined_on_it() {
     // that member, never as a name guessed from the machine's label.
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
-    s.join("team-alpha", "alice", "box-1", &code_at(&secret_of(&s, "team-alpha"), T0), T0).unwrap();
+    s.enrol("team-alpha", "alice", "box-1", &code_at(&secret_of(&s, "team-alpha"), T0), None, T0).map(|_| ()).unwrap();
     let lease = s.acquire("team-alpha", "ses_9", "box-1", T0).unwrap();
     s.put_record("team-alpha", "ses_9", "box-1", lease.version, b"owned by alice".to_vec(), T0)
         .expect("the registered member may write");
@@ -123,7 +123,7 @@ fn http_enrol_and_acquire_return_the_right_status_codes() {
     let mut s = svc();
     s.create_space("team-alpha", &["alice"]).unwrap();
     let good = EnrolBody { space: "team-alpha".into(), member: "alice".into(), machine: "box-1".into(),
-                           code: code_at(&secret_of(&s, "team-alpha"), T0), device: None };
+                           code: code_at(&secret_of(&s, "team-alpha"), T0), device: None, proof: None };
     let (status, json) = enrol(&mut s, &good, T0);
     assert_eq!(status, 200);
     let header = format!("Bearer {}", json["token"].as_str().unwrap());

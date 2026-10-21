@@ -16,10 +16,12 @@ fn startup_gives_up_after_its_attempts_when_nothing_listens() {
 
 #[test]
 fn a_single_attempt_is_not_retried() {
+    // A retry would sleep the full 30 s wait. A refused connect alone can take about 2 s on
+    // Windows (it retries the SYN), so the bound sits between the two, not at the connect time.
     let started = Instant::now();
-    let r = PgStore::connect_with_retry("postgres://u:p@127.0.0.1:1/db", [0u8; 32], 1, Duration::from_secs(5));
+    let r = PgStore::connect_with_retry("postgres://u:p@127.0.0.1:1/db", [0u8; 32], 1, Duration::from_secs(30));
     assert!(r.is_err());
-    assert!(started.elapsed() < Duration::from_secs(2), "one attempt does not sleep");
+    assert!(started.elapsed() < Duration::from_secs(15), "one attempt does not sleep");
 }
 
 #[test]

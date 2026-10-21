@@ -19,12 +19,7 @@ fn app() -> App {
     std::fs::create_dir_all(d.join("pi")).unwrap();
     std::fs::create_dir_all(d.join("claude")).unwrap();
     App::new(
-        sesync::manage::Roots {
-            omp: d.join("omp").join("sessions"),
-            pi: d.join("pi"),
-            claude: d.join("claude"),
-            gemini: d.join("gemini"),
-        },
+        sesync::manage::Roots::under(&d, d.join("no-sesync-conv")),
         sesync::state::State::default(),
         d.join("locks"),
         d.join("no-sesync_lock"),
@@ -156,10 +151,10 @@ fn esc_closes_the_dialog_without_a_request() {
 fn the_register_dialog_asks_for_the_admin_fields() {
     let a = open_register();
     let text = screen(&a, 110, 26);
-    for field in ["team", "members", "admin token file"] {
+    for field in ["team", "members", "admin token file", "server url"] {
         assert!(text.contains(field), "the dialog asks for '{field}':\n{text}");
     }
-    assert!(text.contains("shown once and cannot be read back"), "the QR warning is shown:\n{text}");
+    assert!(text.contains("a QR code for your authenticator app, shown only once"), "the QR warning is shown:\n{text}");
 }
 
 #[test]
@@ -173,7 +168,7 @@ fn the_dialog_can_be_prefilled_by_the_caller() {
 #[test]
 fn a_completed_register_hands_the_request_to_the_caller() {
     let mut a = open_register();
-    for (i, v) in ["main", "laptop, pixel", "/tmp/admin-token"].iter().enumerate() {
+    for (i, v) in ["main", "laptop, pixel", "/tmp/admin-token", "http://team.test:30500"].iter().enumerate() {
         if i > 0 {
             a.handle(Ev::Tab, Instant::now());
         }
@@ -184,6 +179,7 @@ fn a_completed_register_hands_the_request_to_the_caller() {
     assert_eq!(req.kind, Kind::Register);
     assert_eq!(req.value_of("team"), "main");
     assert_eq!(req.value_of("members"), "laptop, pixel");
+    assert_eq!(req.value_of("server url"), "http://team.test:30500");
 }
 
 #[test]

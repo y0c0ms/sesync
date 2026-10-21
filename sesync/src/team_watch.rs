@@ -1,6 +1,6 @@
 //! The team side of `--watch`: when a team is configured, each pass also pulls and verifies the
-//! team's sealed records for display. It is off unless the environment names a team server and a
-//! device, so an install without a team behaves exactly as before.
+//! team's sealed records for display. It is off unless a joined team credential or the
+//! environment names a team, so an install without a team behaves exactly as before.
 
 use std::collections::BTreeMap;
 
@@ -115,92 +115,74 @@ fn fresh_if_newer(pinned: &Trust, signed_list: Vec<u8>, version: u64) -> Option<
     if version >= pinned.version().ok()? { Some(fresh) } else { None }
 }
 
-/// Whatever the environment did not name, take from the credential on disk — but only when
-/// there is exactly one, so there is no question of which team this machine belongs to.
-fn fill_from_credential(
-    config_dir: &std::path::Path,
-    token: Option<String>,
-    machine: Option<String>,
-    space: Option<String>,
-) -> Option<(String, String, String, Option<Trust>)> {
-    use crate::team_join;
-    let space = space.or_else(|| single_team(config_dir))?;
-    let path = team_join::credential_path(config_dir, &space);
-    let cred = team_join::load(&path).ok();
-    let token = token.or_else(|| cred.as_ref().map(|c| c.token.clone()))?;
-    let machine = machine.or_else(|| cred.as_ref().map(|c| c.machine.clone()))?;
-    let trust = cred.as_ref().and_then(team_join::trust_of);
-    if token.is_empty() || machine.is_empty() { return None; }
-    Some((token, machine, space, trust))
-}
-
-/// Every team this machine belongs to. The server is named by `SESYNC_TEAM_URL`; a credential
-/// under the configuration directory names each team's space, and a token and machine may come
-/// from the environment instead when there is exactly one team. `SESYNC_TEAM_SPACE` narrows
+/// Every team this machine belongs to. A credential under the configuration directory names each
+/// team's space and the server it was joined on; `SESYNC_TEAM_URL` serves credentials written
+/// before the server was recorded, and a team configured only by the environment. A token and
+/// machine may come from the environment instead when there is exactly one team (or the space is
+/// named with them); the environment's server then goes with them. `SESYNC_TEAM_SPACE` narrows
 /// everything to that one team (the pre-multi-team behaviour). Sorted by space.
 pub fn teams_from_env(config_dir: &std::path::Path) -> Vec<TeamWatch> {
-    let Ok(base) = std::env::var("SESYNC_TEAM_URL") else { return Vec::new() };
+    use crate::team_join;
+    let env_base = std::env::var("SESYNC_TEAM_URL").ok();
     let token = std::env::var("SESYNC_TEAM_TOKEN").ok();
     let machine = std::env::var("SESYNC_TEAM_MACHINE").ok();
     let named = std::env::var("SESYNC_TEAM_SPACE").ok();
-    let named_space = named.clone();
-    let mut spaces: Vec<String> = match named {
-        Some(s) => vec![s],
+    let mut spaces: Vec<String> = match &named {
+        Some(s) => vec![s.clone()],
         None => all_teams(config_dir),
     };
     // No credential at all: the environment may still name one team entirely.
     if spaces.is_empty() {
-        if let (Some(t), Some(m)) = (token.clone(), machine.clone()) {
+        if let (Some(base), Some(t), Some(m)) = (env_base, token, machine) {
             let Ok(device) = load_or_create(config_dir) else { return Vec::new() };
             return vec![TeamWatch { base, token: t, machine: m, space: String::new(), device, trust: None }];
         }
         return Vec::new();
     }
-    let multi = spaces.len() > 1;
+    // Environment token/machine apply only when they cannot be ambiguous (one team) or when they
+    // were named together with the space.
+    let env_applies = spaces.len() == 1 || named.is_some();
     spaces.sort();
     spaces.dedup();
     spaces.into_iter().filter_map(|space| {
-        let Some(device) = load_or_create(config_dir).ok() else { return None };
-        // Environment token/machine apply only when they cannot be ambiguous (one team) or
-        // when they were named together with the space.
-        let (token, machine, trust) = if multi && named_space.is_none() {
-            let cred = crate::team_join::load(&crate::team_join::credential_path(config_dir, &space)).ok()?;
-            (cred.token.clone(), cred.machine.clone(), crate::team_join::trust_of(&cred))
-        } else {
-            let (t, m, _s, trust) = fill_from_credential(config_dir, token.clone(), machine.clone(), Some(space.clone()))?;
-            (t, m, trust)
-        };
+        let cred = team_join::load(&team_join::credential_path(config_dir, &space)).ok();
+        // A join still waiting for the admin has nothing to pull or push yet: every data route
+        // refuses it. `team_join::check_approval` turns it into a working team once approved.
+        if cred.as_ref().map_or(false, team_join::is_waiting) {
+            return None;
+        }
+        let env_token = token.clone().filter(|_| env_applies);
+        // An environment token goes with the environment's server; a credential's own token goes
+        // with the server it was joined on.
+        let joined_on = cred.as_ref().and_then(|c| c.server.clone());
+        let base = if env_token.is_some() { env_base.clone().or(joined_on) } else { joined_on.or_else(|| env_base.clone()) }?;
+        let token = env_token.or_else(|| cred.as_ref().map(|c| c.token.clone()))?;
+        let machine = machine.clone().filter(|_| env_applies).or_else(|| cred.as_ref().map(|c| c.machine.clone()))?;
         if token.is_empty() || machine.is_empty() { return None; }
-        Some(TeamWatch { base: base.clone(), token, machine, space, device, trust })
+        let device = load_or_create(config_dir).ok()?;
+        let trust = cred.as_ref().and_then(team_join::trust_of);
+        Some(TeamWatch { base, token, machine, space, device, trust })
     }).collect()
 }
 
-/// Every credential under the configuration directory, as space names.
+/// Every credential under the configuration directory, as space names (the file names decoded,
+/// see `team_join::file_stem_of`).
 pub fn all_teams(config_dir: &std::path::Path) -> Vec<String> {
     let dir = config_dir.join("teams");
     let mut out: Vec<String> = std::fs::read_dir(dir).ok().into_iter().flatten()
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.extension()? == "cred" { p.file_stem().map(|s| s.to_string_lossy().to_string()) } else { None }
+            if p.extension()? == "cred" {
+                p.file_stem().map(|s| crate::team_join::space_of_file_stem(&s.to_string_lossy()))
+            } else {
+                None
+            }
         })
         .collect();
     out.sort();
     out.dedup();
     out
-}
-
-/// The only team credential on disk, or None when there is none or more than one.
-fn single_team(config_dir: &std::path::Path) -> Option<String> {
-    let dir = config_dir.join("teams");
-    let entries: Vec<String> = std::fs::read_dir(dir).ok()?
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension()? == "cred" { p.file_stem().map(|s| s.to_string_lossy().to_string()) } else { None }
-        })
-        .collect();
-    if entries.len() == 1 { entries.into_iter().next() } else { None }
 }
 
 /// The team server's record listing and fetch, over HTTP.

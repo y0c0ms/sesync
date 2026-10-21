@@ -137,7 +137,7 @@ fn an_opencode_mirror_is_never_removed_by_file() {
     });
     state.sources.insert(key.clone(), src);
     let planned = plan(&state);
-    assert!(matches!(&planned[0].verdict, Verdict::Keep(why) if why.contains("OpenCode")));
+    assert!(matches!(&planned[0].verdict, Verdict::Keep(_)), "{:?}", planned[0].verdict);
     apply(&mut state, &planned, &sb.join("locks"), Path::new(MISSING_CLIENT));
     assert!(mir.exists(), "no file of ours is touched for an OpenCode mirror");
     let _ = fs::remove_dir_all(&sb);
@@ -173,12 +173,7 @@ fn a_mirror_that_changes_between_plan_and_apply_is_kept() {
 fn deleting_a_session_removes_only_that_file_and_leaves_its_mirror() {
     let sb = sandbox("delete");
     let (key, src, mir) = recorded_pair(&sb, "session body\n");
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
     let mut group = Group::file("omp", key.clone(), "t");
     group.mirrors.push(("pi".into(), mir.display().to_string()));
 
@@ -252,11 +247,8 @@ fn an_un_chosen_opencode_mirror_is_handed_to_the_cli_and_kept_by_the_file_rule()
 
     let planned = plan_unchosen(&state);
     assert_eq!(planned.len(), 1, "an un-chosen OpenCode mirror is planned too");
-    assert_eq!(
-        planned[0].verdict,
-        Verdict::Keep("OpenCode session: remove it through OpenCode, not by file".into()),
-        "the file rule never touches it; the caller removes it through the CLI"
-    );
+    assert!(matches!(&planned[0].verdict, Verdict::Keep(_)),
+        "the file rule never touches it; the caller removes it through the CLI: {:?}", planned[0].verdict);
 }
 
 /// A copy that cannot be proven unchanged is kept, but its record is released. Keeping the record

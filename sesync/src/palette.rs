@@ -18,6 +18,8 @@ pub enum Action {
     Theme,
     Enroll,
     Register,
+    Invite,
+    Members,
 }
 
 struct Def {
@@ -40,6 +42,8 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::Theme, title: "Colour scheme", key: "ctrl+t", event: Ev::Theme },
     Def { action: Action::Enroll, title: "Join a team", key: "", event: Ev::OpenEnroll },
     Def { action: Action::Register, title: "Start a team", key: "", event: Ev::OpenRegister },
+    Def { action: Action::Members, title: "Team members", key: "", event: Ev::OpenMembers },
+    Def { action: Action::Invite, title: "Invite a member", key: "", event: Ev::OpenInvite },
 ];
 
 /// What a command can see when deciding whether it may run.
@@ -51,6 +55,11 @@ pub struct Ctx {
     pub session_shared: bool,
     pub team_selected: bool,
     pub team_configured: bool,
+    /// Whether there is a team the admin dialogs can work on: one this machine created, or one
+    /// it joined.
+    pub team_to_manage: bool,
+    /// Whether this machine holds the team's admin key.
+    pub admin: bool,
 }
 
 /// Ok, or the reason the action cannot run right now, shown beside it in the list.
@@ -83,6 +92,13 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
                 Err("no team server configured")
             }
         }
+        Action::Invite | Action::Members => if !ctx.admin {
+            Err("only the machine that started the team can do this")
+        } else if !ctx.team_to_manage {
+            Err("no team to manage here; start one first")
+        } else {
+            Ok(())
+        },
         Action::SwitchView | Action::Quit | Action::Theme | Action::Enroll | Action::Register => Ok(()),
     }
 }

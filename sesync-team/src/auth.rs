@@ -19,6 +19,16 @@ pub fn issue_token(key: &[u8; 32], member: &str, machine: &str, expires_at: u64)
     format!("{body}|{}", sign(key, &body))
 }
 
+/// The expiry a token carries, read without checking its signature. For the holder only, to
+/// renew ahead of time; the server never trusts this value without `check_token`.
+pub fn expiry_of(token: &str) -> Option<u64> {
+    let parts: Vec<&str> = token.split('|').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    parts[2].parse().ok()
+}
+
 /// Check a token's signature and machine, ignoring its expiry. Used only for renewal: a token
 /// that expired a few minutes ago still proves the machine holds it, and the renewal checks the
 /// enrolment window separately. Never use this to grant access on its own.

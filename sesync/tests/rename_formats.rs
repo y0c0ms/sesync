@@ -17,12 +17,7 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn roots(sb: &PathBuf) -> Roots {
-    Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    }
+    Roots::under(&sb, sb.join("no-sesync-conv"))
 }
 
 fn do_rename(sb: &PathBuf, r: &Roots, g: &Group, title: &str) -> Result<String, String> {
@@ -33,7 +28,7 @@ fn do_rename(sb: &PathBuf, r: &Roots, g: &Group, title: &str) -> Result<String, 
 fn claude_rename_appends_a_custom_title_record_and_keeps_the_transcript() {
     let sb = sandbox("claude");
     let r = roots(&sb);
-    let dir = r.claude.join("-tmp-proj");
+    let dir = r.locations.sessions_dir("claude").join("-tmp-proj");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{CID}.jsonl"));
     let original = format!("{}\n{}\n",
@@ -55,7 +50,7 @@ fn claude_rename_appends_a_custom_title_record_and_keeps_the_transcript() {
 fn pi_rename_appends_a_session_info_name_and_keeps_history() {
     let sb = sandbox("pi");
     let r = roots(&sb);
-    let dir = r.pi.join("-tmp-proj");
+    let dir = r.locations.sessions_dir("pi").join("-tmp-proj");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("2026-10-01T10-00-00-000Z_{CID}.jsonl"));
     let original = "{\"type\":\"session\",\"id\":\"x\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"keep\"}}\n";
@@ -77,7 +72,7 @@ fn a_rename_that_changes_nothing_is_an_error() {
     // success. The new title must be visible in the file, or the rename fails.
     let sb = sandbox("noop");
     let r = roots(&sb);
-    let dir = r.claude.join("-tmp-proj");
+    let dir = r.locations.sessions_dir("claude").join("-tmp-proj");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("{CID}.jsonl"));
     fs::write(&p, format!("{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"{CID}\",\"message\":{{\"role\":\"user\",\"content\":\"x\"}}}}\n")).unwrap();

@@ -18,6 +18,6 @@ fn an_invited_member_enrols_after_the_admin_creates_the_team() {
     s.create_space("personal", &["admin-box"]).unwrap();
     s.invite("personal", "member-box").unwrap();
     let code = code_at(&s.space_secret("personal").unwrap(), T0);
-    assert!(s.enrol("personal", "member-box", "member-box-2", &code, T0).is_ok(), "the invited member enrols");
-    assert!(s.enrol("personal", "stranger", "box-x", &code, T0).is_err(), "a non-member does not");
+    assert!(s.enrol("personal", "member-box", "member-box-2", &code, None, T0).is_ok(), "the invited member enrols");
+    assert!(s.enrol("personal", "stranger", "box-x", &code, None, T0).is_err(), "a non-member does not");
 }

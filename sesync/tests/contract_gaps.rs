@@ -3,9 +3,8 @@
 //! rule, the O-penCode no-database fast path, and the to-opencode converter guard. Each
 //! checks a behaviour a user or a harness relies on.
 
-use sesync::install::install_opencode;
+use sesync::harness::opencode::store::{clean_title, install_opencode, sessions};
 use sesync::lock::holder_of;
-use sesync::opencode::{clean_title, sessions};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,7 +31,7 @@ fn sesync_lock() -> PathBuf {
         assert!(out.status.success(), "building sesync_lock failed:
 {}",
                 String::from_utf8_lossy(&out.stderr));
-        lock_dir.join("target").join("debug").join("sesync-lock")
+        lock_dir.join("target").join("debug").join(format!("sesync-lock{}", std::env::consts::EXE_SUFFIX))
     }).clone()
 }
 
@@ -84,6 +83,7 @@ fn a_missing_opencode_database_is_an_empty_list_and_is_not_created() {
     assert!(!db.exists(), "reading a missing store must not create it");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_to_opencode_conversion_is_an_error_and_nothing_is_imported() {
     let _exec = exec_guard();
@@ -99,13 +99,14 @@ fn a_failed_to_opencode_conversion_is_an_error_and_nothing_is_imported() {
     for p in [&fake_sesync_conv, &fake_oc] {
         stage_exec(p);
     }
-    let r = install_opencode(&fake_oc, &fake_sesync_conv, &src, "/", "ses_convfail00000000000000000", "t", Some(&sb.join("xdg")));
+    let r = install_opencode(&fake_oc, &fake_sesync_conv, &src, "/", "", "ses_convfail00000000000000000", "t", Some(&sb.join("xdg")));
     let err = r.expect_err("a failed conversion must be an error");
     assert!(err.contains("to-opencode failed"), "the guard must be what stops it: {err}");
     assert!(!marker.exists(), "import must not run when the conversion failed");
 }
 
 /// Make a fake CLI executable. Callers hold exec_guard(), so no fork races the write.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn stage_exec(p: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;

@@ -106,14 +106,10 @@ fn claude_resume_picker_shows_the_renamed_title() {
     ].join("\n") + "\n").unwrap();
 
     // Rename through the daemon's own path.
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: cfg.join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    fs::create_dir_all(&roots.omp).unwrap();
-    fs::create_dir_all(&roots.pi).unwrap();
+    let mut roots = Roots::under(&sb, sb.join("no-sesync-conv"));
+    roots.locations.set("claude", sesync::harness::Location { root: cfg.clone(), cli: None });
+    fs::create_dir_all(&roots.locations.sessions_dir("omp")).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("pi")).unwrap();
     let group = Group::file("claude", transcript.display().to_string(), "Old generated name");
     rename_group(&roots, &group, "Renamed for resume", &sb.join("locks"), &sb.join("no-sesync_lock"))
         .expect("the daemon's rename must succeed");

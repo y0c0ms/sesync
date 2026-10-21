@@ -18,7 +18,7 @@ fn setup() -> (Service<TestStore>, Faults, String) {
     let mut s = Service::new(TestStore::with_faults(faults.clone()));
     s.create_space("team-a", &["alice"]).unwrap();
     let code = code_at(&s.space_secret("team-a").unwrap(), T0);
-    let token = s.enrol("team-a", "alice", "box-1", &code, T0).unwrap();
+    let token = s.enrol("team-a", "alice", "box-1", &code, None, T0).map(|a| a.token().to_string()).unwrap();
     (s, faults, format!("Bearer {token}"))
 }
 
@@ -43,7 +43,7 @@ fn a_lease_during_an_outage_is_503_not_403_or_404() {
 fn a_join_during_an_outage_is_503_not_a_wrong_code() {
     let (mut s, faults, _) = setup();
     faults.database_down.set(true);
-    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-2".into(), code: "000000".into(), device: None };
+    let body = EnrolBody { space: "team-a".into(), member: "alice".into(), machine: "box-2".into(), code: "000000".into(), device: None, proof: None };
     let (status, _) = http::enrol(&mut s, &body, T0);
     assert_eq!(status, 503, "a join during an outage is unavailable, not a refused code");
 }

@@ -3,6 +3,156 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-21: one module per harness
+
+- **Why.** What sesync knew about each harness was spread over a dozen places (discovery,
+  titles, install, buckets, prompts, `mirror_write`, `scan`, `manage`, `team_sync`, the daemon's
+  scan and cleanup, the TUI's target probe), so adding or removing a harness meant edits in all of
+  them.
+- **Now.** `sesync/src/harness/` holds the `Harness` trait, the registry (`ALL`, `get`), one
+  module per harness (`omp`, `pi`, `claude/`, `opencode/` with its store and rename,
+  `antigravity/` with its store), the shared JSONL helpers (`journal`) and `RETIRED`. The daemon,
+  the TUI, mirror writes, cleanup, turn-taking and the team push go through the trait; outside
+  `harness/` no production code names a harness. `Roots` and `Stores` carry one `Locations`;
+  `retire_gemini` became `retire_harnesses` over `RETIRED`. OpenCode's two default-title rules
+  are one now (the stricter one its tests define). `sesync mirrors` now gives a database copy's
+  keep reason as "opencode keeps this session in its own store: remove it through opencode".
+- **Checked.** On a copy of the crate, deleting `harness/opencode/` and adding a throwaway
+  harness (one file, two lines in `harness/mod.rs`) compiled with no other change, and its
+  daemon mirrored an omp session into the new harness and recorded the copy.
+- **Suites** (Windows, sandboxed): `sesync` 572 passed, `sesync-team` 196, `sesync-conv` 74,
+  `sesync-lock` 19; 0 failed in each.
+- **Open.** `harness::claude::compaction` has had no caller since conversion moved to
+  `sesync-conv from-claude` (dead before this change too): remove it or wire it.
+
+## 2026-10-21: TUI shows per-copy sync state; team setup done entirely in the TUI
+
+- **Bugs fixed.** (1) A title starting with U+2696 + U+FE0F (an emoji presentation: two cells in one terminal,
+  one in another) shifted every later column and left stale characters on screen: session text
+  goes through `display_safe` and the finished frame is scrubbed (`ui::scrub_unsafe_glyphs`), so
+  no such glyph is sent; widths come from `unicode-width`, the table ratatui places glyphs with.
+  (2) The harness column is 8 cells for every label (`agy` for Antigravity), and the list's 2-cell
+  cursor gutter is counted, so UPDATED is no longer clipped. (3) A missing session shows its
+  recorded name, else `untitled`, with `(missing)`; never a file name or a store id.
+- **Sync state.** The daemon records each chosen copy's last good write and last failure
+  (`Source.sync`); `settle_sync_records` prunes un-chosen copies every pass and backfills the
+  write time of file copies made before the record existed (an OpenCode copy waits for its next
+  write). MIRRORS marks `?` unwritten, `~` busy (in
+  use, retried by itself), `!` failed; SYNCED is the oldest good write, `ok`, `waiting` or
+  `failing`. Columns drop on narrow panes in the order TEAM, UPDATED, MIRRORS, SYNCED. At 120
+  columns a details pane gives each copy's time or error. The tab bar shows the daemon's last pass
+  and copy counts. The mouse selects, scrolls and double-clicks.
+- **Team in the TUI.** "Start a team" takes the server in the form (no environment needed) and
+  shows the QR full screen, ECC Low on the URI without its default parameters (version 5 for a
+  typical name): an 80x24 terminal holds it, with a 4-module quiet zone when there is room and 2
+  when that is what fits. Black on white; with `NO_COLOR` the light modules are painted instead,
+  which keeps the right polarity on a dark terminal. A team started here is remembered
+  (`<config>/admin/teams.json`), so "Team members" and "Invite a member" work before the machine
+  joins it. The members dialog approves (two presses, fingerprint shown), refuses, revokes and
+  removes. The Team tab shows per team whether this machine is listed or waiting (with its
+  fingerprint). Network calls run on worker threads. Em dashes are gone from the UI text.
+- **Checked live** (WezTerm, sandboxed stores, a throwaway in-memory team server on 127.0.0.1):
+  the QR screenshot decodes with jsQR in strict standard polarity to the URI whose secret is the
+  key on screen; a TOTP code computed from the scanned secret let a second machine join (pending,
+  fingerprint shown); the admin's members dialog showed that same fingerprint and approved it;
+  the member's daemon then reported the approval and synced. The operator confirmed the QR renders
+  well.
+- **Suites** (Windows, sandboxed): `sesync` 568 passed, 0 failed; `sesync-team` 196 passed, 0
+  failed.
+- **Open.** The daemon status is the state file's age, so a TUI save also refreshes it. Long
+  status messages are cut at the terminal's width.
+
+## 2026-10-21: team revocation sticks; only the admin admits
+
+- **Why.** `team publish` signed every enrolled device, so a forgotten device re-joined with the
+  shared code and was signed back in; `/enrol` handed the signed list to any code holder and let
+  one replace a listed machine's key; `save_owner` ran before the code was checked.
+- **Now** (contract: ARCHITECTURE.md "Team membership and revocation"). A new key gets 202
+  pending, a token that opens nothing, the admin key and its fingerprint, and no list; a listed
+  key bound to that machine re-authenticates; a new key under a listed machine's name gets 409
+  and changes nothing; a revoked or declined key gets 403 at every join; a removed member is
+  refused until invited again. Requests: 3 per member, 20 per team, 7-day expiry. Storing a list
+  tombstones and unbinds dropped keys and binds approved requests. New admin routes
+  `/admin/roster`, `/admin/decline`; `/admin/devices` and `/admin/forget` are gone. CLI:
+  `team roster|approve|decline|revoke|remove` (each builds v+1 from the list it verified with
+  the admin key); `publish` and `forget` are gone. The daemon and the TUI pick up an approval on
+  their own and log "waiting for the admin" once per team per run. Postgres gains `requests` and
+  `tombstones` (created by `migrate`). An existing team's unlisted bindings become requests on
+  first use; nobody re-scans the QR. `membership::Join`/`admit`/`is_member_at` and the join
+  window were test-only and are removed.
+- **Suites** (Windows, sandboxed): `sesync-team` 195 passed, 0 failed (Postgres tests skipped:
+  no `TEAM_TEST_PG`); `sesync` 538 passed, 0 failed (live team-server tests skipped).
+- **Not deployed.** The team server and clients must be upgraded together: an old client reads
+  a 202 as a join and saves a credential with no list, and an old client's join (unsigned) is
+  refused with "upgrade the client" by a team that has an admin key.
+- **Join proves the device key** (closed the same day). A join carries the device's Ed25519
+  signature over `membership::enrol_message` (space, member, machine, code, entry), checked
+  against the entry's signing key before the code, so a member who knows a listed machine's
+  name and public entry gets 403 and no token, and a forged attempt spends no code
+  (`device_binding::a_join_must_prove_it_holds_the_device_key`).
+
+## 2026-10-21: sync/mirror audit after a live loop destroyed an OpenCode session
+
+- **Incident.** With the 15e70f4 build the daemon promoted a Gemini copy of the "Record"
+  conversation (its state record had fallen behind, no one answered), demoted the OpenCode source,
+  re-adopted that source from disk in the same pass, and then promoted the copy every pass. Each
+  pass ran `opencode session delete` on the real source and an import that failed (`Missing key
+  at [parentID]`): 6926 messages lost. The OpenCode WAL showed 46 deletions, 44 of them on
+  10-19 by the older build. Recovery from the WAL got 4409 messages, every part over about 4 KB
+  lost; the original omp journal held the whole conversation, so it was restored as the source
+  (copies backed up in `~/.local/share/sesync/recovery-20261021T134600/`).
+- **Fixed** (each with a test): a source moves only on a user prompt newer than every prompt of
+  the source (`prompts.rs`; renames, resume bookkeeping and stale records no longer promote);
+  tangles collapse before detection; the daemon adopts from disk only keys it never held
+  (`State::seen_keys`) and the TUI saves only entries it created; recorded copies (OpenCode ids
+  included) are never sources in the scan or the list; bytes sesync did not write are archived
+  and verified before any replace (`preserve_foreign`, `keep_before_replace`), the demoted source
+  is recorded as not sesync's and replaced in place under its own id; an OpenCode replace is
+  proven in a throwaway store first, deletes where the store keeps the session, imports in the
+  conversation's directory; un-choosing OpenCode deletes only a provably unchanged copy and
+  releases the rest; an empty conversation never replaces a copy; `to-opencode` gives an
+  assistant-first conversation a `msg_` parent; every copy id is aliased to the conversation's
+  lock name (`lock::write_alias`) and every write claims that name.
+- **Team audit** (16 defects, `tests/team_lifecycle_e2e.rs` on an in-process server): otpauth
+  label encoding, QR one column per module with the setup key shown, create validated before the
+  name is taken, names with `|` refused, a per-member join lock, explicit join errors, re-join
+  restarts the renewal window, automatic token renewal in the daemon and the TUI, encoded push
+  query and credential file names, the credential records its server, one damaged credential no
+  longer stops other teams, team poll backoff per team, codes typed as "123 456", forgetting an
+  unknown machine is an error. Open decision: a forgotten device can re-join and the next
+  `publish` signs it back in (secret never rotated, no remove-member, publish lists nothing).
+- **Windows test suite** compiles again: Unix-only shell fakes gated with `cfg(unix)`,
+  `sesync-lock` paths use the platform exe suffix, JSON-escaped Windows paths in fixtures.
+- **Docs**: ARCHITECTURE.md gains "How the main logic works" (mermaid, harnesses as X/Y/Z);
+  AGENTS.md invariants 15 to 18.
+
+## 2026-10-21: Antigravity CLI replaces Gemini CLI in the sesync crate
+
+- **Harness `antigravity`** (agy 1.4.4) is a source and a target. Store
+  `$ANTIGRAVITY_CLI_HOME` (default `~/.gemini/antigravity-cli`), conversations
+  `conversations/<id>.db`. Targets: `sesync-conv to-antigravity` (`install::install_antigravity`;
+  "in use" while agy holds the file is a retry). Sources: `sesync-conv from-antigravity` in
+  `sync_chosen` and `team_sync::Canonical::Antigravity`. Offered in the picker when agy is
+  installed (`AGY_BIN`, else `%LOCALAPPDATA%\agy\bin\agy.exe`, else PATH); sesync never runs it.
+- **WAL-aware copies**: `mirror::copy_files/copy_hash/copy_stamp/copy_mtime/remove_copy` cover
+  `<id>.db` + `<id>.db-wal` in the scan, turn-taking, `preserve_foreign` and cleanup.
+  `antigravity::newest_prompt` reads the newest USER_INPUT step; `antigravity::read_only` never
+  leaves `-wal`/`-shm` beside agy's file. Titles: annotations, else agy's cached summary title;
+  TUI rename runs `antigravity-retitle` (exit 2 = "applies when agy restarts").
+- **Gemini retired**: every Gemini code path and test is gone from the sesync crate.
+  `State::retire_harness("gemini", exists)` runs at load and every merge (daemon, `sesync
+  mirrors`, TUI): Gemini sources move to their best surviving copy (omp, Pi, Claude, OpenCode,
+  Antigravity), keeping conv/title/shares; Gemini choices and copies are released; no Gemini
+  file is touched. The Gemini converters (`from-gemini`, `to-gemini`) are removed from sesync-conv.
+- **Suite** (Windows, sandboxed HOME, without team_cli/team_join/team_sync/device_keys):
+  480 passed, 0 failed. New: `tests/antigravity_target.rs` (7, real converter),
+  `tests/retire_gemini.rs` (7), discovery and unit tests.
+- **E2E** (research sandbox, local mock): `sesync --once` mirrored an omp journal into the agy
+  store, agy resumed it with the history replayed, the agy follow-up promoted the agy copy and
+  rewrote omp, and a conversation agy created itself mirrored into omp.
+- **Open**: no agy lock hook (agy turns are not excluded by the lock, only by the converter's
+  in-use refusal); `from-*` converters print their output path on the daemon's stdout.
+
 ## 2026-10-18 (late evening) — TUI quality-of-life batch (same branch)
 
 - Operator approved the QoL list from the TUI audit; all items implemented except the mouse
@@ -503,14 +653,11 @@ tests win, and you fix this file. Update it at the end of every work session.
 
 ## Next action
 
-1. Operator: restart any running TUI (`q`, then `sesync --tui`) — everything above (the QoL
-   batch) is only in the 19:51 binary; the title/tool-id fixes are in the 18:43 one. Reopen the
-   `tileCoder35b` session in Claude to re-read the healed mirror (tool calls now render).
-   Restart opencode too, its config now
-   pins the subagents to `opencode/deepseek-v4.1-flash-free`.
-2. Operator decisions still open: commit split of the uncommitted tree (now including the
-   Gemini wiring), `sesync.service` enablement, plaintext route removal, lockstep client
-   update on the other machines.
-3. Optional follow-up: Antigravity (`~/.gemini/antigravity-cli/conversations/<uuid>.db`,
-   SQLite) as another target; its format is documented in session-migrate's
-   `docs/antigravity-format.md`.
+1. Operator: relaunch any running TUI so it picks up the 2026-10-21 binaries.
+2. Operator decisions still open: how revocation stays revoked (rotate the authenticator
+   secret on removal, a remove-member route, or a `publish` that lists the devices it signs);
+   the commit/PR split of the 2026-10-21 work; `sesync.service` enablement; plaintext route
+   removal; lockstep client update on the other machines.
+3. Optional follow-up: an agy lock hook (agy turns are excluded only by the converter's
+   in-use refusal and the archive), and reading Antigravity App conversations
+   (`~/.gemini/antigravity/conversations/*.db`, same format) as sources.

@@ -10,6 +10,8 @@ pub enum Kind {
     /// `sesync team create`: team name, optional member list, and the path to the admin token
     /// file. Never the token itself.
     Register,
+    /// `sesync team invite`: the server, the team, the member to add, and the admin token file.
+    Invite,
 }
 
 pub struct Field {
@@ -33,7 +35,10 @@ impl Form {
                 ("server url"), ("team"), ("member"), ("machine"), ("code"),
             ],
             Kind::Register => vec![
-                ("team"), ("members"), ("admin token file"),
+                ("team"), ("members"), ("admin token file"), ("server url"),
+            ],
+            Kind::Invite => vec![
+                ("server url"), ("team"), ("member"), ("admin token file"),
             ],
         };
         let mut form = Form {
@@ -58,6 +63,7 @@ impl Form {
         match kind {
             Kind::Enroll => true,
             Kind::Register => name != "members", // members is optional
+            Kind::Invite => true,
         }
     }
 

@@ -13,6 +13,9 @@ ring = "0.17"
 crypto_box = { version = "0.9", features = ["seal"] }
 sesync-team = { path = "../sesync-team", version = "0.1.0" }
 ratatui = "0.30"
+# The width table ratatui itself places glyphs with (already in the lock file through ratatui),
+# so the list's columns are cut and padded by the same widths the terminal frame uses.
+unicode-width = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 crossterm = "0.29"
 sha2 = "0.10"
@@ -23,3 +26,7 @@ qrcodegen = "1"
 [dev-dependencies]
 proptest = "1"
 postgres = "0.19"
+# The client end-to-end tests run the real team-server router in-process over a TCP socket.
+# Both are already in the lock file through sesync-team.
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+axum = "0.7"

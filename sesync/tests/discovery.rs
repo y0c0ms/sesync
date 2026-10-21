@@ -1,7 +1,8 @@
 //! Discovery, ported from daemon/sesync.py jsonl_sessions / claude_sessions.
 //! Only files with the exact native names are sessions; anything else is ignored.
 
-use sesync::discovery::{claude_sessions, jsonl_sessions, parse_claude_name, parse_omp_name};
+use sesync::harness::claude::{claude_sessions, parse_claude_name};
+use sesync::harness::journal::{jsonl_sessions, parse_omp_name};
 use std::fs;
 use std::path::PathBuf;
 
@@ -75,19 +76,8 @@ fn claude_subagent_files_are_found_under_their_parent_session() {
     let a = sub.join("agent-a1.jsonl");
     fs::write(&a, "").unwrap();
     fs::write(sub.join("notes.txt"), "").unwrap();
-    let found = sesync::discovery::claude_subagents(&root);
+    let found = sesync::harness::claude::claude_subagents(&root);
     assert_eq!(found, vec![(parent.to_string(), a)]);
-}
-
-#[test]
-fn gemini_subagent_files_are_found_under_their_parent_session() {
-    let root = tmp("gemini-sub2");
-    let parent = "0f3c9a12-1111-4222-8333-444455556666";
-    let sub = root.join("tmp").join("proj").join("chats").join(parent);
-    fs::create_dir_all(&sub).unwrap();
-    let a = sub.join("sub-1.jsonl");
-    fs::write(&a, "").unwrap();
-    assert_eq!(sesync::discovery::gemini_subagents(&root), vec![(parent.to_string(), a)]);
 }
 
 #[test]
@@ -103,27 +93,20 @@ fn subagent_files_never_appear_as_main_sessions() {
 }
 
 #[test]
-fn gemini_session_files_are_found_under_each_project_chats_folder() {
-    // ~/.gemini/tmp/<slug>/chats/session-<ts>-<id>.jsonl is a Gemini session; other files
-    // in the project folder (logs.json, checkpoints) are not.
-    let root = tmp("gemini");
-    let chats = root.join("tmp").join("proj").join("chats");
-    fs::create_dir_all(&chats).unwrap();
-    let good = chats.join("session-2026-10-16T10-00-0f3c9a12.jsonl");
-    fs::write(&good, "").unwrap();
-    fs::write(root.join("tmp").join("proj").join("logs.json"), "[]").unwrap();
-    fs::write(chats.join("notes.txt"), "").unwrap();
-    assert_eq!(sesync::discovery::gemini_sessions(&root), vec![good]);
-}
-
-#[test]
-fn a_gemini_subagent_file_is_not_a_main_session() {
-    // Subagent sessions live in chats/<parentSessionId>/<id>.jsonl; they belong to their
-    // parent and are not listed as conversations of their own.
-    let root = tmp("gemini-sub");
-    let chats = root.join("tmp").join("proj").join("chats");
-    let sub = chats.join("0f3c9a12-1111-4222-8333-444455556666");
-    fs::create_dir_all(&sub).unwrap();
-    fs::write(sub.join("agent-1.jsonl"), "").unwrap();
-    assert!(sesync::discovery::gemini_sessions(&root).is_empty());
+fn antigravity_conversations_are_the_db_files_and_never_their_wal_or_temp_siblings() {
+    // `<root>/conversations/<id>.db` is an agy conversation. A live database has `-wal` and
+    // `-shm` beside it, and a writer builds `.tmp` files before it publishes: none of those is a
+    // conversation of its own, and listing one would make a copy of a half-written file.
+    let root = tmp("antigravity");
+    let conv = root.join("conversations");
+    fs::create_dir_all(&conv).unwrap();
+    let good = conv.join("28b4f6a2-2ecf-4ad2-933f-25dfd05896bf.db");
+    for name in ["28b4f6a2-2ecf-4ad2-933f-25dfd05896bf.db", "28b4f6a2-2ecf-4ad2-933f-25dfd05896bf.db-wal",
+                 "28b4f6a2-2ecf-4ad2-933f-25dfd05896bf.db-shm", "x.db.tmp", "x.tmp", ".db", "notes.txt"] {
+        fs::write(conv.join(name), "").unwrap();
+    }
+    fs::create_dir_all(conv.join("dir.db")).unwrap();
+    fs::write(root.join("conversation_summaries.db"), "").unwrap();
+    assert_eq!(sesync::harness::antigravity::store::antigravity_sessions(&root), vec![good]);
+    assert!(sesync::harness::antigravity::store::antigravity_sessions(&root.join("missing")).is_empty());
 }

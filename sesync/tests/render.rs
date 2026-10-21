@@ -18,16 +18,11 @@ fn sandbox(name: &str) -> PathBuf {
 }
 
 fn app_with_one_session(sb: &PathBuf, title: &str) -> App {
-    let roots = Roots {
-        omp: sb.join("omp").join("sessions"),
-        pi: sb.join("pi").join("sessions"),
-        claude: sb.join("claude").join("projects"),
-        gemini: sb.join("gemini").join("tmp"),
-    };
-    let dir = roots.omp.join("-tmp");
+    let roots = Roots::under(&sb, sb.join("no-sesync-conv"));
+    let dir = roots.locations.sessions_dir("omp").join("-tmp");
     fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&roots.pi).unwrap();
-    fs::create_dir_all(&roots.claude).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("pi")).unwrap();
+    fs::create_dir_all(&roots.locations.sessions_dir("claude")).unwrap();
     let sid = "aaaaaaaa-1111-2222-3333-444444444444";
     fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"{title}\"}}\n")).unwrap();

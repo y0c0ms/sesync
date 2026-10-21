@@ -5,7 +5,7 @@
 //! Every route except `POST /enrol` requires `Authorization: Bearer <token>`. The token must
 //! have been issued to the same machine named in the request, and it must not be expired.
 
-use crate::service::{Service, ServiceError, Store};
+use crate::service::{Admission, Service, ServiceError, Store};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -14,7 +14,11 @@ pub struct EnrolBody { pub space: String, pub member: String, pub machine: Strin
     /// The device entry (signing and box keys) hex-encoded. Required once the team has a trust
     /// root: the machine's later authority comes from this key being in the signed list.
     #[serde(default)]
-    pub device: Option<String> }
+    pub device: Option<String>,
+    /// The device's Ed25519 signature over `membership::enrol_message`, hex-encoded. Required
+    /// once the team has a trust root: it proves the caller holds the entry's private key.
+    #[serde(default)]
+    pub proof: Option<String> }
 
 #[derive(Deserialize)]
 pub struct LeaseBody { pub space: String, pub conversation: String, pub machine: String }
@@ -27,12 +31,28 @@ pub fn error_response(e: &ServiceError) -> (u16, Value) {
         ServiceError::Conflict(m) => (409, json!({"error": m})),
         ServiceError::NoSpace(_) => (404, json!({"error": "no such space"})),
         ServiceError::NotMember(_) => (403, json!({"error": "not a member"})),
-        ServiceError::Auth(_) => (401, json!({"error": "authentication refused"})),
+        ServiceError::Auth(m) => (401, json!({"error": auth_message(m)})),
         ServiceError::Lease(m) if m.contains("Held") => (409, json!({"error": "conversation is in use"})),
         ServiceError::Lease(m) if m.contains("Stale") => (409, json!({"error": "stale write refused"})),
         ServiceError::Lease(_) => (409, json!({"error": "no live lease for this write"})),
         ServiceError::Crypto(_) => (400, json!({"error": "record refused"})),
         ServiceError::Policy(m) => (400, json!({"error": "invalid backup policy", "detail": m})),
+        ServiceError::Invalid(m) => (400, json!({"error": m})),
+        ServiceError::Removed => (403, json!({"error": "this device was removed from the team"})),
+        ServiceError::Limit(m) => (429, json!({"error": m})),
+    }
+}
+
+/// What a refused join or renewal tells the user. A locked or already-used code is named, so the
+/// user waits instead of retrying a code that is right; every other refusal stays generic.
+fn auth_message(m: &str) -> &'static str {
+    match m {
+        "Wrong" => "wrong code",
+        "AlreadyUsed" => "this code was already used on this machine; wait for the next code",
+        _ if m.starts_with("Locked") => "too many wrong codes: joining is locked for 15 minutes",
+        _ if m.starts_with("enrolment window passed") =>
+            "the 7-day renewal window has passed; join again with the authenticator code",
+        _ => "authentication refused",
     }
 }
 
@@ -109,9 +129,11 @@ pub fn renew<S: Store>(svc: &mut Service<S>, auth: Option<&str>, space: &str, ma
     }
 }
 
-/// Enrol a machine. Confirms the authenticator code, then returns a token bound to the machine,
-/// together with the trust root (admin key and signed member list) when the team has one, so the
-/// joining device can pin the admin key and never accept lists the admin did not sign.
+/// Enrol a machine. Confirms the authenticator code, then answers by what the code led to (see
+/// `Service::enrol`): 200 with a token and the trust root (admin key and signed member list) for
+/// a listed key, so the device pins the admin key and never accepts lists the admin did not sign;
+/// 202 with status "pending", a token, the admin key and the device's fingerprint, and no list,
+/// for a new key; 200 with a token alone for a team without a trust root.
 pub fn enrol<S: Store>(svc: &mut Service<S>, body: &EnrolBody, now: u64) -> (u16, Value) {
     let device = match body.device.as_deref() {
         Some(d) => match from_hex(d) {
@@ -120,41 +142,65 @@ pub fn enrol<S: Store>(svc: &mut Service<S>, body: &EnrolBody, now: u64) -> (u16
         },
         None => None,
     };
-    if device.is_none() && svc.trust_list(&body.space).is_some() {
-        return (400, json!({"error": "this team needs the device key; upgrade the client"}));
+    // Checked before the code, so a forged join neither spends the code nor counts as a wrong
+    // attempt against the machine.
+    if svc.admin_key(&body.space).is_some() {
+        let Some(entry) = device.as_deref() else {
+            return (400, json!({"error": "this team needs the device key; upgrade the client"}));
+        };
+        let Some(proof) = body.proof.as_deref().and_then(from_hex) else {
+            return (400, json!({"error": "this team needs proof of the device key; upgrade the client"}));
+        };
+        let msg = crate::membership::enrol_message(&body.space, &body.member, &body.machine, &body.code, entry);
+        if entry.len() < 32 || !crate::membership::Device::verify(&entry[..32], &msg, &proof) {
+            return (403, json!({"error": "the device could not prove it holds its key"}));
+        }
     }
-    match svc.enrol(&body.space, &body.member, &body.machine, &body.code, now) {
-        Ok(token) => {
-            if let Some(entry) = device {
-                svc.bind_device(&body.space, &body.machine, entry);
-            }
-            let mut reply = json!({"token": token, "expires_in": crate::service::TOKEN_LIFETIME_SECS});
-            if let Some(list) = svc.trust_list(&body.space) {
-                if let Some(admin) = svc.load_admin_key_for_test(&body.space) {
-                    let version = crate::membership::SignedList::from_bytes(&list)
-                        .map(|l| l.list.version).unwrap_or(0);
-                    reply["admin_public"] = json!(hex(&admin));
-                    reply["signed_list"] = json!(hex(&list));
-                    reply["list_version"] = json!(version);
-                }
+    let admission = match svc.enrol(&body.space, &body.member, &body.machine, &body.code, device.as_deref(), now) {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    let expires_in = crate::service::TOKEN_LIFETIME_SECS;
+    let admin_public = svc.admin_key(&body.space).map(|k| hex(&k));
+    match admission {
+        Admission::Legacy(token) => (200, json!({"token": token, "expires_in": expires_in})),
+        Admission::Listed(token) => {
+            let mut reply = json!({"status": "listed", "token": token, "expires_in": expires_in});
+            if let (Some(list), Some(admin)) = (svc.trust_list(&body.space), admin_public) {
+                let version = crate::membership::SignedList::from_bytes(&list)
+                    .map(|l| l.list.version).unwrap_or(0);
+                reply["admin_public"] = json!(admin);
+                reply["signed_list"] = json!(hex(&list));
+                reply["list_version"] = json!(version);
             }
             (200, reply)
         }
-        Err(e) => error_response(&e),
+        Admission::Pending { token, fingerprint } => (202, json!({
+            "status": "pending", "token": token, "expires_in": expires_in,
+            "admin_public": admin_public, "fingerprint": fingerprint,
+        })),
     }
 }
 
-/// The enrolled devices for a space, with the current list version, for the admin to build the
-/// next list. Admin only: the entries are public keys, but a member has no business enumerating
-/// the team's machines.
-pub fn list_devices<S: Store>(svc: &Service<S>, space: &str) -> (u16, Value) {
-    let version = svc.trust_list(space)
-        .and_then(|l| crate::membership::SignedList::from_bytes(&l).ok())
-        .map(|l| l.list.version).unwrap_or(0);
-    let devices: Vec<Value> = svc.devices(space).iter()
-        .map(|(m, entry)| json!({"machine": m, "entry": hex(entry)}))
-        .collect();
-    (200, json!({"space": space, "version": version, "devices": devices}))
+/// The admin's roster: the current signed list and its version, the member and machine bound to
+/// each listed key, and the open join requests with their entries. Every entry carries its
+/// fingerprint; the admin's client recomputes it from the entry rather than trusting this one.
+pub fn roster<S: Store>(svc: &mut Service<S>, space: &str, now: u64) -> (u16, Value) {
+    let r = match svc.roster(space, now) {
+        Ok(r) => r,
+        Err(e) => return error_response(&e),
+    };
+    let listed: Vec<Value> = r.listed.iter().map(|d| json!({
+        "member": d.member, "machine": d.machine,
+        "fingerprint": crate::membership::fingerprint(&d.entry), "entry": hex(&d.entry),
+    })).collect();
+    let pending: Vec<Value> = r.pending.iter().map(|p| json!({
+        "member": p.member, "machine": p.machine,
+        "fingerprint": crate::membership::fingerprint(&p.entry), "entry": hex(&p.entry),
+        "requested_at": p.requested_at, "age_secs": now.saturating_sub(p.requested_at),
+    })).collect();
+    (200, json!({"space": space, "version": r.version, "signed_list": hex(&r.signed_list),
+                 "listed": listed, "pending": pending}))
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {

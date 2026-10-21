@@ -44,12 +44,7 @@ fn fixture(name: &str) -> (PathBuf, App) {
     src.failures = 1;
     state.sources.insert(c.to_string_lossy().to_string(), src);
     let app = App::new(
-        Roots {
-            omp: sb.join("omp").join("sessions"),
-            pi: sb.join("pi").join("sessions"),
-            claude: sb.join("claude").join("projects"),
-            gemini: sb.join("gemini").join("tmp"),
-        },
+        Roots::under(&sb, sb.join("no-sesync-conv")),
         state,
         sb.join("locks"),
         sb.join("no-sesync_lock"),
@@ -140,12 +135,7 @@ fn a_stale_failure_counter_without_mirror_intent_is_not_failing() {
     src.failures = 2770;
     state.sources.insert(p.to_string_lossy().to_string(), src);
     let mut a = App::new(
-        Roots {
-            omp: sb.join("omp").join("sessions"),
-            pi: sb.join("pi").join("sessions"),
-            claude: sb.join("claude").join("projects"),
-            gemini: sb.join("gemini").join("tmp"),
-        },
+        Roots::under(&sb, sb.join("no-sesync-conv")),
         state,
         sb.join("locks"),
         sb.join("no-sesync_lock"),
@@ -161,12 +151,7 @@ fn a_stale_failure_counter_without_mirror_intent_is_not_failing() {
     src2.chosen_targets.insert("pi".to_string());
     state2.sources.insert(p.to_string_lossy().to_string(), src2);
     let mut a2 = App::new(
-        Roots {
-            omp: sb.join("omp").join("sessions"),
-            pi: sb.join("pi").join("sessions"),
-            claude: sb.join("claude").join("projects"),
-            gemini: sb.join("gemini").join("tmp"),
-        },
+        Roots::under(&sb, sb.join("no-sesync-conv")),
         state2,
         sb.join("locks"),
         sb.join("no-sesync_lock"),
@@ -205,9 +190,15 @@ fn the_team_mark_survives_a_real_turn() {
     state.record_team_push("team-a", "conversation-uuid-1", "hash-before", 100.0);
     state.mirror_keys.insert(mirror.display().to_string());
 
-    // The user answers in the claude copy: the next pass turns the session to it.
-    fs::write(&mirror, "installed by the daemon\nthe user's answer\n").unwrap();
-    let promoted = sesync::turn::promote_changed(&mut state, &[]);
+    // The user answers in the claude copy: a prompt the source does not have. The next pass
+    // turns the session to it.
+    fs::write(&mirror, concat!(
+        "installed by the daemon\n",
+        r#"{"type":"user","timestamp":"2026-10-01T10:05:00.000Z","message":{"role":"user","content":"the user's answer"}}"#, "\n",
+    )).unwrap();
+    let locations = sesync::harness::Locations::default();
+    let prompt_of = |fmt: &str, key: &str| sesync::harness::get(fmt)?.newest_prompt(locations.of(fmt), key);
+    let promoted = sesync::turn::promote_changed(&mut state, &Default::default(), &prompt_of);
     assert_eq!(promoted, vec![mirror.display().to_string()], "the copy with the answer wins");
 
     let new_key = mirror.display().to_string();
