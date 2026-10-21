@@ -1092,6 +1092,7 @@ fn run_tui(
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
     app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
+    let have_teams = !teams.is_empty();
     app.set_teams(teams);
     app.set_team_cards(sesync::team_join::team_cards(&config_dir));
     // The team server and the admin token file are the dialogs' defaults; the admin flag says
@@ -1113,7 +1114,10 @@ fn run_tui(
     app.set_state_written(file_mtime_secs(&state_file));
     let mut last_click: Option<(usize, Instant)> = None;
     let mut last_merge = Instant::now();
-    let mut pending_pull = TeamPull::None;
+    let mut last_team_check = Instant::now();
+    // A team this machine already belongs to is pulled once at start, so the Team tab shows
+    // what the team holds instead of an empty list that waits for ctrl+r.
+    let mut pending_pull = if have_teams { request_team_pull(&mut app, &config_dir) } else { TeamPull::None };
     let mut jobs = TeamJobs::default();
     loop {
         jobs.tick(&mut app, &config_dir);
@@ -1151,6 +1155,25 @@ fn run_tui(
                 // few small local files, read only while the Team tab is on screen.
                 if app.view() == sesync::app::View::Team {
                     app.set_team_cards(sesync::team_join::team_cards(&config_dir));
+                }
+                // A join approved (or a team left) while this screen is open must reach the
+                // share picker and the Team tab without a restart: re-read the teams, and pull
+                // once when the set changed, so the tab shows what the team holds.
+                if last_team_check.elapsed() >= Duration::from_secs(5) {
+                    last_team_check = Instant::now();
+                    let before = app.teams().to_vec();
+                    reload_team_records(&mut app, &config_dir);
+                    if app.teams() != before.as_slice() {
+                        let names: Vec<String> = app.teams().to_vec();
+                        app.set_status(&format!("teams: {}",
+                            if names.is_empty() { "none".to_string() } else { names.join(", ") }));
+                        if !names.is_empty() {
+                            if let started @ TeamPull::Running(_) = request_team_pull(&mut app, &config_dir) {
+                                pending_pull = started;
+                            }
+                        }
+                        tr("teams re-resolved", &mut trace);
+                    }
                 }
             }
             continue;
