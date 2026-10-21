@@ -6,8 +6,19 @@ use std::path::Path;
 
 /// How much of a large transcript is read for its title, from each end.
 const TITLE_WINDOW: u64 = 64 * 1024;
-/// Files up to this size are read whole; above it only the two windows are.
+/// Files up to this size are read whole; above it only the windows are.
 const TITLE_FULL_MAX: u64 = 256 * 1024;
+/// How far back the tail is walked looking for a title record before giving up.
+const TITLE_TAIL_MAX: u64 = 8 * 1024 * 1024;
+
+/// Whether a chunk of transcript carries a record that can name the session. Used to stop the
+/// backwards walk as soon as the rename is in hand.
+fn carries_a_title(chunk: &str) -> bool {
+    chunk.contains("\"title_change\"")
+        || chunk.contains("\"session_info\"")
+        || chunk.contains("\"custom-title\"")
+        || chunk.contains("\"$set\"")
+}
 
 /// The text a title is read from. Titles live in the first records (journal headers,
 /// ai-title) or the last ones (Pi/omp renames, Claude custom-title, Gemini summary), so
@@ -29,15 +40,37 @@ pub fn read_title_text(path: &Path) -> Option<String> {
         Some(i) => head.truncate(i + 1),
         None => head.push(b'\n'),
     }
-    f.seek(SeekFrom::Start(len - TITLE_WINDOW)).ok()?;
-    let mut tail = vec![0u8; TITLE_WINDOW as usize];
-    let n = f.read(&mut tail).ok()?;
-    tail.truncate(n);
-    if let Some(i) = tail.iter().position(|&b| b == b'\n') {
-        tail.drain(..=i);
+    // Walk the tail backwards until a record that can name the session shows up. A rename made
+    // inside the harness leaves only a `title_change` (the slot lags until it saves), and in a
+    // long journal that record sits far from both ends: one 64 KiB window missed it, the caller
+    // fell back to the stale slot, and a rename could be silently overwritten by the name shown.
+    let mut tail = String::new();
+    let mut end = len;
+    let mut scanned: u64 = 0;
+    loop {
+        let span = TITLE_WINDOW.min(end);
+        let start = end - span;
+        let mut buf = vec![0u8; span as usize];
+        f.seek(SeekFrom::Start(start)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        let mut chunk = String::from_utf8_lossy(&buf).into_owned();
+        // Drop the partial first line unless this chunk reaches the start of the file: its JSON
+        // would not parse, and the window before it carries that line whole.
+        if start > 0 {
+            if let Some(i) = chunk.find('\n') {
+                chunk.drain(..=i);
+            }
+        }
+        let found = carries_a_title(&chunk);
+        tail = format!("{chunk}{tail}");
+        scanned += span;
+        if found || start == 0 || scanned >= TITLE_TAIL_MAX {
+            break;
+        }
+        end = start;
     }
     let mut text = String::from_utf8_lossy(&head).into_owned();
-    text.push_str(&String::from_utf8_lossy(&tail));
+    text.push_str(&tail);
     Some(text)
 }
 
