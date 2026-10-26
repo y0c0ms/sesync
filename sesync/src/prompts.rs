@@ -12,6 +12,11 @@
 /// prompt. The shared opening is what matches both.
 pub const COMPACTION_NOTE_PREFIX: &str = "Earlier turns of this conversation were ";
 
+/// The note `sesync-conv` writes where a copy does not carry an attachment (`attach.rs`). Like the
+/// compaction note it is a user message by shape, stamped with the time of the message it stands
+/// in for; sesync wrote it, so it is never a prompt.
+pub const ATTACHMENT_NOTE_PREFIX: &str = "[attachment not carried: ";
+
 /// Seconds since the epoch of an RFC 3339 timestamp such as `2026-10-09T18:15:51.408Z` or
 /// `2026-10-09T19:15:51+01:00`. None for anything else.
 pub fn parse_rfc3339(s: &str) -> Option<f64> {
@@ -64,10 +69,11 @@ pub fn parse_rfc3339(s: &str) -> Option<f64> {
 }
 
 /// Whether a piece of text is something a person typed: not empty, not a command wrapper
-/// (`<command-name>`, `<local-command-stdout>`) and not sesync's compaction note.
+/// (`<command-name>`, `<local-command-stdout>`) and not one of sesync's own notes (the compaction note,
+/// the attachment note).
 pub fn is_typed_text(t: &str) -> bool {
     let t = t.trim();
-    !t.is_empty() && !t.starts_with('<') && !t.starts_with(COMPACTION_NOTE_PREFIX)
+    !t.is_empty() && !t.starts_with('<') && !t.starts_with(COMPACTION_NOTE_PREFIX) && !t.starts_with(ATTACHMENT_NOTE_PREFIX)
 }
 
 /// Whether message content holds something a person typed (`is_typed_text`). Tool results and
@@ -109,6 +115,8 @@ mod tests {
         assert!(!is_prompt_content(&json!([{"type": "tool_result", "content": "ok"}])), "a tool result is not a prompt");
         assert!(!is_prompt_content(&json!([{"type": "text", "text": "Earlier turns of this conversation were compacted. Their summary:\n\nx"}])),
             "sesync's own compaction note is not a prompt");
+        assert!(!is_prompt_content(&json!([{"type": "text", "text": "[attachment not carried: image (image/png, 2 KB) \u{2014} kept in the source session]"}])),
+            "sesync-conv's attachment note is not a prompt");
         assert!(!is_prompt_content(&json!("   ")));
     }
 }

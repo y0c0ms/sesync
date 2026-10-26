@@ -14,6 +14,7 @@
 //! means delete-then-import under the same deterministic id.
 
 mod antigravity;
+mod attach;
 mod claude;
 mod fit;
 mod from_antigravity;

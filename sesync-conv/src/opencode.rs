@@ -21,6 +21,7 @@
 //!
 //! Thinking IS carried as `reasoning` parts: OpenCode stores them natively.
 
+use crate::attach::{self, Verdict};
 use crate::fit::Window;
 use crate::journal::Msg;
 use serde_json::{json, Map, Value};
@@ -28,6 +29,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Why a note stands in for a tool-result image this copy does not carry.
+const TOOL_IMAGE_WHY: &str = "an image in a tool result, which OpenCode's tool output does not carry; kept in the source session";
 
 /// OpenCode ids: prefix + 12 hex chars (ms time) + 14 base62 chars.
 /// Deterministic from (seed, counter) so a re-run yields identical ids and
@@ -163,13 +167,14 @@ pub fn to_bundle(win: &Window, o: &Options) -> Value {
                         }
                     }
                     Some("thinking") => {}
-                    Some("image") => {
-                        let mime = ob.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
-                        let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
-                        if !data.is_empty() && !data.starts_with("blob:") {
+                    Some("image") => match attach::judge(&attach::OPENCODE, b, false) {
+                        Verdict::Carry => {
+                            let mime = ob.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
+                            let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
                             parts.push(part("file", map(json!({"mime": mime, "url": format!("data:{mime};base64,{data}")})), next("prt", t)));
                         }
-                    }
+                        Verdict::Withhold(note) => parts.push(part("text", map(json!({"text": note})), next("prt", t))),
+                    },
                     Some("toolCall") => {
                         tool_calls += 1;
                         let cid = ob.get("id").and_then(Value::as_str).unwrap_or("");
@@ -178,8 +183,9 @@ pub fn to_bundle(win: &Window, o: &Options) -> Value {
                         let (status, output, is_err, end) = match results.get(cid) {
                             Some(r) => {
                                 let txt = r.content.iter().filter_map(|c| match c {
-                                    Value::String(s) => Some(s.as_str()),
-                                    Value::Object(x) => x.get("text").and_then(Value::as_str),
+                                    Value::String(s) => Some(s.clone()),
+                                    Value::Object(x) if x.get("type").and_then(Value::as_str) == Some("image") => Some(attach::image_note(c, TOOL_IMAGE_WHY)),
+                                    Value::Object(x) => x.get("text").and_then(Value::as_str).map(str::to_string),
                                     _ => None,
                                 }).collect::<Vec<_>>().join("\n");
                                 let is_err = r.message.get("isError").and_then(Value::as_bool).unwrap_or(false);

@@ -4,7 +4,9 @@
 //! call is split from its result, and an impossible fit is refused.
 
 use super::*;
+use crate::attach::image_tokens;
 use crate::{claude, from_claude, from_opencode, opencode, to_antigravity};
+use base64::Engine;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -467,5 +469,125 @@ fn a_journal_keeps_its_archive_for_the_whole_file_copies() {
     let dir = sandbox("omp-whole");
     let j = journal_from_lines(&dir, "omp.jsonl", &omp_lines(300, Some((60, 20))));
     assert_eq!(j.records.iter().filter(|r| r.get("type").and_then(Value::as_str) == Some("message")).count(), 1200);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---- images in the window ----
+
+/// omp turns: a prompt "turn t" with `per_turn` images of `w` x `h` pixels (header-only PNGs: all the
+/// fit reads), then a reply. Turn `t` is at `iso(4 * t)`.
+fn image_turns(turns: usize, per_turn: usize, w: u32, h: u32) -> Vec<String> {
+    let data = base64::engine::general_purpose::STANDARD.encode(crate::attach::tests::png_header(w, h));
+    let mut lines = vec![json!({"type": "session", "id": "omp-img", "timestamp": iso(0), "cwd": "/work/proj"}).to_string()];
+    let mut parent: Option<String> = None;
+    for t in 0..turns {
+        let uid = format!("u{t}");
+        let mut content = vec![json!({"type": "text", "text": format!("turn {t}")})];
+        content.extend((0..per_turn).map(|_| json!({"type": "image", "data": data, "mimeType": "image/png"})));
+        lines.push(json!({"type": "message", "id": uid, "parentId": parent, "timestamp": iso(4 * t), "message": {"role": "user", "content": content}}).to_string());
+        let aid = format!("a{t}");
+        lines.push(json!({"type": "message", "id": aid, "parentId": uid, "timestamp": iso(4 * t + 1),
+            "message": {"role": "assistant", "provider": "anthropic", "model": MODEL, "content": [{"type": "text", "text": format!("answer {t}")}]}}).to_string());
+        parent = Some(aid);
+    }
+    lines
+}
+
+/// Each user turn of a window: its prompt text and its image count.
+fn turn_images(msgs: &[Msg]) -> Vec<(String, usize)> {
+    msgs.iter()
+        .filter(|m| m.role == "user")
+        .map(|m| {
+            let text = m.content.iter().find_map(|c| c.get("text").and_then(Value::as_str)).unwrap_or("").to_string();
+            let images = m.content.iter().filter(|c| c.get("type").and_then(Value::as_str) == Some("image")).count();
+            (text, images)
+        })
+        .collect()
+}
+
+#[test]
+fn images_count_toward_the_budget_and_a_cut_keeps_whole_turns_with_their_images() {
+    let dir = sandbox("images-cut");
+    // Each turn: three 1920 x 1080 images (2691 estimated tokens each) and its reply.
+    let j = journal_from_lines(&dir, "img.jsonl", &image_turns(12, 3, 1920, 1080));
+    for window in [60_000usize, 100_000, 200_000] {
+        let b = budget(window);
+        let win = j.fit("claude", &b).unwrap();
+        let turns = turn_images(&win.msgs);
+        assert!(turns.iter().all(|(_, n)| *n == 3), "a kept turn lost an image: {turns:?}");
+        let first = 12 - turns.len();
+        let want: Vec<String> = (first..12).map(|t| format!("turn {t}")).collect();
+        assert_eq!(turns.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(), want, "the newest turns, whole");
+        assert!(win.report.tokens_after <= b.limit(), "{:?}", win.report);
+
+        // The copy carries exactly those images, each in its own turn's record.
+        let lines = claude::to_lines(&win, &claude::Options { session_id: "00000000-0000-4000-8000-0000000000f1", cwd: "/work/proj", cli_version: "2.1.245", title: "" });
+        let mut copied = 0;
+        for line in &lines {
+            let r: Value = serde_json::from_str(line).unwrap();
+            let blocks = r["message"]["content"].as_array().cloned().unwrap_or_default();
+            let images = blocks.iter().filter(|b| b["type"] == "image").count();
+            if images > 0 {
+                assert!(blocks.iter().any(|b| b["text"].as_str().is_some_and(|t| t.starts_with("turn "))), "an image without its turn: {r}");
+            }
+            copied += images;
+        }
+        assert_eq!(copied, 3 * turns.len(), "window {window}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn images_cost_the_budget_so_fewer_turns_fit_than_text_alone() {
+    let dir = sandbox("images-budget");
+    let with = journal_from_lines(&dir, "with.jsonl", &image_turns(12, 3, 1920, 1080));
+    let text_only = journal_from_lines(&dir, "text.jsonl", &image_turns(12, 0, 0, 0));
+    let b = budget(60_000);
+    let kept_with = with.fit("claude", &b).unwrap().report.turns_kept;
+    let kept_text = text_only.fit("claude", &b).unwrap().report.turns_kept;
+    assert_eq!(kept_text, 12, "text alone fits the window");
+    assert!(kept_with < kept_text, "images are counted: {kept_with} of 12 with images");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_image_costs_its_formula_and_a_withheld_one_only_its_note() {
+    let dir = sandbox("estimate");
+    let fits = crate::attach::tests::png_header(1920, 1080);
+    let mut huge = crate::attach::tests::png_header(100, 100);
+    huge.resize(3_800_000, 0);
+    let one_turn = |png: &[u8]| {
+        let data = base64::engine::general_purpose::STANDARD.encode(png);
+        vec![
+            json!({"type": "session", "id": "e", "timestamp": iso(0), "cwd": "/work/proj"}).to_string(),
+            json!({"type": "message", "id": "u1", "parentId": null, "timestamp": iso(1), "message": {"role": "user", "content": [
+                {"type": "text", "text": "x"}, {"type": "image", "data": data, "mimeType": "image/png"}]}})
+            .to_string(),
+        ]
+    };
+    let j = journal_from_lines(&dir, "fits.jsonl", &one_turn(&fits));
+    // The message: its framing, "user", the text block's type and text, then the image at its formula.
+    let want = TOKENS_PER_MESSAGE + tokens_for_bytes(4) + tokens_for_bytes(4) + tokens_for_bytes(1) + image_tokens(1920, 1080);
+    assert_eq!(j.window().report.tokens_before, want);
+
+    let j = journal_from_lines(&dir, "huge.jsonl", &one_turn(&huge));
+    let cost = j.window().report.tokens_before;
+    assert!(cost < want - image_tokens(1920, 1080) + image_tokens(100, 100), "a withheld image costs its note: {cost}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_tool_result_image_costs_its_note_because_no_message_based_copy_carries_it() {
+    let dir = sandbox("result-image");
+    let data = base64::engine::general_purpose::STANDARD.encode(crate::attach::tests::png_header(1920, 1080));
+    let lines = vec![
+        json!({"type": "session", "id": "r", "timestamp": iso(0), "cwd": "/work/proj"}).to_string(),
+        json!({"type": "message", "id": "r1", "parentId": null, "timestamp": iso(1), "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "shot",
+            "content": [{"type": "image", "data": data, "mimeType": "image/png"}]}})
+        .to_string(),
+    ];
+    let j = journal_from_lines(&dir, "result.jsonl", &lines);
+    let cost = j.window().report.tokens_before;
+    assert!(cost < TOKENS_PER_MESSAGE + image_tokens(1920, 1080), "a tool-result image is priced as its note: {cost}");
     let _ = fs::remove_dir_all(&dir);
 }
