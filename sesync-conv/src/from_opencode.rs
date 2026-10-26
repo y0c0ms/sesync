@@ -12,6 +12,8 @@
 //!                         "New session - <ts>" titles are dropped, not kept)
 //!   message.role       -> message.role (user | assistant)
 //!   text parts         -> text content blocks
+//!   file parts         -> image content when inline (data: URL); any other file (path, http URL,
+//!                         non-image data) -> a note in its place, counted
 //!   tool parts         -> a toolCall block in the assistant message, plus, when the
 //!                         tool finished (status completed or error), one toolResult
 //!                         message right after the assistant message, in call order.
@@ -25,6 +27,7 @@
 //!                         starts there. The user message holding the compaction part has no text
 //!                         and is dropped with the other empty turns.
 
+use crate::attach;
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -137,17 +140,32 @@ pub fn to_journal_lines(export: &Value) -> Result<(Vec<String>, Stats), String> 
                 }
                 Some("step-start") | Some("step-finish") => {}
                 Some("file") => {
-                    // An attachment. An image carried inline as a data: URL is kept; a file
-                    // reference (path, http URL) cannot be carried and is counted.
+                    // An attachment. An inline image (data: URL) is kept. Any other file cannot be
+                    // carried: it is counted, and a note takes its place in the message.
                     let mime = p.get("mime").and_then(Value::as_str).unwrap_or("");
                     let url = p.get("url").and_then(Value::as_str).unwrap_or("");
-                    match url.strip_prefix("data:").and_then(|rest| rest.split_once(";base64,")) {
+                    let inline = url.strip_prefix("data:").and_then(|rest| rest.split_once(";base64,"));
+                    match inline {
                         Some((data_mime, data)) if mime.starts_with("image/") || data_mime.starts_with("image/") => {
                             let m = if mime.is_empty() { data_mime } else { mime };
                             content.push(json!({"type": "image", "data": data, "mimeType": m}));
                             stats.images += 1;
                         }
-                        _ => stats.skipped_file_parts += 1,
+                        _ => {
+                            stats.skipped_file_parts += 1;
+                            let filename = p.get("filename").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                            // The name is the source's own filename only: a path or a URL can hold private
+                            // directories or a query, so it is never written.
+                            let name = filename.map(str::to_string);
+                            let mime = match inline {
+                                Some((data_mime, _)) if mime.is_empty() => data_mime,
+                                _ => mime,
+                            };
+                            let mime = if mime.is_empty() { None } else { Some(mime) };
+                            let bytes = inline.map(|(_, data)| attach::decoded_len(data));
+                            let note = attach::note(name.as_deref().unwrap_or("attachment"), mime, bytes, attach::KEPT);
+                            content.push(json!({"type": "text", "text": note}));
+                        }
                     }
                 }
                 Some("tool") if role == "assistant" => {

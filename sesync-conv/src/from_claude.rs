@@ -9,6 +9,8 @@
 //!   user / assistant    -> message records (role from `message.role`)
 //!   isCompactSummary user   -> compaction record {summary}; the live window starts there
 //!   text blocks         -> text content blocks
+//!   image blocks          -> image content when inline (base64); an image held by reference (URL,
+//!                          Files API id) -> a note in its place, counted
 //!   tool_use            -> toolCall block {id, name, arguments} in the assistant message
 //!   tool_result         -> one toolResult message per result {toolCallId, toolName,
 //!                          content, isError}, placed right after the record it came from
@@ -26,6 +28,7 @@
 //! Claude signs its reasoning blocks and cannot accept ours back, so thinking
 //! is never carried into a Claude mirror; here it is dropped on the way in.
 
+use crate::attach;
 use serde_json::{json, Map, Value};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -175,12 +178,19 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
                             let src = b.get("source").and_then(Value::as_object);
                             let kind = src.and_then(|x| x.get("type")).and_then(Value::as_str).unwrap_or("");
                             let data = src.and_then(|x| x.get("data")).and_then(Value::as_str).unwrap_or("");
-                            let mime = src.and_then(|x| x.get("media_type")).and_then(Value::as_str).unwrap_or("image/png");
+                            let media = src.and_then(|x| x.get("media_type")).and_then(Value::as_str);
                             if kind == "base64" && !data.is_empty() {
-                                content.push(json!({"type": "image", "data": data, "mimeType": mime}));
+                                content.push(json!({"type": "image", "data": data, "mimeType": media.unwrap_or("image/png")}));
                                 stats.images += 1;
                             } else {
                                 stats.skipped_image_blocks += 1;
+                                let url_why = "an image by URL, which is not fetched; kept in the source session";
+                                let note = match kind {
+                                    "url" => attach::note("image", media, None, url_why),
+                                    "file" => attach::note("image", media, None, "an image by Files API id; kept in the source session"),
+                                    _ => attach::image_note_parts(media, data, "an image without inline bytes; kept in the source session"),
+                                };
+                                content.push(json!({"type": "text", "text": note}));
                             }
                         }
                         Some("tool_use") if role == "assistant" => {
@@ -213,11 +223,20 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
                                 Some(Value::String(t)) => text_blocks.push(json!({"type": "text", "text": t})),
                                 Some(Value::Array(items)) => {
                                     for it in items {
-                                        if it.get("type").and_then(Value::as_str) == Some("text") {
-                                            let t = it.get("text").and_then(Value::as_str).unwrap_or("");
-                                            text_blocks.push(json!({"type": "text", "text": t}));
-                                        } else {
-                                            stats.skipped_tool_blocks += 1;
+                                        match it.get("type").and_then(Value::as_str) {
+                                            Some("text") => {
+                                                let t = it.get("text").and_then(Value::as_str).unwrap_or("");
+                                                text_blocks.push(json!({"type": "text", "text": t}));
+                                            }
+                                            Some("image") => {
+                                                stats.skipped_image_blocks += 1;
+                                                let src = it.get("source").and_then(Value::as_object);
+                                                let media = src.and_then(|x| x.get("media_type")).and_then(Value::as_str);
+                                                let data = src.and_then(|x| x.get("data")).and_then(Value::as_str).unwrap_or("");
+                                                let why = "an image in a tool result, which this copy does not carry; kept in the source session";
+                                                text_blocks.push(json!({"type": "text", "text": attach::image_note_parts(media, data, why)}));
+                                            }
+                                            _ => stats.skipped_tool_blocks += 1,
                                         }
                                     }
                                 }

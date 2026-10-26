@@ -8,9 +8,12 @@
 //! Budget: `window x share - overhead` tokens. Defaults: share 0.75, overhead 16384, both set by
 //! `--context-share` / `--context-overhead`; the window by `--context-window`, else 128000.
 //!
-//! Estimate: `ceil(bytes / 3)` for every string, 1600 for every image, 8 per message. It is
-//! deliberately high: English prose runs near 4 bytes per token and code or JSON nearer 3, so the
-//! target's real count sits under the estimate. No tokenizer is loaded.
+//! Estimate: `ceil(bytes / 3)` for every string, 8 per message, and per image the tokens of its
+//! size (`attach::estimate`), read from the image header: the larger of Claude's 28 px patch rule
+//! and OpenAI's 512 px tile rule, 1600 when the header is unreadable. An image the target would
+//! refuse costs its note instead (`attach::judge`). Deliberately high: English prose runs near 4
+//! bytes per token and code or JSON nearer 3, so the target's real count sits under the estimate.
+//! No tokenizer is loaded.
 //!
 //! Cuts: only at user messages, and only where every tool result after the cut answers a call
 //! after it, so a call and its result always travel together. When the summary and the newest
@@ -19,6 +22,7 @@
 //! Only the message-based writers fit (Claude, OpenCode, Antigravity). omp and Pi receive the
 //! whole journal and apply their own compaction (see `main.rs`, `to-pi` / `to-omp`).
 
+use crate::attach::{self, Limits};
 use crate::journal::{iso_from_ms, Journal, Msg};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -27,8 +31,6 @@ use std::collections::HashMap;
 pub const DEFAULT_WINDOW: usize = 128_000;
 pub const DEFAULT_SHARE: f64 = 0.75;
 pub const DEFAULT_OVERHEAD: usize = 16_384;
-/// A flat estimate for one image, whatever its bytes (Claude bills about 1.6k at most).
-const TOKENS_PER_IMAGE: usize = 1_600;
 /// Framing per message: role, separators, the record envelope the target adds.
 const TOKENS_PER_MESSAGE: usize = 8;
 
@@ -152,19 +154,23 @@ fn note_tokens(summary: Option<&str>, cut: bool) -> usize {
     TOKENS_PER_MESSAGE + tokens_for_bytes(note_text(summary, cut).len())
 }
 
-fn value_tokens(v: &Value) -> usize {
+fn value_tokens(v: &Value, limits: &Limits, in_result: bool) -> usize {
     match v {
         Value::String(s) => tokens_for_bytes(s.len()),
-        Value::Array(a) => a.iter().map(value_tokens).sum(),
-        Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("image") => TOKENS_PER_IMAGE,
-        Value::Object(o) => o.values().map(value_tokens).sum(),
+        Value::Array(a) => a.iter().map(|x| value_tokens(x, limits, in_result)).sum(),
+        // No message-based target carries an image from a tool result: its copy is a note.
+        Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("image") => {
+            if in_result { attach::result_image_tokens() } else { attach::estimate(limits, v) }
+        }
+        Value::Object(o) => o.values().map(|x| value_tokens(x, limits, in_result)).sum(),
         _ => 1,
     }
 }
 
 /// Estimated tokens of one message as a target reads it: its content, tool calls and results.
-fn msg_tokens(m: &Msg) -> usize {
-    TOKENS_PER_MESSAGE + m.message.values().map(value_tokens).sum::<usize>()
+fn msg_tokens(m: &Msg, limits: &Limits) -> usize {
+    let in_result = m.role == "toolResult";
+    TOKENS_PER_MESSAGE + m.message.values().map(|x| value_tokens(x, limits, in_result)).sum::<usize>()
 }
 
 /// Positions a window may start at: user messages where no tool result at or after the cut
@@ -211,9 +217,11 @@ fn cut_points(msgs: &[Msg]) -> Vec<usize> {
 impl Journal {
     /// The live window with every message of it, nothing fitted. For the writers that never fit.
     pub fn window(&self) -> Window<'_> {
+        // Not fitted for any one target: the strictest limits, so the estimate stays an upper bound.
+        let limits = Limits::for_target("claude");
         let msgs = self.messages();
         let summary = self.summary_of();
-        let total = note_tokens(summary_text(&summary), false) + msgs.iter().map(msg_tokens).sum::<usize>();
+        let total = note_tokens(summary_text(&summary), false) + msgs.iter().map(|m| msg_tokens(m, limits)).sum::<usize>();
         let turns = msgs.iter().filter(|m| m.role == "user").count();
         Window {
             summary,
@@ -227,10 +235,11 @@ impl Journal {
     /// a user turn. Refuses when the note and the newest valid turn do not fit together.
     pub fn fit(&self, target: &str, budget: &Budget) -> Result<Window<'_>, String> {
         let limit = budget.limit();
+        let limits = Limits::for_target(target);
         let all = self.messages();
         let summary = self.summary_of();
         let plain = note_tokens(summary_text(&summary), false);
-        let costs: Vec<usize> = all.iter().map(msg_tokens).collect();
+        let costs: Vec<usize> = all.iter().map(|m| msg_tokens(m, limits)).collect();
         // suffix[c]: tokens of every message from c on.
         let mut suffix = vec![0usize; costs.len() + 1];
         for c in (0..costs.len()).rev() {

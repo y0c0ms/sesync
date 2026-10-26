@@ -8,6 +8,7 @@
 //!                   conversation_summaries row
 //!   14 user input   -> user: text 19.2 (else 19.1, else the 19.3 items); images 19.9
 //!                      (inline bytes, else the field-5 file, else the JPEG thumbnail)
+//!                      with none of them, a note in its place (`attach`)
 //!   15 planner      -> assistant: thinking 20.3, text 20.1 (else 20.8), toolCall per 20.7
 //!   132 generic     -> toolResult: call from StepMetadata 4 (payload 5.4, else the metadata
 //!                      column), else the next pending call; text 140.2.1; isError on
@@ -19,6 +20,7 @@
 //! Every message keeps its step's timestamp (StepMetadata 1).
 
 use crate::antigravity::{self as ag, file_uri_to_path};
+use crate::attach;
 use crate::journal::iso_from_ms;
 use crate::protobuf::{timestamp_ms, Msg};
 use base64::Engine;
@@ -239,9 +241,10 @@ pub fn to_journal_lines(db: &Path) -> Result<(Vec<String>, Stats), String> {
                 for media in u.all_bytes(9) {
                     let m = Msg::lenient(media);
                     let mut mime = m.text(1).unwrap_or_else(|| "image/png".into());
+                    let path = m.text(5);
                     let bytes = match m.bytes(2).filter(|b| !b.is_empty()) {
                         Some(b) => Some(b.to_vec()),
-                        None => match m.text(5).and_then(|path| fs::read(path).ok()) {
+                        None => match path.as_deref().and_then(|p| fs::read(p).ok()) {
                             Some(b) => Some(b),
                             None => m.bytes(6).filter(|b| !b.is_empty()).map(|b| {
                                 mime = "image/jpeg".into();
@@ -254,7 +257,12 @@ pub fn to_journal_lines(db: &Path) -> Result<(Vec<String>, Stats), String> {
                             content.push(json!({"type": "image", "data": b64.encode(b), "mimeType": mime}));
                             st.images += 1;
                         }
-                        None => st.missing_images += 1,
+                        None => {
+                            st.missing_images += 1;
+                            let why = "the conversation holds no bytes for it: no inline data, file or thumbnail";
+                            let note = attach::note("image", Some(mime.as_str()), None, why);
+                            content.push(json!({"type": "text", "text": note}));
+                        }
                     }
                 }
                 if content.is_empty() {
@@ -542,6 +550,11 @@ mod tests {
         let got: Vec<(Vec<u8>, &str)> = (1..4).map(|i| (b64.decode(c[i]["data"].as_str().unwrap()).unwrap(), c[i]["mimeType"].as_str().unwrap())).collect();
         assert_eq!(got, vec![(b"inline".to_vec(), "image/png"), (b"from-file".to_vec(), "image/png"), (b"thumb".to_vec(), "image/jpeg")]);
         assert_eq!((st.images, st.missing_images), (3, 1));
+        assert_eq!(c.as_array().unwrap().len(), 5, "the text, three images, then the note for the image with no bytes");
+        assert_eq!(
+            c[4]["text"],
+            "[attachment not carried: image (image/png) \u{2014} the conversation holds no bytes for it: no inline data, file or thumbnail]"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
