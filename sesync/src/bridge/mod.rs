@@ -1,6 +1,7 @@
-//! The phone bridge: a WebSocket server that speaks the part of Orca's mobile protocol the Orca
-//! Android app needs to pair with this machine and list its sessions. The protocol subset, the
-//! pairing flow and the security notes are in docs/BRIDGE.md.
+//! The phone bridge: a WebSocket server that speaks the part of Orca's mobile protocol the agent-hub
+//! Android app needs to pair with this machine, list its sesync conversations, open their herdr panes
+//! live and type prompts into them. The protocol subset, the mapping onto sesync and herdr, the
+//! streams and the security notes are in docs/BRIDGE.md.
 //!
 //! Only `sesync bridge …` runs any of this. The daemon, the TUI and the team client never touch it.
 
@@ -8,11 +9,15 @@ pub mod catalog;
 pub mod cli;
 pub mod devices;
 pub mod e2ee;
+pub mod herdr;
 pub mod keys;
 pub mod net;
 pub mod offer;
 pub mod rpc;
 pub mod server;
+pub mod stream;
+pub mod terminals;
+pub mod turns;
 
 /// The port Orca's desktop listens on, and so the port the app dials.
 pub const DEFAULT_PORT: u16 = 6768;

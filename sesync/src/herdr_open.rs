@@ -465,18 +465,18 @@ fn tag_suffix(tag: &str) -> String {
     if tag.is_empty() { String::new() } else { format!(" · {tag}") }
 }
 
+/// Whether one of these foreground argument lists has `ident` as a flag's value. Nothing matches an
+/// empty identifier. The phone bridge uses the same rule to find a conversation's panes.
+pub fn argv_carries(argvs: &[Vec<String>], ident: &str) -> bool {
+    !ident.is_empty()
+        && argvs.iter().any(|argv| argv.windows(2).any(|pair| pair[0].starts_with('-') && pair[1] == ident))
+}
+
 /// The pane whose foreground process was started with `ident` as a flag's value. When no pane
 /// matches that way, a pane with no foreground argument list whose tab is labelled with `tag` is
 /// the session. Nothing matches an empty identifier.
 pub fn find_open_pane<'a>(panes: &'a [PaneProcs], ident: &str, tag: &str) -> Option<&'a PaneProcs> {
-    let by_argv = if ident.is_empty() {
-        None
-    } else {
-        panes.iter().find(|pane| {
-            pane.argvs.iter().any(|argv| argv.windows(2).any(|pair| pair[0].starts_with('-') && pair[1] == ident))
-        })
-    };
-    by_argv.or_else(|| {
+    panes.iter().find(|pane| argv_carries(&pane.argvs, ident)).or_else(|| {
         let suffix = tag_suffix(tag);
         if suffix.is_empty() {
             return None;

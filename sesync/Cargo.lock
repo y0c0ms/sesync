@@ -2359,6 +2359,7 @@ dependencies = [
  "crossterm",
  "crypto_box",
  "futures-util",
+ "parking_lot",
  "postgres",
  "proptest",
  "qrcodegen",

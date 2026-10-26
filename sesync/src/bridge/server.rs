@@ -1,16 +1,18 @@
 //! The WebSocket server. A connection is a fixed sequence:
 //!   1. plaintext `e2ee_hello` → plaintext `e2ee_ready` (a v2 hello is closed with 4001 instead);
 //!   2. encrypted `e2ee_auth` with a paired device token → encrypted `e2ee_authenticated`;
-//!   3. encrypted RPC requests, each carrying the device token, answered in order.
+//!   3. encrypted RPC requests, each carrying the device token, answered in order. A request may open a
+//!      stream (terminal, tabs, status); the stream's frames are sent on the same connection, through the
+//!      one writer task, so frames from streams and replies never interleave mid-frame.
 //! A peer outside the allowlist is dropped before step 1. A token is checked on every frame, so a
 //! revoked device is refused on its next frame.
 
-use super::catalog::Catalog;
 use super::devices;
 use super::e2ee::{self, Channel};
 use super::keys::ServerKeys;
 use super::net::{self, Cidr};
-use super::rpc::{self, Host};
+use super::rpc::{self, Ctx};
+use super::stream::{Conn, Sink};
 use super::UNAUTHORIZED_CLOSE;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, Stream, StreamExt};
@@ -20,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -37,8 +40,7 @@ pub struct Shared {
     pub dir: PathBuf,
     pub keys: ServerKeys,
     pub allow: Vec<Cidr>,
-    pub host: Host,
-    pub catalog: Arc<dyn Catalog>,
+    pub ctx: Ctx,
 }
 
 /// Accept connections until the listener fails repeatedly. Never returns on its own; the caller
@@ -77,7 +79,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) ->
         .map_err(|e| e.to_string())?;
     let (mut tx, mut rx) = ws.split();
 
-    // 1. Plaintext hello and ready.
+    // 1. Plaintext hello and ready. Written before the writer task exists, so nothing else can write.
     let Some(hello) = next_text(&mut rx, Some(HANDSHAKE_TIMEOUT)).await? else { return Ok(()) };
     let hello: Value = serde_json::from_str(&hello).unwrap_or(Value::Null);
     if hello.get("type") != Some(&json!("e2ee_hello")) {
@@ -94,19 +96,42 @@ async fn connection(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) ->
         return close(&mut tx, None, "").await;
     };
     send_text(&mut tx, json!({ "type": "e2ee_ready" }).to_string()).await?;
-    let channel = Channel::new(&client, &shared.keys.secret);
+    let channel = Arc::new(Channel::new(&client, &shared.keys.secret));
 
-    // 2 and 3. Encrypted auth, then encrypted RPC.
+    // From here on every frame leaves through the writer, so replies and stream frames are ordered.
+    let (out_tx, out_rx) = unbounded_channel::<Message>();
+    let writer = tokio::spawn(write_frames(tx, out_rx));
+    let sink = Sink::new(out_tx, Arc::clone(&channel));
+    let conn = Arc::new(Conn::new(sink.clone()));
+    let result = serve_requests(&mut rx, &channel, &sink, &conn, &shared, peer).await;
+    // Dropping the connection stops its streams; each stream's sender goes with it, so the writer ends.
+    drop(conn);
+    drop(sink);
+    let _ = writer.await;
+    result
+}
+
+/// Steps 2 and 3: authenticate, then answer requests until the peer leaves.
+async fn serve_requests(
+    rx: &mut (impl Stream<Item = Result<Message, WsError>> + Unpin),
+    channel: &Arc<Channel>,
+    sink: &Sink,
+    conn: &Arc<Conn>,
+    shared: &Arc<Shared>,
+    peer: SocketAddr,
+) -> Result<(), String> {
     let mut authed = false;
     loop {
         let limit = if authed { None } else { Some(HANDSHAKE_TIMEOUT) };
-        let Some(frame) = next_text(&mut rx, limit).await? else { return Ok(()) };
+        let Some(frame) = next_text(rx, limit).await? else { return Ok(()) };
         // An undecryptable frame is dropped, not answered: it proves nothing about the peer.
         let Some(plain) = channel.open(&frame) else { continue };
         let msg: Value = match serde_json::from_str(&plain) {
             Ok(value) => value,
             Err(_) => {
-                send_sealed(&mut tx, &channel, &rpc::error(&Value::Null, "bad_request", "Invalid JSON")).await?;
+                if !sink.json(&rpc::error(&Value::Null, "bad_request", "Invalid JSON")) {
+                    return Ok(());
+                }
                 continue;
             }
         };
@@ -116,29 +141,50 @@ async fn connection(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) ->
             if msg.get("type") == Some(&json!("e2ee_auth")) && devices::verify(&shared.dir, token) {
                 authed = true;
                 eprintln!("bridge: {peer} authenticated");
-                send_sealed(&mut tx, &channel, &json!({ "type": "e2ee_authenticated" })).await?;
+                if !sink.json(&json!({ "type": "e2ee_authenticated" })) {
+                    return Ok(());
+                }
                 continue;
             }
             // The reason is not logged with the token; the peer learns only "unauthorized".
             eprintln!("bridge: {peer} refused at auth");
-            send_sealed(&mut tx, &channel, &json!({ "type": "e2ee_error", "error": { "code": "unauthorized" } })).await?;
-            return close(&mut tx, Some(UNAUTHORIZED_CLOSE), "unauthorized").await;
+            sink.json(&json!({ "type": "e2ee_error", "error": { "code": "unauthorized" } }));
+            sink.close(UNAUTHORIZED_CLOSE, "unauthorized");
+            return Ok(());
         }
 
         if !devices::verify(&shared.dir, token) {
             let id = msg.get("id").cloned().unwrap_or(Value::Null);
-            send_sealed(&mut tx, &channel, &rpc::error(&id, "unauthorized", "this device is not paired")).await?;
+            sink.json(&rpc::error(&id, "unauthorized", "this device is not paired"));
             eprintln!("bridge: {peer} is no longer paired; closed");
-            return close(&mut tx, Some(UNAUTHORIZED_CLOSE), "unauthorized").await;
+            sink.close(UNAUTHORIZED_CLOSE, "unauthorized");
+            return Ok(());
         }
 
-        // Catalog reads touch the disk; keep them off the reactor.
-        let worker = Arc::clone(&shared);
-        let reply = tokio::task::spawn_blocking(move || rpc::dispatch(&msg, worker.catalog.as_ref(), &worker.host))
+        // Catalog and herdr reads touch the disk and the socket; keep them off the reactor.
+        let ctx = shared.ctx.clone();
+        let conn = Arc::clone(conn);
+        let reply = tokio::task::spawn_blocking(move || rpc::dispatch(&msg, &ctx, &conn))
             .await
             .map_err(|e| e.to_string())?;
-        send_sealed(&mut tx, &channel, &reply).await?;
+        if let Some(reply) = reply {
+            if !sink.json(&reply) {
+                return Ok(());
+            }
+        }
     }
+}
+
+/// The only writer to the socket once the handshake is done. Ends when every sender is gone or after
+/// a close frame.
+async fn write_frames(mut tx: Tx, mut out: UnboundedReceiver<Message>) {
+    while let Some(msg) = out.recv().await {
+        let closing = matches!(msg, Message::Close(_));
+        if tx.send(msg).await.is_err() || closing {
+            break;
+        }
+    }
+    let _ = SinkExt::close(&mut tx).await;
 }
 
 /// The next text (or UTF-8 binary) message. None when the peer closed the socket. A timeout or a
@@ -172,12 +218,7 @@ async fn send_text(tx: &mut Tx, text: String) -> Result<(), String> {
     tx.send(Message::Text(text.into())).await.map_err(|e| e.to_string())
 }
 
-async fn send_sealed(tx: &mut Tx, channel: &Channel, value: &Value) -> Result<(), String> {
-    let frame = channel.seal(&value.to_string())?;
-    send_text(tx, frame).await
-}
-
-/// Close the socket, with `code` when given. An empty reason is sent as none.
+/// Close the socket before the writer exists, with `code` when given. An empty reason is sent as none.
 async fn close(tx: &mut Tx, code: Option<u16>, reason: &str) -> Result<(), String> {
     let frame = code.map(|code| CloseFrame { code: CloseCode::from(code), reason: reason.into() });
     tx.send(Message::Close(frame)).await.map_err(|e| e.to_string())

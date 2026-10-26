@@ -45,6 +45,20 @@ impl Channel {
         Ok(STANDARD.encode(frame))
     }
 
+    /// Encrypt raw bytes for a binary WebSocket message: `nonce ‖ box`, not base64. This is the
+    /// layout Orca's legacy channel reads with `openLegacyBinary` (`paired-e2ee-primitives.ts`).
+    pub fn seal_bytes(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let mut nonce = [0u8; NONCE_LEN];
+        SystemRandom::new().fill(&mut nonce)
+            .map_err(|_| "no system randomness for an E2EE frame".to_string())?;
+        let boxed = self.boxed.encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|_| "E2EE encryption failed".to_string())?;
+        let mut frame = Vec::with_capacity(NONCE_LEN + boxed.len());
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&boxed);
+        Ok(frame)
+    }
+
     /// Decrypt one inbound frame. None for anything that is not a valid frame under this key:
     /// malformed base64, too short, a failed tag, or non-UTF-8 plaintext.
     pub fn open(&self, frame: &str) -> Option<String> {

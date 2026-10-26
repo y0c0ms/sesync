@@ -210,8 +210,8 @@ if (statusResult.success) {
   record('Orca host status schema reads the result', hostStatus.hostStatusSchema.safeParse(statusResult.data).success)
 }
 
-// 3. The home screen's reads. Served: worktree.ps and repo.list. Unserved: method_not_found, which
-// Orca must read as "unavailable" and skip.
+// 3. The home screen's reads. Served: worktree.ps and repo.list. Unserved (the phase-1 surface does not
+// include them): method_not_found, which Orca must read as "unavailable" and skip.
 paired.sendSealed({ id: 'rpc-wt', deviceToken: offer.deviceToken, method: 'worktree.ps' })
 const worktrees = await paired.sealedReply()
 record('worktree.ps returns a worktree list', worktrees.ok === true && WorktreeResult.safeParse(worktrees.result).success)
@@ -220,7 +220,7 @@ paired.sendSealed({ id: 'rpc-repo', deviceToken: offer.deviceToken, method: 'rep
 const repos = await paired.sealedReply()
 record('repo.list returns a repo list', repos.ok === true && RepoResult.safeParse(repos.result).success)
 
-paired.sendSealed({ id: 'rpc-term', deviceToken: offer.deviceToken, method: 'terminal.list' })
+paired.sendSealed({ id: 'rpc-term', deviceToken: offer.deviceToken, method: 'accounts.list' })
 const term = await paired.sealedReply()
 const termCode = term.error?.code
 const termMessage = term.error?.message

@@ -23,10 +23,12 @@ zstd = "0.14"
 ureq = { version = "2", features = ["json"] }
 qrcodegen = "1"
 # The phone bridge (`sesync bridge`): a WebSocket server on tokio. Only the bridge subcommand runs it.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 base64 = "0.22"
+# Mutexes the bridge holds for one short section each; parking_lot's guards need no poison handling.
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's

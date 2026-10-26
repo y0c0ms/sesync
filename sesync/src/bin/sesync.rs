@@ -659,7 +659,8 @@ fn main() {
             home: env.home.clone(),
             sesync_conv: env.sesync_conv.clone(),
         };
-        let code = sesync::bridge::cli::run(&args[1..], &team_config_dir().join("bridge"), move || {
+        let locks = sesync::bridge::turns::LockTools { sesync_lock: env.sesync_lock.clone(), lock_dir: env.lock_dir() };
+        let code = sesync::bridge::cli::run(&args[1..], &team_config_dir().join("bridge"), locks, move || {
             std::sync::Arc::new(sesync::bridge::catalog::StateCatalog { roots, state_file })
         });
         std::process::exit(code);

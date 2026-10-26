@@ -2,8 +2,11 @@
 //! `sesync team`: 0 on success, 2 on a usage mistake, 1 on a failure.
 
 use super::catalog::Catalog;
+use super::herdr::{self, Herdr};
 use super::offer::{self, Offer};
-use super::{devices, keys, net, rpc, server, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
+use super::rpc::{self, Ctx};
+use super::turns::{LockTools, Turns};
+use super::{devices, keys, net, server, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
 use crate::qr;
 use qrcodegen::QrCode;
 use std::collections::HashMap;
@@ -15,7 +18,7 @@ use tokio::net::TcpListener;
 const USAGE: &str = "usage: sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]
        sesync bridge devices
        sesync bridge revoke <device-id>
-       sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,CIDR,...]";
+       sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,CIDR,...] [--herdr-socket PATH]";
 
 enum Fail {
     Usage(String),
@@ -23,13 +26,14 @@ enum Fail {
 }
 
 /// Run one `sesync bridge` command. `dir` is the bridge's state directory; `catalog` is called only
-/// by `serve`, so the other commands never read a session store.
-pub fn run(args: &[String], dir: &Path, catalog: impl FnOnce() -> Arc<dyn Catalog>) -> i32 {
+/// by `serve`, so the other commands never read a session store. `locks` says where sesync-lock is
+/// and where its claims live; `serve` uses it for prompt turns.
+pub fn run(args: &[String], dir: &Path, locks: LockTools, catalog: impl FnOnce() -> Arc<dyn Catalog>) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("pair") => pair(&args[1..], dir),
         Some("devices") => list_devices(&args[1..], dir),
         Some("revoke") => revoke(&args[1..], dir),
-        Some("serve") => serve(&args[1..], dir, catalog()),
+        Some("serve") => serve(&args[1..], dir, catalog(), locks),
         _ => Err(Fail::Usage("expected a command".into())),
     };
     match result {
@@ -90,23 +94,25 @@ fn revoke(args: &[String], dir: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>) -> Result<(), Fail> {
-    let opts = options(args, &["listen", "allow"])?;
+fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTools) -> Result<(), Fail> {
+    let opts = options(args, &["listen", "allow", "herdr-socket"])?;
     let listen_text = opts.get("listen").cloned().unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
     let listen: SocketAddr = listen_text.parse()
         .map_err(|_| Fail::Usage(format!("{listen_text}: not an address:port")))?;
     let allow_text = opts.get("allow").cloned().unwrap_or_else(|| DEFAULT_ALLOW.to_string());
     let allow = net::parse_list(&allow_text).map_err(Fail::Usage)?;
+    let herdr_socket = opts.get("herdr-socket").map_or_else(herdr::default_socket, Into::into);
 
     let keys = keys::load_or_create(&dir.join("server.key")).map_err(Fail::Failed)?;
     let paired = devices::list(dir).map_err(Fail::Failed)?.len();
-    let shared = Arc::new(server::Shared {
-        dir: dir.to_path_buf(),
-        keys,
-        allow,
-        host: rpc::Host { machine_name: machine_name(), platform: platform() },
+    let ctx = Ctx {
         catalog,
-    });
+        herdr: Arc::new(herdr::Socket::new(herdr_socket.clone())) as Arc<dyn Herdr>,
+        host: rpc::Host { machine_name: machine_name(), platform: platform() },
+        locks,
+        turns: Turns::default(),
+    };
+    let shared = Arc::new(server::Shared { dir: dir.to_path_buf(), keys, allow, ctx });
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()
         .map_err(|e| Fail::Failed(format!("cannot start the runtime: {e}")))?;
@@ -115,6 +121,7 @@ fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>) -> Result<(), F
             .map_err(|e| Fail::Failed(format!("cannot listen on {listen}: {e}")))?;
         let bound = listener.local_addr().map_err(|e| Fail::Failed(e.to_string()))?;
         eprintln!("bridge: listening on ws://{bound}; allowed networks {allow_text}");
+        eprintln!("bridge: herdr socket {}", herdr_socket.display());
         if paired == 0 {
             eprintln!("bridge: no paired devices yet; run `sesync bridge pair`");
         }
