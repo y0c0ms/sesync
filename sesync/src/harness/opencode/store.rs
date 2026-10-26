@@ -341,6 +341,7 @@ pub fn install_opencode(
         .arg("to-opencode").arg(src)
         .arg("--out").arg(&bundle)
         .args(["--id", mirror_id, "--title", title])
+        .args(crate::harness::window::flags("opencode", src))
         .output()
         .map_err(|e| format!("cannot run sesync-conv: {e}"))?;
     if !conv.status.success() {

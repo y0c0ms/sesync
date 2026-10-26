@@ -59,7 +59,8 @@ impl Harness for Claude {
         name.strip_suffix(".jsonl").filter(|stem| uuid::Uuid::parse_str(stem).is_ok()).map(str::to_string)
     }
     fn install(&self, loc: &Location, tools: &Tools, journal: &Path, mirror_id: &str, title: &str) -> Result<String, String> {
-        journal::install(tools.sesync_conv, journal, "to-claude", "projects", &loc.root, &[], mirror_id, title)
+        let fit = super::window::flags(self.id(), journal);
+        journal::install(tools.sesync_conv, journal, "to-claude", "projects", &loc.root, &fit, mirror_id, title)
             .map(|p| p.display().to_string())
     }
     /// Claude's own rename: a `custom-title` record is appended (what /rename and -n write); the
