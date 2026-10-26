@@ -1,0 +1,39 @@
+  ┃
+  ┃  Which colour?
+  ┃  Blue
+  ┃
+
+     question done
+
+     ▣  Build · fake-32k · 7.3s
+
+  ┃
+  ┃  run ls
+  ┃
+
+  ┃
+  ┃  $ ls -la
+  ┃
+  ┃  total 0
+  ┃  drwxr-xr-x.  2 yocoms yocoms   40 Oct 26 22:29 .
+  ┃  drwx------. 10 yocoms yocoms 1280 Oct 26 22:38 ..
+  ┃
+
+     listing done
+
+     ▣  Build · fake-32k · 238ms
+
+  ┃
+  ┃  run ls
+  ┃
+
+     $ ls -la
+
+     ▣  Build · fake-32k
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · fake-32k Fake
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   <SANDBOX>/work                                                             8.3K (25%)  ctrl+p commands

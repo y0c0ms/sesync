@@ -12,11 +12,17 @@
 
 use super::catalog::{self, Catalog, Conversation, Project};
 use super::herdr::{self, Herdr};
+use super::notify;
+use super::start;
 use super::stream::{self, Conn};
 use super::terminals::{self, Running};
+use super::transcript;
 use super::turns::{LockTools, Turns};
+use super::uploads;
+use super::usage;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -46,10 +52,20 @@ pub struct Ctx {
     pub host: Host,
     pub locks: LockTools,
     pub turns: Turns,
+    /// The bridge's state directory (`<sesync config>/bridge`). Owner-only bridge files live under it.
+    pub dir: PathBuf,
+    /// In-app notifications: the live stream, the recent history and the optional ntfy push.
+    pub notify: notify::Hub,
+    /// The latest plan usage per account, from `omp usage --json`, and its subscribers.
+    pub usage: usage::Store,
+    /// Image uploads in progress, by upload id.
+    pub uploads: uploads::Store,
+    /// How this host starts agent sessions (`preflight.detectAgents`, `agentSession.create`).
+    pub launch: start::Launch,
 }
 
 /// A failed request: the error code the phone sees, and its message.
-type Failure = (&'static str, String);
+pub type Failure = (&'static str, String);
 
 /// Answer one decrypted request frame. The reply carries the request's `id`, as the app matches on it.
 /// `None` means a stream took the request over: its first frame was already sent on `conn`.
@@ -61,14 +77,30 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
         "session.tabs.subscribe" => return stream_or_error(&id, tabs_subscribe(&params, ctx, conn, &id)),
         "terminal.subscribe" => return stream_or_error(&id, terminal_subscribe(&params, ctx, conn, &id)),
         "agentSession.subscribeStatus" => return stream_or_error(&id, status_subscribe(ctx, conn, &id)),
+        "nativeChat.subscribe" => return stream_or_error(&id, transcript::subscribe(&params, ctx, conn, &id)),
+        "notifications.subscribe" => return stream_or_error(&id, notify::subscribe(&params, ctx, conn, &id)),
+        "accounts.subscribe" => return stream_or_error(&id, usage::accounts_subscribe(&params, ctx, conn, &id)),
         "status.get" => Ok(status(&ctx.host)),
         "worktree.ps" => worktree_ps(ctx),
         "repo.list" => repo_list(ctx),
         "session.tabs.list" => tabs_list(&params, ctx),
-        "session.tabs.unsubscribe" | "terminal.unsubscribe" => Ok(unsubscribe(&params, conn)),
+        "session.tabs.unsubscribe" | "terminal.unsubscribe" | "nativeChat.unsubscribe"
+        | "notifications.unsubscribe" | "accounts.unsubscribe" => Ok(unsubscribe(&params, conn)),
         "terminal.list" => terminal_list(&params, ctx),
         "terminal.read" => terminal_read(&params, ctx),
         "terminal.send" => terminal_send(&params, ctx),
+        "nativeChat.readSession" => transcript::read_session(&params, ctx),
+        "clipboard.startImageUpload" => uploads::start(&params, ctx),
+        "clipboard.appendImageUploadChunk" => uploads::append(&params, ctx),
+        "clipboard.commitImageUpload" => uploads::commit(&params, ctx),
+        "clipboard.abortImageUpload" => uploads::abort(&params, ctx),
+        "clipboard.saveImageAsTempFile" => uploads::save_temp_file(&params, ctx),
+        "preflight.detectAgents" => start::detect_agents(&params, ctx),
+        "settings.get" => start::settings_get(&params, ctx),
+        "session.tabs.createTerminal" => start::create_terminal_tab(&params, ctx),
+        "notifications.getMissedSince" => notify::get_missed_since(&params, ctx),
+        "notifications.registerPush" | "notifications.unregisterPush" => Ok(json!({})),
+        "accounts.list" => usage::accounts_list(&params, ctx),
         other => return Some(error(&id, "method_not_found", &format!("Unknown method: {other}"))),
     };
     Some(match outcome {
@@ -331,7 +363,8 @@ fn submit(ctx: &Ctx, pane: &herdr::Pane, text: &str) -> Result<(), Failure> {
     let h = ctx.herdr.as_ref();
     let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
     let argvs = herdr::foreground_argvs(h, &pane.pane_id).map_err(|m| ("herdr_unavailable", m))?;
-    let running = Running { pane: pane.clone(), argvs };
+    let owner = terminals::owner_of(&pane.terminal_id);
+    let running = Running { pane: pane.clone(), argvs, prompt: None, owner };
     let conv = terminals::conversation_of(&running, &conversations).cloned();
     if let Some(c) = &conv {
         ctx.turns.begin(&ctx.locks, &c.lock_id(), &pane.terminal_id).map_err(|m| ("conversation_locked", m))?;
@@ -483,6 +516,11 @@ mod tests {
             host: Host { machine_name: "box".into(), platform: "linux" },
             locks: LockTools { sesync_lock: "/nonexistent/sesync-lock".into(), lock_dir: "/nonexistent".into() },
             turns: Turns::default(),
+            dir: std::env::temp_dir().join("sesync-rpc-unit"),
+            notify: notify::Hub::new(None),
+            usage: usage::Store::default(),
+            uploads: uploads::Store::default(),
+            launch: start::Launch::default(),
         }
     }
 

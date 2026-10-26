@@ -32,6 +32,7 @@ fn an_idle_bridge_stays_under_its_resident_memory_budget() {
             "--listen", &format!("127.0.0.1:{port}"),
             "--allow", "127.0.0.1/32",
             "--herdr-socket", &sandbox.join("no-herdr.sock").display().to_string(),
+            "--no-ntfy", "--no-usage",
         ])
         .env("SESYNC_CONFIG_DIR", &config)
         .env("SESYNC_LOCK", sandbox.join("no-sesync-lock"))

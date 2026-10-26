@@ -5,32 +5,75 @@
 //! Everything here is a pure mapping over herdr's answers, so the unit tests drive it with canned
 //! pane lists.
 
+use super::approvals;
 use super::catalog::Conversation;
-use std::sync::LazyLock;
 use super::herdr::{self, Herdr, Pane};
 use crate::herdr_open;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A herdr pane with the argument lists of its foreground processes.
+/// How many recent screen lines are read to find a blocked pane's prompt.
+const SCREEN_LINES: u32 = 60;
+
+/// A herdr pane with the argument lists of its foreground processes. `prompt` is set only when herdr
+/// reports the pane blocked on a prompt the bridge recognises: the app's `interactivePrompt` envelope.
+/// `owner` is the worktree id the bridge opened the pane for (see `remember_pane`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Running {
     pub pane: Pane,
     pub argvs: Vec<Vec<String>>,
+    pub prompt: Option<String>,
+    pub owner: Option<String>,
+}
+
+/// Panes the bridge opened, by herdr terminal id, with the worktree id they were opened for. A pane
+/// opened without a resume runs no session id yet, so its argv cannot place it; this does. Entries of
+/// panes herdr no longer lists are dropped on the next listing.
+static OPENED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record that the pane `terminal_id` belongs to the worktree `worktree_id`.
+pub fn remember_pane(terminal_id: &str, worktree_id: &str) {
+    OPENED.lock().insert(terminal_id.to_string(), worktree_id.to_string());
+}
+
+/// The worktree id a pane was opened for, when the bridge opened it.
+pub fn owner_of(terminal_id: &str) -> Option<String> {
+    OPENED.lock().get(terminal_id).cloned()
 }
 
 /// Every pane herdr has, with its foreground processes. Fails closed: a pane whose processes cannot
 /// be read fails the listing, so no conversation is reported idle while one of its panes is unknown.
 pub fn running_panes(h: &dyn Herdr) -> Result<Vec<Running>, String> {
-    herdr::list_panes(h)?
+    let panes = herdr::list_panes(h)?;
+    let owners: HashMap<String, String> = {
+        let mut opened = OPENED.lock();
+        opened.retain(|terminal, _| panes.iter().any(|p| p.terminal_id == *terminal));
+        opened.clone()
+    };
+    panes
         .into_iter()
         .map(|pane| {
             let argvs = herdr::foreground_argvs(h, &pane.pane_id)
                 .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
-            Ok(Running { pane, argvs })
+            let prompt = blocked_prompt(h, &pane);
+            let owner = owners.get(&pane.terminal_id).cloned();
+            Ok(Running { pane, argvs, prompt, owner })
         })
         .collect()
+}
+
+/// The prompt a blocked pane is waiting on, read from its recent screen. Best effort: a pane whose
+/// screen cannot be read shows no card rather than failing the listing.
+fn blocked_prompt(h: &dyn Herdr, pane: &Pane) -> Option<String> {
+    if pane.agent_status != "blocked" {
+        return None;
+    }
+    let screen = herdr::read_recent_text(h, &pane.pane_id, SCREEN_LINES).ok()?;
+    approvals::interactive_prompt(&screen, pane.agent.as_deref().unwrap_or(""))
 }
 
 /// The panes that run `conv`, in herdr's order.
@@ -45,7 +88,8 @@ pub fn conversation_of<'a>(pane: &Running, conversations: &'a [Conversation]) ->
 }
 
 fn runs(r: &Running, conv: &Conversation) -> bool {
-    conv.idents.iter().any(|ident| herdr_open::argv_carries(&r.argvs, ident))
+    r.owner.as_deref() == Some(conv.worktree_id().as_str())
+        || conv.idents.iter().any(|ident| herdr_open::argv_carries(&r.argvs, ident))
 }
 
 /// The label a terminal shows: the harness and the conversation's title, as "open in herdr" names a tab.
@@ -64,7 +108,50 @@ pub fn tab(r: &Running, conv: &Conversation) -> Value {
         "terminal": r.pane.terminal_id,
         "status": "ready",
         "leafId": r.pane.terminal_id,
+        "agentStatus": agent_status(r, conv),
     })
+}
+
+/// The `agentStatus` of a tab row (src/shared/agent-status-types.ts). `state` is herdr's status in the
+/// app's four states, idle and unknown both `waiting`. A card opens when the state is `blocked` or
+/// `waiting` and `interactivePrompt` is set. `providerSession.id` is the conversation's journal session
+/// id, the one `nativeChat.readSession` reads by, not the herdr pane id.
+pub fn agent_status(r: &Running, conv: &Conversation) -> Value {
+    let state = agent_state(&r.pane.agent_status);
+    let since = state_since(&r.pane.terminal_id, state);
+    let session_id = super::transcript::session_id(conv);
+    let mut status = json!({
+        "state": state,
+        "prompt": "",
+        "updatedAt": since,
+        "stateStartedAt": since,
+        "paneKey": format!("{}:{}", r.pane.tab_id, r.pane.terminal_id),
+        "terminalHandle": r.pane.terminal_id,
+        "agentType": conv.harness,
+        "stateHistory": [],
+        "providerSession": { "key": "session_id", "id": session_id },
+    });
+    if let Some(prompt) = &r.prompt {
+        status["interactivePrompt"] = json!(prompt);
+    }
+    status
+}
+
+/// When each pane's current state began, as this bridge first saw it. Kept across listings, so the tab
+/// rows do not change on every poll.
+static STATE_SINCE: LazyLock<Mutex<HashMap<String, (&'static str, f64)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn state_since(terminal_id: &str, state: &'static str) -> f64 {
+    let mut seen = STATE_SINCE.lock();
+    match seen.get(terminal_id) {
+        Some((previous, since)) if *previous == state => *since,
+        _ => {
+            let now = now_ms();
+            seen.insert(terminal_id.to_string(), (state, now));
+            now
+        }
+    }
 }
 
 /// The `session.tabs.list` result: the conversation's terminals, with the focused one active.
@@ -229,6 +316,8 @@ mod tests {
                 rows: Some(40),
             },
             argvs: vec![argv.iter().map(|s| s.to_string()).collect()],
+            prompt: None,
+            owner: None,
         }
     }
 

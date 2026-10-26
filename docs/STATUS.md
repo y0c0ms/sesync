@@ -183,6 +183,26 @@ Worktree `/home/yocoms/projects/sesync-wt-windows-build`, from `herdr-open` @072
   Windows-side `device.key` permission model (no POSIX mode on Windows; the profile's ACL applies).
 - **Next action.** Run the team join on the work PC per `~/projects/agent-hub-notes/work-pc-join.md`.
 
+## 2026-10-26: phone bridge phase 2 (branch `bridge-phase2`)
+
+Worktree `/home/yocoms/projects/sesync-wt-phone-bridge`. Committed on `bridge-phase2`, not pushed.
+
+- **Surface.** Chat (`nativeChat.readSession`, `nativeChat.subscribe`), prompts and approval keys
+  through `terminal.send`, approval cards from `agentStatus.interactivePrompt` (omp and OpenCode
+  recognised), images (`clipboard.*`), new sessions (`preflight.detectAgents`, `settings.get`,
+  `session.tabs.createTerminal`), notifications (in-app stream, `getMissedSince`, ntfy push) and plan
+  usage (`accounts.list`, `accounts.subscribe`). The `agentSession.*` structured methods stay
+  `method_not_found`: the app's terminal-backed path never calls them (its only calls are the refused
+  claude/codex create path, which falls through to `session.tabs.createTerminal`).
+- **Tests.** Bridge unit tests 140/140; `tests/bridge.rs` 17/17 including five live cases against a
+  sandboxed herdr, real omp and fake-model; `bridge_resources` idle RSS under 20 MB.
+- **Fixes found on the way.** Notifications raise needs-input on any change into `blocked`, as the
+  spec says (it was working→blocked only). Pane ownership is remembered for panes the bridge opens.
+- **Not done.** A live `omp usage --json` run (schema from omp's source); Claude Code approvals (no
+  fake-model support for the Anthropic API); real ntfy delivery; the emulator run (orca-phone
+  `fork/e2e/backend.sh`, which came up and down in trials, last re-run pending).
+- **Next.** The coordinator runs `sh build-test.sh` and the Detox suite against `backend.sh up`.
+
 ## 2026-10-26: context fit on every message-based mirror (branch `context-fit`)
 
 Worktree `/home/yocoms/projects/sesync-wt-context-fit`, from `herdr-open`. Committed, not pushed.

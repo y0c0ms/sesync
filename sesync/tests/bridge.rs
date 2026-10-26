@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sesync::bridge::catalog::{Catalog, Conversation, StateCatalog};
 use sesync::bridge::devices;
+use sesync::bridge::{notify, ntfy, start, uploads, usage};
 use sesync::bridge::keys;
 use sesync::bridge::net;
 use sesync::bridge::rpc::{Ctx, Host};
@@ -74,6 +75,11 @@ async fn start_with(dir: PathBuf, catalog: Arc<dyn Catalog>, herdr: Arc<dyn herd
             host: Host { machine_name: "test-box".into(), platform: "linux" },
             locks: LockTools { sesync_lock: dir.join("no-sesync-lock"), lock_dir: dir.join("locks") },
             turns: Turns::default(),
+            dir: dir.clone(),
+            notify: notify::Hub::new(None),
+            usage: usage::Store::default(),
+            uploads: uploads::Store::default(),
+            launch: start::Launch::default(),
         },
     });
     tokio::spawn(server::serve(listener, shared));
@@ -220,7 +226,7 @@ async fn an_unserved_method_answers_method_not_found_with_the_request_id() {
     let mut phone = Phone::hello(&b, 9).await;
     phone.auth(&token).await;
 
-    for method in ["accounts.list", "files.read", "nativeChat.send", "preflight.detectAgents", "terminal.multiplex"] {
+    for method in ["files.read", "nativeChat.send", "agentSession.send", "agentSession.currentRequests", "worktree.create", "terminal.multiplex"] {
         let reply = phone.rpc(&token, "rpc-x", method).await;
         assert_eq!(reply["id"], "rpc-x");
         assert_eq!(reply["ok"], false);
@@ -417,6 +423,10 @@ impl SandboxHerdr {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("SHELL", "/bin/sh")
             .env("TERM", "xterm-256color")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("OLLAMA_HOST", "http://127.0.0.1:9")
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -456,6 +466,8 @@ impl Drop for SandboxHerdr {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The sandbox holds omp's extracted natives (hundreds of MB); it goes with the server.
+        let _ = std::fs::remove_dir_all(&self.home);
     }
 }
 
@@ -605,4 +617,601 @@ async fn a_phone_lists_subscribes_types_into_and_watches_a_live_herdr_pane() {
     assert_eq!(sessions[0]["sessionId"], handle.as_str());
     assert_eq!(sessions[0]["workspaceId"], wt.as_str());
     assert!(sessions[0]["status"].is_null(), "herdr reports no status: {status}");
+}
+
+// ----- phase 2: a live world (herdr, fake-model, omp) -----------------------------------------------
+
+/// A one-pixel PNG: the image the upload test sends. omp decodes it as an image input.
+const PIXEL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// How long a turn, a pane or a notification may take before a test fails.
+const TURN: Duration = Duration::from_secs(40);
+
+/// The fake-model binary: `FAKE_MODEL_BIN`, else the sibling worktree's static build. None when absent.
+fn fake_model_bin() -> Option<PathBuf> {
+    let bin = match std::env::var_os("FAKE_MODEL_BIN") {
+        Some(path) => PathBuf::from(path),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sesync-wt-fake-model/fake-model/target/x86_64-unknown-linux-musl/release/fake-model"),
+    };
+    bin.is_file().then_some(bin)
+}
+
+/// A `fake-model` on loopback serving `scenario`, stopped when dropped. `log` is its request log.
+struct FakeModel {
+    child: std::process::Child,
+    _stdout: std::io::BufReader<std::process::ChildStdout>,
+    port: u16,
+    log: PathBuf,
+}
+
+impl FakeModel {
+    fn start(dir: &Path, scenario: &str) -> Option<FakeModel> {
+        let bin = fake_model_bin()?;
+        let scenario_file = dir.join("scenario.yaml");
+        std::fs::write(&scenario_file, scenario).unwrap();
+        let log = dir.join("requests.jsonl");
+        let mut child = std::process::Command::new(bin)
+            .args(["--listen", "127.0.0.1:0", "--scenario"])
+            .arg(&scenario_file)
+            .arg("--log")
+            .arg(&log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("fake-model starts");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+        let port = line.split("port=").nth(1)?.trim().parse().ok()?;
+        Some(FakeModel { child, _stdout: stdout, port, log })
+    }
+
+    /// Every request the fake model has served, parsed from its log.
+    fn requests(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+}
+
+impl Drop for FakeModel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// omp's models for a sandbox HOME: the fake provider alone, its model taking text and images.
+fn write_models(home: &Path, port: u16) {
+    let dir = home.join(".omp/agent");
+    std::fs::create_dir_all(&dir).unwrap();
+    let models = format!(
+        "providers:\n  fake:\n    baseUrl: http://127.0.0.1:{port}/v1\n    api: openai-completions\n    apiKey: fake-key-not-a-secret\n    authHeader: true\n    discovery:\n      type: openai-models-list\n      injectV1: false\n    modelOverrides:\n      fake-32k:\n        input: [text, image]\n"
+    );
+    std::fs::write(dir.join("models.yml"), models).unwrap();
+}
+
+/// An omp command in the sandbox HOME, with the environment that keeps every model call on the fake.
+fn omp_in(home: &Path, cwd: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("omp");
+    cmd.current_dir(cwd)
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("TERM", "dumb")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("OLLAMA_HOST", "http://127.0.0.1:9");
+    cmd
+}
+
+/// Every session journal (`.jsonl`) under `dir`.
+fn journals_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                todo.push(path);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Poll `check` every 100 ms until it yields a value; panics naming `what` after `secs`.
+fn wait_until<T>(what: &str, secs: u64, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+impl Phone {
+    /// The next frame within `within`, decrypted to JSON. Binary frames are skipped. None on timeout.
+    async fn frame_within(&mut self, within: Duration) -> Option<Value> {
+        loop {
+            let next = tokio::time::timeout(within, self.ws.next()).await.ok()?;
+            match next?.ok()? {
+                Message::Text(text) => {
+                    let bytes = STANDARD.decode(text.as_str()).expect("text frames are base64");
+                    let (nonce, boxed) = bytes.split_at(24);
+                    let plain = self.boxed.decrypt(Nonce::from_slice(nonce), boxed).expect("text frame authenticates");
+                    return Some(serde_json::from_slice(&plain).unwrap());
+                }
+                Message::Binary(_) => continue,
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// One request, its reply awaited. Stream frames that arrive meanwhile are kept in `inbox`.
+async fn call_into(phone: &mut Phone, token: &str, id: &str, method: &str, params: Value, inbox: &mut Vec<Value>) -> Value {
+    phone.request(token, id, method, params).await;
+    loop {
+        let frame = phone.frame_within(STEP).await.expect("the bridge answers in time");
+        if frame["id"] == id {
+            return frame;
+        }
+        inbox.push(frame);
+    }
+}
+
+/// A bridge on loopback that serves `ctx`, with its keys in `dir`.
+async fn start_ctx(dir: PathBuf, ctx: Ctx) -> Bridge {
+    let keys = keys::load_or_create(&dir.join("server.key")).unwrap();
+    let server_public = PublicKey::from_slice(&STANDARD.decode(keys.public_key_b64()).unwrap()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shared = Arc::new(Shared { dir: dir.clone(), keys, allow: net::parse_list(LOOPBACK).unwrap(), ctx });
+    tokio::spawn(server::serve(listener, shared));
+    Bridge { addr, dir, server_public }
+}
+
+/// One conversation open in an omp pane, served by a bridge with its phone connected.
+struct World {
+    /// Held for the whole test: see `LIVE_TESTS`.
+    _serial: parking_lot::MutexGuard<'static, ()>,
+    herdr: SandboxHerdr,
+    fake: FakeModel,
+    project: PathBuf,
+    ctx: Ctx,
+    bridge: Bridge,
+    token: String,
+    phone: Phone,
+    inbox: Vec<Value>,
+    worktree: String,
+    /// The tab's terminal id: the handle the phone types into.
+    terminal: String,
+    /// The journal session id the chat view reads by.
+    session: String,
+}
+
+impl World {
+    /// One request; stream frames that arrive meanwhile are kept in the inbox.
+    async fn rpc(&mut self, id: &str, method: &str, params: Value) -> Value {
+        call_into(&mut self.phone, &self.token, id, method, params, &mut self.inbox).await
+    }
+
+    /// Type `text` and press Enter in the conversation's pane, as the composer does. A previous turn
+    /// holds the conversation until the bridge sees its agent idle, so a refusal for that is retried.
+    async fn send(&mut self, text: &str) {
+        let terminal = self.terminal.clone();
+        let deadline = std::time::Instant::now() + TURN;
+        loop {
+            let reply = self.rpc("send", "terminal.send", json!({ "terminal": terminal, "text": text, "enter": true })).await;
+            if reply["result"]["send"]["accepted"] == true {
+                return;
+            }
+            assert!(reply["error"]["code"] == "conversation_locked" && std::time::Instant::now() < deadline, "{reply}");
+            self.pump(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Type `text` without Enter: an approval card's key.
+    async fn key(&mut self, text: &str) {
+        let terminal = self.terminal.clone();
+        let reply = self.rpc("key", "terminal.send", json!({ "terminal": terminal, "text": text, "enter": false })).await;
+        assert_eq!(reply["result"]["send"]["accepted"], true, "{reply}");
+    }
+
+    /// Keep the frames the bridge sends for `within` in the inbox.
+    async fn pump(&mut self, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match self.phone.frame_within(left).await {
+                Some(frame) => self.inbox.push(frame),
+                None => return,
+            }
+        }
+    }
+
+    /// The conversation's tab that satisfies `pred`, polled until one does.
+    async fn tab_where(&mut self, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+        let worktree = self.worktree.clone();
+        let deadline = std::time::Instant::now() + TURN;
+        loop {
+            let reply = self.rpc("tabs", "session.tabs.list", json!({ "worktree": worktree })).await;
+            if let Some(tab) = reply["result"]["tabs"].as_array().and_then(|tabs| tabs.iter().find(|t| pred(*t))) {
+                return tab.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: last reply {reply}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The first notification frame with agent state `state`, read for up to the turn limit.
+    async fn notification(&mut self, state: &str) -> Value {
+        let deadline = std::time::Instant::now() + TURN;
+        loop {
+            if let Some(frame) = self.inbox.iter().find(|f| is_notification(f, state)) {
+                return frame.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "no '{state}' notification in {:?}", self.inbox);
+            self.pump(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+fn is_notification(frame: &Value, state: &str) -> bool {
+    frame["result"]["type"] == "notification" && frame["result"]["agentState"] == state
+}
+
+/// The worktree id of the conversation whose path ends with `suffix`, polled until listed.
+async fn wait_for_worktree(phone: &mut Phone, token: &str, inbox: &mut Vec<Value>, suffix: &str) -> String {
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let reply = call_into(phone, token, "wt", "worktree.ps", json!({}), inbox).await;
+        let found = reply["result"]["worktrees"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| r["path"].as_str().is_some_and(|p| p.ends_with(suffix)))
+                .and_then(|r| r["worktreeId"].as_str().map(str::to_string))
+        });
+        if let Some(id) = found {
+            return id;
+        }
+        assert!(std::time::Instant::now() < deadline, "the conversation is listed: {reply}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The first tab of `worktree`, polled until herdr's pane for the conversation shows up.
+async fn wait_for_tab(phone: &mut Phone, token: &str, inbox: &mut Vec<Value>, worktree: &str) -> Value {
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let reply = call_into(phone, token, "tabs", "session.tabs.list", json!({ "worktree": worktree }), inbox).await;
+        if let Some(tab) = reply["result"]["tabs"].as_array().and_then(|tabs| tabs.first()) {
+            return tab.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "the conversation's pane is listed: {reply}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A live world for one test: a sandboxed herdr, a fake-model serving `scenario`, the conversation
+/// (an omp session) open in a pane, and a bridge with a paired phone. None, with a note, when herdr or
+/// the fake-model binary is not available.
+/// Live tests take this lock, so their omp and herdr runs never compete for CPU and time budgets.
+static LIVE_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> Option<World> {
+    // One live world at a time: each runs omp and herdr, and their 40 s budgets fail under parallel load.
+    let serial = LIVE_TESTS.lock();
+    let Some(herdr) = SandboxHerdr::start(name) else {
+        eprintln!("skipped {name}: no herdr on PATH");
+        return None;
+    };
+    let Some(fake) = FakeModel::start(&herdr.home, scenario) else {
+        eprintln!("skipped {name}: set FAKE_MODEL_BIN to a fake-model build");
+        return None;
+    };
+    write_models(&herdr.home, fake.port);
+    let project = herdr.home.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // The same locations the bridge derives from its HOME in production: each harness's own `locate`.
+    use sesync::harness::Harness;
+    let mut locations = sesync::harness::Locations::default();
+    for h in sesync::harness::ALL {
+        locations.set(h.id(), h.locate(&herdr.home));
+    }
+    let roots = Roots { locations, home: herdr.home.clone(), sesync_conv: herdr.home.join("no-sesync-conv") };
+
+    // The first turn writes the conversation's journal. herdr reports an omp pane's agent only once
+    // omp's integration is installed, and that needs omp to have run once.
+    let first = omp_in(&herdr.home, &project)
+        .args(["-p", "--model", "fake-32k", "--no-title", "--no-lsp", "e2e chat start"])
+        .output()
+        .expect("omp runs");
+    assert!(first.status.success(), "omp -p: {}", String::from_utf8_lossy(&first.stderr));
+    herdr.cli(&["integration", "install", "omp"]);
+    let journals = journals_under(&roots.locations.sessions_dir("omp"));
+    assert_eq!(journals.len(), 1, "one conversation: {journals:?}");
+    let session = journals[0].display().to_string();
+
+    let dir = herdr.home.join("config/bridge");
+    let catalog = Arc::new(StateCatalog { roots, state_file: herdr.home.join("state.json") });
+    let ctx = Ctx {
+        catalog,
+        herdr: Arc::new(herdr::Socket::new(herdr.socket.clone())) as Arc<dyn Herdr>,
+        host: Host { machine_name: "test-box".into(), platform: "linux" },
+        locks: LockTools { sesync_lock: herdr.home.join("no-sesync-lock"), lock_dir: herdr.home.join("locks") },
+        turns: Turns::default(),
+        dir: dir.clone(),
+        notify: notify::Hub::new(push),
+        usage: usage::Store::default(),
+        uploads: uploads::Store::default(),
+        launch: start::Launch::default(),
+    };
+    let bridge = start_ctx(dir, ctx.clone()).await;
+    let (_, token) = pair(&bridge.dir, "phone");
+    let mut phone = Phone::hello(&bridge, 9).await;
+    assert_eq!(phone.auth(&token).await["type"], "e2ee_authenticated");
+
+    // A workspace whose one pane runs the conversation's omp, with the session in its argv.
+    let project_text = project.display().to_string();
+    herdr.cli(&["workspace", "create", "--cwd", project_text.as_str(), "--label", "e2e-chat", "--no-focus"]);
+    let api = herdr.api();
+    let pane = wait_until("the workspace's pane", 20, || herdr::list_panes(&api).ok()?.into_iter().next());
+    let command = format!("omp --resume {session} --model fake-32k --no-title --no-lsp --approval-mode always-ask");
+    herdr.cli(&["pane", "run", pane.pane_id.as_str(), command.as_str()]);
+    wait_until("omp detected in the pane", 40, || {
+        herdr::list_panes(&api)
+            .ok()?
+            .into_iter()
+            .find(|p| p.pane_id == pane.pane_id && p.agent.as_deref() == Some("omp"))
+    });
+
+    let mut inbox = Vec::new();
+    let worktree = wait_for_worktree(&mut phone, &token, &mut inbox, "/project").await;
+    let tab = wait_for_tab(&mut phone, &token, &mut inbox, &worktree).await;
+    let terminal = tab["terminal"].as_str().expect("a tab names its terminal").to_string();
+    let session = tab["agentStatus"]["providerSession"]["id"].as_str().expect("a tab names its session").to_string();
+    Some(World { herdr, fake, project, ctx, bridge, token, phone, inbox, worktree, terminal, session, _serial: serial })
+}
+
+/// A local ntfy stand-in on loopback. It records each request's head and answers 200.
+struct FakeNtfy {
+    addr: std::net::SocketAddr,
+    heads: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl FakeNtfy {
+    fn start() -> FakeNtfy {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().map_while(Result::ok) {
+                let seen = Arc::clone(&seen);
+                std::thread::spawn(move || answer_ntfy(stream, &seen));
+            }
+        });
+        FakeNtfy { addr, heads }
+    }
+
+    /// The heads (request line and headers, lower-cased) of every request so far.
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().iter().map(|h| h.to_ascii_lowercase()).collect()
+    }
+}
+
+/// Read one HTTP request, record its head, and answer 200 with no body.
+fn answer_ntfy(mut stream: std::net::TcpStream, seen: &parking_lot::Mutex<Vec<String>>) {
+    use std::io::{Read, Write};
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let head_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            return;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.strip_prefix("content-length:")?.trim().parse::<usize>().ok()
+        })
+        .unwrap_or(0);
+    while buf.len() < head_end + 4 + length {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    seen.lock().push(head);
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// The approval scenario: a bash call on `approved.txt` once the prompt is sent, and a plain reply
+/// after the tool's result (refused or run).
+const APPROVAL_RULES: &str = "  - name: approval
+    match: 'e2e approve please\\s*$'
+    reply: {tool_call: {name: bash, arguments: {command: \"printf approved > approved.txt\"}}}
+  - name: after-tool
+    match: 'e2e approve please\\s*$'
+    when: tool_result
+    reply: {text: \"finished\"}
+";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_typed_into_a_live_omp_pane_reaches_the_chat_transcript() {
+    let scenario = "rules:\n  - name: reply\n    match: 'e2e reply please\\s*$'\n    reply: {text: \"hello from the fake model\"}\n";
+    let Some(mut w) = live_world("prompt", scenario, None).await else { return };
+    w.send("e2e reply please").await;
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let session = w.session.clone();
+        let page = w.rpc("page", "nativeChat.readSession", json!({ "agent": "omp", "sessionId": session, "limit": 50 })).await;
+        if page["result"]["messages"].to_string().contains("hello from the fake model") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the reply never reached the transcript: {page}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(w.fake.requests().iter().any(|r| r["reply"]["rule_name"] == "reply"), "the scenario answered");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_card_denies_without_running_and_approves_by_running_the_tool() {
+    let scenario = format!("rules:\n{APPROVAL_RULES}");
+    let Some(mut w) = live_world("approve", &scenario, None).await else { return };
+    let approved = w.project.join("approved.txt");
+
+    // A bash call waits for approval: the tab turns blocked and carries the approval envelope.
+    w.send("e2e approve please").await;
+    let card = w.tab_where("the approval card", |t| t["agentStatus"]["state"] == "blocked").await;
+    let prompt: Value =
+        serde_json::from_str(card["agentStatus"]["interactivePrompt"].as_str().expect("the card carries its prompt")).unwrap();
+    assert_eq!(prompt["approval"]["tool"], "bash", "{card}");
+
+    // Deny (Esc): the turn finishes and the call never runs.
+    w.key("\u{1b}").await;
+    let fake = &w.fake;
+    wait_until("the refused turn to finish", 40, || {
+        fake.requests().iter().any(|r| r["reply"]["rule_name"] == "after-tool").then_some(())
+    });
+    assert!(!approved.exists(), "a denied call must not write its file");
+
+    // Approve (Enter) the same call: the tool runs and writes its file.
+    w.send("e2e approve please").await;
+    w.tab_where("the second approval card", |t| t["agentStatus"]["state"] == "blocked").await;
+    w.key("\r").await;
+    wait_until("the approved call to write its file", 40, || approved.exists().then_some(()));
+    assert_eq!(std::fs::read_to_string(&approved).unwrap(), "approved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_image_is_staged_as_a_path_and_reaches_the_model() {
+    // omp expands an `@image` reference into a file block: the last user message is that block, not the text.
+    let scenario = "rules:\n  - name: image\n    match: '\\.png'\n    reply: {text: \"I see a pixel\"}\n";
+    let Some(mut w) = live_world("image", scenario, None).await else { return };
+
+    let started = w.rpc("up", "clipboard.startImageUpload", json!({ "expectedBase64Length": PIXEL_PNG_B64.len() })).await;
+    let upload = started["result"]["uploadId"].as_str().expect("an upload id").to_string();
+    let appended = w
+        .rpc("chunk", "clipboard.appendImageUploadChunk", json!({ "uploadId": upload, "offset": 0, "contentBase64": PIXEL_PNG_B64 }))
+        .await;
+    assert_eq!(appended["result"]["ok"], true, "{appended}");
+    let committed = w.rpc("commit", "clipboard.commitImageUpload", json!({ "uploadId": upload })).await;
+    let path = committed["result"].as_str().expect("the staged path").to_string();
+    assert!(Path::new(&path).is_file(), "staged at {path}");
+
+    // The app inserts the path into the prompt; omp attaches the image and the model receives it.
+    w.send(&format!("@{path} e2e image please")).await;
+    let fake = &w.fake;
+    wait_until("the model to receive an image part", 40, || {
+        fake.requests().iter().any(|r| r["images"].as_u64().is_some_and(|n| n >= 1)).then_some(())
+    });
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let session = w.session.clone();
+        let page = w.rpc("page", "nativeChat.readSession", json!({ "agent": "omp", "sessionId": session, "limit": 50 })).await;
+        if page["result"]["messages"].to_string().contains("I see a pixel") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the image turn reached the transcript: {page}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_agent_tab_for_a_conversation_is_listed_with_its_pane() {
+    let Some(mut w) = live_world("create", "rules:\n  - match: 'never zzz'\n    reply: {text: x}\n", None).await else {
+        return;
+    };
+    let detected = w.rpc("detect", "preflight.detectAgents", json!({})).await;
+    let agents = detected["result"].as_array().expect("a bare array of agent ids");
+    assert!(agents.iter().any(|a| a == "omp"), "omp is installed: {detected}");
+
+    let worktree = w.worktree.clone();
+    let created = w.rpc("create", "session.tabs.createTerminal", json!({ "worktree": worktree, "agent": "omp" })).await;
+    let new_terminal = created["result"]["tab"]["id"].as_str().expect("the new tab's id").to_string();
+    assert_ne!(new_terminal, w.terminal);
+    let listed = w.tab_where("the new tab in the conversation", |t| t["id"] == new_terminal.as_str()).await;
+    assert_eq!(listed["type"], "terminal", "{listed}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_and_needs_input_reach_the_app_stream_and_the_ntfy_topic() {
+    let ntfy = FakeNtfy::start();
+    let push = ntfy::load(&format!("http://{}", ntfy.addr), "agents", "printf fixture-token").expect("the fixture token loads");
+    let scenario = format!(
+        "rules:\n  - name: reply\n    match: 'e2e reply please\\s*$'\n    reply: {{text: \"done\"}}\n{APPROVAL_RULES}"
+    );
+    let Some(mut w) = live_world("notify", &scenario, Some(push)).await else { return };
+    notify::spawn_watcher(w.ctx.clone(), Duration::from_millis(200));
+
+    let subscribed = w.rpc("sub", "notifications.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["type"], "ready", "{subscribed}");
+    let terminal = w.terminal.clone();
+
+    // working -> idle: finished.
+    w.send("e2e reply please").await;
+    let done = w.notification("done").await;
+    assert_eq!(done["result"]["paneKey"], terminal.as_str(), "{done}");
+
+    // working -> blocked: needs input. Deny afterwards so the turn ends.
+    w.send("e2e approve please").await;
+    let blocked = w.notification("blocked").await;
+    assert_eq!(blocked["result"]["paneKey"], terminal.as_str(), "{blocked}");
+    w.key("\u{1b}").await;
+
+    wait_until("both pushes on the ntfy topic", 20, || {
+        let heads = ntfy.heads();
+        let posted = |title: &str| {
+            heads.iter().any(|h| {
+                h.starts_with("post /agents ")
+                    && h.contains("authorization: bearer fixture-token")
+                    && h.contains(&format!("title: {title}"))
+            })
+        };
+        (posted("agent finished") && posted("agent needs input")).then_some(())
+    });
+
+    let missed = w.rpc("missed", "notifications.getMissedSince", json!({ "lastSeenSeq": 0 })).await;
+    assert!(missed["result"]["notifications"].as_array().is_some_and(|n| n.len() >= 2), "{missed}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_phase_two_stubs_answer_the_shapes_the_app_reads() {
+    let b = start("stubs", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 9).await;
+    phone.auth(&token).await;
+
+    let settings = phone.rpc_params(&token, "s", "settings.get", json!({})).await;
+    assert_eq!(settings["result"], json!({ "settings": {} }), "{settings}");
+    let push = phone.rpc_params(&token, "p", "notifications.registerPush", json!({})).await;
+    assert_eq!(push["ok"], true, "{push}");
+    let send = phone.rpc_params(&token, "x", "agentSession.send", json!({})).await;
+    assert_eq!(send["error"]["code"], "method_not_found", "the terminal-backed app never calls it: {send}");
 }

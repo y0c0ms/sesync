@@ -1,7 +1,7 @@
 # Phone bridge (`sesync bridge`)
 
 A WebSocket server that lets the Orca-derived Android app (agent-hub) pair with this machine and work
-with its sesync conversations: list them, open one, watch its herdr pane live, and type a prompt into it.
+with its sesync conversations: list them, read each transcript, open its herdr pane live, type prompts, answer approvals, send images, start sessions and receive notifications. Phase 2 adds the chat, approval, image, new-session, notification and usage methods; the design is in `~/projects/agent-hub-notes/native-host-contract.md`.
 Phase 1 (agent-hub, native host screens, option A). The app renders the host screens itself; the bridge
 serves data RPCs only. Only the `sesync bridge` subcommand runs any of this. The daemon, the TUI and the
 team client never load it.
@@ -16,7 +16,7 @@ Orca is MIT-licensed (stablyai/orca). Its protocol is read from the source at th
 | Command | What it does |
 |---|---|
 | `sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]` | Pairs a new device. Prints the pairing offer (v2 JSON), the `orca://pair?code=` URL and a terminal QR. The device token is in that output and nowhere else. |
-| `sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,…] [--herdr-socket PATH]` | Serves in the foreground until Ctrl-C. Defaults: `0.0.0.0:6768`, allowed networks `10.10.20.0/24,192.168.1.0/24,127.0.0.0/8`, herdr socket `$HERDR_SOCKET_PATH` else `$HOME/.config/herdr/herdr.sock`. |
+| `sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,…] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]` | Serves in the foreground until Ctrl-C. Defaults: `0.0.0.0:6768`, allowed networks `10.10.20.0/24,192.168.1.0/24,127.0.0.0/8`, herdr socket `$HERDR_SOCKET_PATH` else `$HOME/.config/herdr/herdr.sock`, ntfy `http://192.168.100.178:30181` topic `agents`, plan usage every 600 s from `omp`. |
 | `sesync bridge devices` | Lists paired devices: id, label, creation time. Never prints tokens. |
 | `sesync bridge revoke <device-id>` | Removes a device. Its token is refused on the next frame, with no restart. |
 
@@ -27,6 +27,8 @@ another route. Nothing here opens a firewall port: the host's firewalld zone dec
 `serve` takes the sesync-lock binary and its claim directory from the same environment the daemon uses
 (`SESYNC_LOCK`, else the binary beside `sesync`; `SESYNC_LOCK_DIR`, else the stored locks directory). If
 the lock binary is not installed, prompts are sent without a claim, as the daemon's own writes are.
+
+`serve` also runs the phase-2 background work. The ntfy token command runs once at startup (default `sudo -n systemd-creds decrypt --name=agenthub-ntfy-token /opt/homelab-creds/agenthub-ntfy-token.cred -`, 20 s limit). Its output is the publish token and is never logged; a failure leaves push off and says why. `--no-ntfy` turns push off. Plan usage runs `<omp> usage --json` every `--usage-every` seconds (no model call); `--no-usage` turns it off. `SESYNC_USAGE_FIXTURE=<file>` makes the refresh read that file instead of running omp; the e2e backend uses it. A herdr watcher reads agent statuses every 2 s for notifications.
 
 Exit codes: 0 success, 2 usage, 1 failure (as in `sesync team`).
 
@@ -83,10 +85,20 @@ Served methods:
 | `terminal.list` `{worktree?, handles?}` | `{terminals:[…], totalCount, truncated:false}`: one row per pane (`handle` = herdr's terminal id). |
 | `terminal.read` `{terminal}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last 200 rows as text. |
 | `terminal.subscribe` `{terminal, client:{id}, viewport?, capabilities?}` | The screen, then live changes. See Terminal streams. `terminal.unsubscribe {subscriptionId, client, requestId}` ends it. |
-| `terminal.send` `{terminal, text?, enter?, interrupt?}` | `{send:{handle, accepted:true, bytesWritten}}`. A prompt (`text` with `enter:true`) takes the conversation's claim first; see Prompt turns. |
+| `terminal.send` `{terminal, text?, enter?, interrupt?}` | `{send:{handle, accepted:true, bytesWritten}}`. A prompt (`text` with `enter:true`) takes the conversation's claim first; see Prompt turns. Approval keys are `text` with `enter:false` (see Approvals). |
 | `agentSession.subscribeStatus` | Streams `{type:"snapshot", sessions:[…]}` then `{type:"status", session}` on change: one session per pane running a conversation. |
+| `nativeChat.readSession` `{agent, sessionId, limit?, beforeOffset?}` | `{messages, hasMore, beforeOffset?}` (or `{error}`): the conversation's journal from its live window, paged by row cursor. See Chat view. |
+| `nativeChat.subscribe` `{agent, sessionId, subscriptionId, limit?, capabilities?}` | Streams `snapshot`, then `appended` or `replacement`, with `error` and `end` as the app reads them. `nativeChat.unsubscribe {subscriptionId}` ends it. |
+| `clipboard.startImageUpload`, `appendImageUploadChunk`, `commitImageUpload`, `abortImageUpload`, `saveImageAsTempFile` | Staged images. Commit and save return the path string the app puts in the prompt. See Images. |
+| `preflight.detectAgents` | A bare array of installed agent ids. |
+| `settings.get` | `{settings:{}}`: no default agent and none disabled. |
+| `session.tabs.createTerminal` `{worktree, agent}` | `{tab:{type:"terminal", id, terminal, title}}`: a new herdr tab in the conversation's directory running the agent with no resume. See New sessions. |
+| `notifications.subscribe` `{includeDesktopSuppressed?}` | Streams `{type:"ready", subscriptionId, epoch}`, then `{type:"notification", agentState, paneKey, notificationId, …}` frames: `agentState` is `done` for finished and `blocked` for needs input. `notifications.getMissedSince {lastSeenSeq, epoch?}` replays from memory. See Notifications. |
+| `notifications.registerPush`, `unregisterPush` | `{registered:false}`: there is no FCM. |
+| `accounts.list` | `AccountsSnapshot`. See Plan usage. |
+| `accounts.subscribe` | Streams `{type:"ready", subscriptionId, snapshot}`, then `{type:"snapshot", snapshot}` on change. `accounts.unsubscribe` ends it. |
 
-Every other method answers `error.code: "method_not_found"` with the request's `id`. Orca reads that as
+Every other method, including the structured `agentSession.*` calls (`send`, `currentRequests`, `respondToApproval`, `respondToQuestion`, `create`, `createSupport`) and `worktree.create` and `agent.launch`, answers `error.code: "method_not_found"` with the request's `id`. Terminal-backed chat never calls them: its prompts ride `terminal.send`, its cards ride `interactivePrompt`, and new sessions ride `session.tabs.createTerminal` (the app falls through when `agentSession.create` is refused). Orca reads that as
 "not available here" (`isMobileMethodUnavailableError`) and skips the read. Errors the bridge raises:
 `bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
 reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read),
@@ -102,7 +114,7 @@ phone accepts a host with `minCompatibleMobileVersion` 2 or lower.
 | host | this machine (the bridge) |
 | worktree | one sesync conversation: its parent session and that session's mirrors. `worktreeId = <repoId>::<conversation id>`; `repoId = sesync-<hash of the project directory>`, the same id `repo.list` reports; `conversation id = conv-<hash of harness and parent key>`. Both hashes are stable while the parent session's file or store id is. |
 | tab / terminal | one herdr pane whose foreground argv carries one of the conversation's session ids as a flag's value (`argv_carries`, the rule "open in herdr" uses). Handle and terminal id = herdr's `terminal_id`, which stays with the terminal when its pane moves. |
-| agent status | herdr `agent_status`: `working` → worktree status `working` / agent state `working`; `blocked` → `permission` / `blocked`; `done` → `done`; `idle` or `unknown` → `active` / `waiting`. Session status: working → `working`, blocked → `attention`, idle or done → `idle`, unknown → null. |
+| agent status | herdr `agent_status`: `working` → `working`; `blocked` → `blocked`; `done` → `done`; `idle` or `unknown` → `waiting`. A tab row's `agentStatus` carries that `state`, `paneKey` (`tabId:terminalId`), `terminalHandle`, `agentType` (the conversation's harness), `providerSession.id` (the journal session id `nativeChat` reads by), and `interactivePrompt` when the pane is blocked on a recognised approval or question. Worktree status: working → `working`, blocked → `permission`, done → `done`, otherwise `active`/`waiting`. Session status (`agentSession.subscribeStatus`): working → `working`, blocked → `attention`, idle or done → `idle`, unknown → null. |
 
 ## Terminal streams
 
@@ -198,9 +210,38 @@ deferred; the interop check below covers this path.
   the visible screen and last 200 rows of each pane that runs a conversation. Nothing else from the
   session stores is sent; the bridge never writes to them. Its only writes are `server.key`,
   `devices.json`, and the sesync-lock claims for prompt turns.
+- **Notifications and push.** The ntfy publish token is read once at startup and held in memory; it is never logged or written. Publishing is best effort on a detached thread: a failure is logged without the token and never blocks a notification.
+- **Uploads.** Staged images live under `$SESYNC_CONFIG_DIR/bridge/uploads/<conversation>/` (directory `0700`, files `0600`), at most 20 MB decoded per image, and must start with a PNG, JPEG, GIF or WEBP signature. An upload that is refused or idle for 5 minutes is removed.
+- **Approval keys.** A paired phone can answer an approval by typing its key into the pane (`terminal.send` with `enter:false`): the same reach as typing into the pane.
 - **Not done yet:** per-device permissions (a paired phone has every method above), rate limiting,
   audit logging beyond connect/refuse lines, a revocation UI, key rotation for `server.key`, and a
   read-only mode.
+
+## Chat view
+
+The chat screen for a terminal-backed agent reads the conversation's journal, not the pane. `nativeChat.readSession` and `nativeChat.subscribe` take the journal session id from the tab's `agentStatus.providerSession.id` (for omp and Pi, the session file path, which `omp --resume` takes). omp and Pi journals are read in process: the window starts at the last compaction's kept entry, and the compaction shows as a system line. Tool calls and their results are linked by call id, thinking is shown as text, and an image is a label (its bytes never go on the wire). Other harnesses return `{error}` until their readers run in process. Paging uses a row cursor: `beforeOffset` is a record's position in the file. A subscription checks the file's length and modification time each second; a grown window is `appended`, a moved one is `replacement`.
+
+Composer prompts are `terminal.send` (see Prompt turns). The app sends them with bracketed paste already applied.
+
+## Approvals
+
+When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines and recognises the harness's prompt. omp and OpenCode approval and question screens are captured in `sesync/tests/fixtures/approvals/`. The tab row then carries `agentStatus.interactivePrompt` as a JSON string: `{"approval":{"tool","summary"}}` for an approval, or `{"questions":[…],"toolName"}` for a question. The keys are typed into the pane: approve is Enter (`\r`) and deny is Esc, both sent by the app through `terminal.send` with `enter:false`. Claude Code is not recognised: fake-model cannot speak the Anthropic API, so its prompt format is unverified here.
+
+## Images
+
+`clipboard.startImageUpload {expectedBase64Length}` returns `{uploadId}`. `appendImageUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` equals the bytes so far), at most 512 Ki base64 characters per chunk. The total is limited to 24 Mi base64 characters and 20 MB decoded. `commitImageUpload` returns the staged absolute path as a string, which the app inserts into the prompt as `@path`. omp expands that into an image input, so the model request carries an image part (fake-model counts these as `images`). `saveImageAsTempFile {contentBase64}` does the same in one call. The app's clipboard params carry no `worktree`, so uploads stage under `_unscoped`.
+
+## New sessions
+
+`preflight.detectAgents` lists the agents on PATH from the table in `start.rs` (claude, omp, opencode, pi, and antigravity as `agy`). `session.tabs.createTerminal {worktree, agent}` opens an unfocused herdr tab in the conversation's directory and starts the agent with `agent.start`, with no resume argument. The new pane is remembered as belonging to that worktree (`terminals::remember_pane`), so `session.tabs.list` shows it before its agent has a session id. If herdr refuses `agent.start`, the tab the call made is closed and the call fails with `agent_not_started`.
+
+## Notifications
+
+A watcher reads herdr's agent statuses every 2 s. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push enabled, each event is also published on a detached thread to `<ntfy url>/<topic>` with `Authorization: Bearer`, the headers `Title` ("Agent finished" or "Agent needs input"), `Priority` (3 or 4) and `Tags`. Dismissal is not implemented: `dismissedPushes` is always `[]`.
+
+## Plan usage
+
+`accounts.list` and `accounts.subscribe` answer the app's `AccountsSnapshot`: the `claude` and `codex` account lists and the `rateLimits.claude|codex.{session,weekly}` bars (`usedPercent`, `windowMinutes`, `resetsAt` in ms or null). The bridge maps `omp usage --json` to it: the 5-hour window is the session bar and the 7-day untiered window the weekly bar; Anthropic is `claude`, OpenAI Codex is `codex`. Nothing else from the report is shown. The schema comes from omp's own source, not from a live run, so a live check is still to do. A failed refresh keeps the last good snapshot, and a subscriber gets a frame only when the usage changes. The bridge never sends provider credentials to the phone.
 
 ## Session data
 
@@ -238,6 +279,8 @@ env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test 
 env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test --test bridge_resources
 ```
 
+The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`, `an_uploaded_image…`, `a_new_agent_tab…`, `finished_and_needs_input…`) need herdr and omp on PATH and a fake-model build: `FAKE_MODEL_BIN`, or the static build in the sibling `sesync-wt-fake-model` worktree. Each skips with a note when they are missing.
+
 - `src/bridge/*`: unit tests for the herdr reply and pane parsing, the conversation id and worktree
   mapping, the tab, terminal and status shapes, the binary frame codec and 48 KiB chunking, the
   stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
@@ -254,6 +297,8 @@ env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test 
   JSON events, unsubscribes, and reads the status stream.
 - `tests/bridge_resources.rs` starts the built `sesync bridge serve` with no phone connected and asserts
   its resident memory is under 20 MB (measured 12–13 MB across runs).
+- Phase 2 (`tests/bridge.rs`, live): a prompt typed into a live omp pane reaches `nativeChat.readSession`; an approval card denies without writing and approves by running the tool; an uploaded image reaches the model request log as an image part; a created tab is listed; finished and needs-input notifications reach the in-app stream and a local ntfy stand-in. Unit tests cover the transcript window and paging, the approval recognisers against the captured screens, upload staging and limits, the notification transitions and the ntfy request, the usage mapping, and the new RPC shapes.
+- `fork/e2e/backend.sh up|down <stateDir>` (orca-phone) starts the same stack for the emulator suite and writes `<stateDir>/env`.
 
 Interop with Orca's own TypeScript (`tools/bridge-interop`): it copies the Orca files it needs
 (pairing codec and schema, compat gate, host status schema, method-unavailable rule, mock E2EE
@@ -267,6 +312,4 @@ env HOME="$SB" ./target/debug/sesync bridge serve --listen 127.0.0.1:6768 &   # 
 cd tools/bridge-interop && npm install && ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "orca://pair?code=…"
 ```
 
-Not verified here: a real phone and the Android app's own screens (the emulator run is agent-hub's E2E,
-against a sandboxed herdr and a fixture conversation), the QR code read by a scanner, and real agent
-detection by herdr.
+Not verified here: a real phone, the emulator run (orca-phone `fork/e2e`), a live `omp usage --json` run, Claude Code approvals, and real ntfy delivery.

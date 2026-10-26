@@ -6,19 +6,34 @@ use super::herdr::{self, Herdr};
 use super::offer::{self, Offer};
 use super::rpc::{self, Ctx};
 use super::turns::{LockTools, Turns};
-use super::{devices, keys, net, server, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
+use super::{devices, keys, net, notify, ntfy, server, start, uploads, usage, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
 use crate::qr;
 use qrcodegen::QrCode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+/// The homelab ntfy server and topic that finished and needs-input events are pushed to, and the command
+/// that prints the topic's publish token. The token is read once at startup and never logged.
+const DEFAULT_NTFY_URL: &str = "http://192.168.100.178:30181";
+const DEFAULT_NTFY_TOPIC: &str = "agents";
+const DEFAULT_NTFY_TOKEN_COMMAND: &str =
+    "sudo -n systemd-creds decrypt --name=agenthub-ntfy-token /opt/homelab-creds/agenthub-ntfy-token.cred -";
+/// How often plan usage is refreshed with `omp usage --json`, unless `--usage-every` says otherwise.
+const DEFAULT_USAGE_EVERY_SECS: u64 = 600;
+/// How often herdr's agent statuses are read to raise notifications.
+const NOTIFY_EVERY: Duration = Duration::from_secs(2);
+/// The flags of `serve` that take no value.
+const SERVE_FLAGS: &[&str] = &["no-ntfy", "no-usage"];
 const USAGE: &str = "usage: sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]
        sesync bridge devices
        sesync bridge revoke <device-id>
-       sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,CIDR,...] [--herdr-socket PATH]";
+       sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,CIDR,...] [--herdr-socket PATH]
+                           [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy]
+                           [--usage-every SECONDS] [--omp PATH] [--no-usage]";
 
 enum Fail {
     Usage(String),
@@ -50,7 +65,7 @@ pub fn run(args: &[String], dir: &Path, locks: LockTools, catalog: impl FnOnce()
 }
 
 fn pair(args: &[String], dir: &Path) -> Result<(), Fail> {
-    let opts = options(args, &["endpoint", "label"])?;
+    let opts = options(args, &["endpoint", "label"], &[])?;
     let endpoint = opts.get("endpoint").cloned().unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
     offer::check_endpoint(&endpoint).map_err(Fail::Usage)?;
     let label = opts.get("label").cloned().unwrap_or_else(|| "phone".to_string());
@@ -95,7 +110,11 @@ fn revoke(args: &[String], dir: &Path) -> Result<(), Fail> {
 }
 
 fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTools) -> Result<(), Fail> {
-    let opts = options(args, &["listen", "allow", "herdr-socket"])?;
+    let opts = options(
+        args,
+        &["listen", "allow", "herdr-socket", "ntfy-url", "ntfy-topic", "ntfy-token-command", "usage-every", "omp"],
+        SERVE_FLAGS,
+    )?;
     let listen_text = opts.get("listen").cloned().unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
     let listen: SocketAddr = listen_text.parse()
         .map_err(|_| Fail::Usage(format!("{listen_text}: not an address:port")))?;
@@ -105,13 +124,26 @@ fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTool
 
     let keys = keys::load_or_create(&dir.join("server.key")).map_err(Fail::Failed)?;
     let paired = devices::list(dir).map_err(Fail::Failed)?.len();
+    let push = push_config(&opts);
     let ctx = Ctx {
         catalog,
         herdr: Arc::new(herdr::Socket::new(herdr_socket.clone())) as Arc<dyn Herdr>,
         host: rpc::Host { machine_name: machine_name(), platform: platform() },
         locks,
         turns: Turns::default(),
+        dir: dir.to_path_buf(),
+        notify: notify::Hub::new(push),
+        usage: usage::Store::default(),
+        uploads: uploads::Store::default(),
+        launch: start::Launch::from_env(),
     };
+    if !opts.contains_key("no-usage") {
+        let every = usage_every(&opts)?;
+        let omp = PathBuf::from(opts.get("omp").map_or("omp", String::as_str));
+        eprintln!("bridge: plan usage from `{} usage --json` every {}s", omp.display(), every.as_secs());
+        usage::spawn_poller(ctx.usage.clone(), omp, every);
+    }
+    notify::spawn_watcher(ctx.clone(), NOTIFY_EVERY);
     let shared = Arc::new(server::Shared { dir: dir.to_path_buf(), keys, allow, ctx });
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()
@@ -133,18 +165,58 @@ fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTool
     })
 }
 
-/// `--name value` pairs for the names in `known`. Anything else is a usage error.
-fn options(args: &[String], known: &[&str]) -> Result<HashMap<String, String>, Fail> {
+/// `--name value` pairs for the names in `known`, and bare `--flag`s for the names in `flags` (stored as
+/// "true"). Anything else is a usage error.
+fn options(args: &[String], known: &[&str], flags: &[&str]) -> Result<HashMap<String, String>, Fail> {
     let mut out = HashMap::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        let name = arg.strip_prefix("--")
-            .filter(|n| known.contains(n))
-            .ok_or_else(|| Fail::Usage(format!("unexpected argument {arg:?}")))?;
+        let name = arg.strip_prefix("--").ok_or_else(|| Fail::Usage(format!("unexpected argument {arg:?}")))?;
+        if flags.contains(&name) {
+            out.insert(name.to_string(), "true".to_string());
+            continue;
+        }
+        if !known.contains(&name) {
+            return Err(Fail::Usage(format!("unexpected argument {arg:?}")));
+        }
         let value = rest.next().ok_or_else(|| Fail::Usage(format!("--{name} needs a value")))?;
         out.insert(name.to_string(), value.clone());
     }
     Ok(out)
+}
+
+/// The ntfy push this serve run makes, or none. The token command runs once, here at startup. When it
+/// fails the push stays off and the reason is said, never the token.
+fn push_config(opts: &HashMap<String, String>) -> Option<ntfy::Config> {
+    if opts.contains_key("no-ntfy") {
+        return None;
+    }
+    let url = opts.get("ntfy-url").map_or(DEFAULT_NTFY_URL, String::as_str);
+    let topic = opts.get("ntfy-topic").map_or(DEFAULT_NTFY_TOPIC, String::as_str);
+    let command = opts.get("ntfy-token-command").map_or(DEFAULT_NTFY_TOKEN_COMMAND, String::as_str);
+    match ntfy::load(url, topic, command) {
+        Ok(config) => {
+            eprintln!("bridge: ntfy push to {url}, topic {topic}");
+            Some(config)
+        }
+        Err(reason) => {
+            eprintln!("bridge: ntfy push off: {reason}");
+            None
+        }
+    }
+}
+
+/// The plan-usage refresh interval from `--usage-every`, in whole seconds above zero.
+fn usage_every(opts: &HashMap<String, String>) -> Result<Duration, Fail> {
+    match opts.get("usage-every") {
+        None => Ok(Duration::from_secs(DEFAULT_USAGE_EVERY_SECS)),
+        Some(text) => text
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| Fail::Usage(format!("--usage-every {text}: not a number of seconds above 0"))),
+    }
 }
 
 fn no_arguments(args: &[String]) -> Result<(), Fail> {

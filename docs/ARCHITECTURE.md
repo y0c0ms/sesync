@@ -1089,6 +1089,7 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `HS_E2E`, `HS_REQUIRE_CLAUDE` | unset | opt-in real-CLI tests |
 | `HERDR_BIN_PATH` | `herdr` on PATH | herdr CLI used by "Open in herdr"; herdr sets it in its panes and popups |
 | `HERDR_ACTIVE_WORKSPACE_ID` | unset | workspace new herdr tabs open in; herdr sets it for a custom command |
+| `SESYNC_USAGE_FIXTURE` | unset | bridge only: a file holding an `omp usage --json` report, read instead of running omp (the e2e backend uses it). Flags for the bridge are in `docs/BRIDGE.md` |
 
 Unknown or malformed values fall back to the default; a bad env var must never panic the
 daemon.

@@ -5,6 +5,7 @@
 //!
 //! Only `sesync bridge …` runs any of this. The daemon, the TUI and the team client never touch it.
 
+pub mod approvals;
 pub mod catalog;
 pub mod cli;
 pub mod devices;
@@ -18,6 +19,12 @@ pub mod server;
 pub mod stream;
 pub mod terminals;
 pub mod turns;
+pub mod notify;
+pub mod ntfy;
+pub mod start;
+pub mod transcript;
+pub mod uploads;
+pub mod usage;
 
 /// The port Orca's desktop listens on, and so the port the app dials.
 pub const DEFAULT_PORT: u16 = 6768;
