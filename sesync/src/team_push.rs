@@ -46,7 +46,11 @@ struct Lease<'a, R: TeamRemote> {
 
 impl<R: TeamRemote> Drop for Lease<'_, R> {
     fn drop(&mut self) {
-        let _ = self.remote.release(&self.space, &self.conversation);
+        // Drop cannot return an error. A failed release is reported; the lease then expires on
+        // its own after LEASE_SECS, so the conversation is not stranded for good.
+        if let Err(e) = self.remote.release(&self.space, &self.conversation) {
+            eprintln!("sesync: team lease for {} was not released ({e:?}); it expires on its own", self.conversation);
+        }
     }
 }
 
@@ -85,6 +89,7 @@ pub struct HttpTeam {
 
 impl HttpTeam {
     fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, PushError> {
+        crate::team_url::check_scheme(&self.base).map_err(PushError::Refused)?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
         let url = format!("{}{path}", self.base.trim_end_matches('/'));
         match agent.post(&url).set("Authorization", &format!("Bearer {}", self.token)).send_json(body) {
@@ -136,6 +141,7 @@ impl HttpTeam {
     /// client-sealed, signed record the server stores without reading. `/record` is the legacy
     /// plaintext route, kept only until the sealed path is the only writer.
     pub fn put_to(&self, route: &str, space: &str, conversation: &str, version: u64, bytes: &[u8]) -> Result<(), PushError> {
+        crate::team_url::check_scheme(&self.base).map_err(PushError::Refused)?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(60)).build();
         // Each value is form-encoded by `query`, so a team or machine name holding `&`, `+`, `#`,
         // `%`, `=` or a space reaches the server as itself.

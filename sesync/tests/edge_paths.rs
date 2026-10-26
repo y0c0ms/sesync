@@ -67,17 +67,17 @@ fn a_converter_that_writes_no_file_is_an_error_and_leaves_no_mirror() {
 }
 
 #[test]
-fn a_lock_command_that_fails_unexpectedly_runs_the_work_fail_open() {
+fn a_lock_command_that_cannot_run_skips_the_work_fail_closed() {
     let _exec = exec_guard();
-    // The daemon never blocks on the lock layer. A lock binary that cannot run (here, a
-    // path that is not executable) must let the work proceed, as the Python does.
-    let sb = sandbox("failopen");
+    // The lock tool is installed but cannot run. A write without the claim could race a
+    // live turn, so the work must not run; the reason is reported instead.
+    let sb = sandbox("failclosed");
     let fake = sb.join("broken-sesync_lock");
     fs::write(&fake, "not a program").unwrap();
     let mut ran = false;
     let out = with_claim(&fake, Some(&sb), "conv", "daemon", 1, "/src", || ran = true);
-    assert!(ran, "the work must run when the lock command fails");
-    assert_eq!(out, ClaimOutcome::Ran(()));
+    assert!(!ran, "the work must not run when the lock tool cannot claim");
+    assert!(matches!(&out, ClaimOutcome::Failed(e) if e.starts_with("cannot run lock tool")), "got {out:?}");
 }
 
 /// Make a fake CLI executable. Callers hold exec_guard(), so no fork races the write.

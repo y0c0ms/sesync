@@ -161,9 +161,10 @@ fn the_watch_loop_pushes_a_marked_session_and_raises_the_floor_on_the_next_pull(
     // The next tick pulled the pushed record and raised this device's floor for it.
     let state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(state_dir.join("state.json")).unwrap()).unwrap();
-    assert!(state.get("team").and_then(|t| t.get(SID)).and_then(|t| t.get("hash")).is_some(),
+    let key = sesync::state::team_key("personal", SID);
+    assert!(state.get("team").and_then(|t| t.get(&key)).and_then(|t| t.get("hash")).is_some(),
         "the push must be recorded in state: {state}");
-    assert!(state.get("team_seen").and_then(|t| t.get(SID)).and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
+    assert!(state.get("team_seen").and_then(|t| t.get(&key)).and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
         "the pull must raise the sequence floor: {state}");
 
     let _ = std::fs::remove_dir_all(&dir);

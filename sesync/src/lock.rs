@@ -48,6 +48,9 @@ pub enum ClaimOutcome<T> {
     Ran(T),
     /// Another harness holds the conversation. The work did not run. Holds "harness pid".
     Skipped(String),
+    /// The lock tool exists but could not claim (it failed or could not run). The work did
+    /// not run: a write without the claim could race a live turn. Holds the reason.
+    Failed(String),
 }
 
 /// "harness pid" if a live process holds the conversation, else None.
@@ -93,8 +96,9 @@ impl Drop for Release<'_> {
 }
 
 /// Claim `conv` for the duration of `work`, the way a harness turn does.
-/// If the binary is missing, the work runs with no claim. If another harness
-/// holds it, the work is skipped and its holder is returned.
+/// If the binary is not installed, the work runs with no claim. If another harness
+/// holds it, the work is skipped and its holder is returned. If the binary is installed
+/// but fails or cannot run, the work is skipped and the reason is returned.
 pub fn with_claim<T>(
     sesync_lock: &Path,
     lock_dir: Option<&Path>,
@@ -117,8 +121,11 @@ pub fn with_claim<T>(
             return ClaimOutcome::Skipped(String::from_utf8_lossy(&o.stdout).trim().to_string());
         }
         Ok(o) if o.status.success() => {}
-        // Any other failure: the daemon never blocks on the lock layer, so run the work.
-        _ => return ClaimOutcome::Ran(work()),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            return ClaimOutcome::Failed(format!("lock tool exited {}: {err}", o.status));
+        }
+        Err(e) => return ClaimOutcome::Failed(format!("cannot run lock tool: {e}")),
     }
     // Dropped at the end of this scope, on success or panic alike.
     let _guard = Release { sesync_lock, lock_dir, conv, harness, pid, active: true };

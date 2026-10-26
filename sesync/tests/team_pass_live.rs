@@ -117,7 +117,7 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
     assert_eq!(passes.len(), 1, "the machine belongs to one team here");
     let pass = &passes[0];
     assert_eq!(pass.pushed, vec!["ses_pass".to_string()], "the shared, quiet session is pushed: {pass:?}");
-    assert!(state.team_hash("team-a", "ses_pass").is_some(), "the push is recorded in state");
+    assert!(state.team_hash("personal", "ses_pass").is_some(), "the push is recorded in state");
     let _ = writer_cred;
 
     // The database holds the session only as ciphertext.

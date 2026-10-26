@@ -642,7 +642,15 @@ fn main() {
         // pushed. The teams are read again at every team step, after renewing any token about to
         // run out, so a renewal, a new join or a `sesync team renew` is used without a restart.
         let mut teams = sesync::team_watch::teams_from_env(&team_config_dir());
+        // A legacy `marked` list folds into shares here. Save it at once: the first pass re-reads
+        // shares from disk, and an unsaved fold would be discarded there.
+        let had_legacy = !state.legacy_marked.is_empty();
         state.migrate_legacy_team_state(&teams.iter().map(|t| t.space.clone()).collect::<Vec<_>>());
+        if had_legacy && state.legacy_marked.is_empty() {
+            if let Err(e) = state.save(&env.state_file()) {
+                eprintln!("sesync: cannot save migrated team shares: {e}");
+            }
+        }
         // The team pull and push run on their own interval: SESYNC_POLL at first, doubling while the
         // team has nothing new, capped at SESYNC_TEAM_POLL_MAX (team_backoff). The local pass is not
         // affected and still runs on every SESYNC_POLL tick.

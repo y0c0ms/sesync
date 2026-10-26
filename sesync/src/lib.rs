@@ -50,6 +50,7 @@ pub mod team_cli;
 pub mod team_conflict;
 pub mod team_import;
 pub mod team_join;
+pub mod team_url;
 pub mod team_pass;
 pub mod team_pull;
 pub mod team_pull_verified;

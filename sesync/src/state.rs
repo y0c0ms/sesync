@@ -738,8 +738,28 @@ impl State {
             "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at, "list": v.list}))).collect::<serde_json::Map<_, _>>(),
             "team_seen": self.team_seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
         });
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&data).map_err(invalid)?)?;
-        fs::rename(&tmp, path)
+        // A unique temp name per writer (the daemon and the TUI both save this file), synced to
+        // disk before the rename, then the directory entry is synced. A crash leaves the old file
+        // or the new one, never a truncated one: team_seen floors must not silently reset.
+        let json = serde_json::to_string_pretty(&data).map_err(invalid)?;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos()).unwrap_or(0);
+        let tmp = path.with_file_name(format!("{}.{}.{nanos}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("state.json"), std::process::id()));
+        let result = (|| {
+            let mut f = fs::File::create(&tmp)?;
+            io::Write::write_all(&mut f, json.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            fs::rename(&tmp, path)?;
+            if let Some(dir) = path.parent() {
+                fs::File::open(dir)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 }

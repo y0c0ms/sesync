@@ -841,6 +841,7 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `SESYNC_CONFIG_DIR` | `~/.config/sesync` | team credentials, device key and admin key (CLI, TUI, daemon) |
 | `SESYNC_TEAM_URL` | unset | team server base URL for a credential that predates recording its server, and for a team configured only by the environment; a joined credential uses the server it was joined on |
 | `SESYNC_TEAM_TOKEN`, `SESYNC_TEAM_MACHINE`, `SESYNC_TEAM_SPACE` | from credential | optional overrides |
+| `SESYNC_TEAM_ALLOW_HTTP` | unset | `1` allows a token to travel over plain `http://` to a non-loopback team server (a deliberately private network such as a WireGuard mesh); otherwise only `https://` or loopback is accepted (`team_url.rs`) |
 | `SESYNC_TEAM_QUIET` | `120` | team quiet seconds before a push is due |
 | `SESYNC_TEAM_POLL_MAX` | `60` | cap for the team poll backoff |
 | `SESYNC_ADMIN_TOKEN_FILE` | unset | admin token for `sesync team` commands |

@@ -345,6 +345,7 @@ pub fn delete_group(roots: &Roots, g: &Group, lock_dir: &Path, sesync_lock: &Pat
     });
     match outcome {
         ClaimOutcome::Skipped(h) => Err(format!("conversation is in use by {h}; try again when its turn ends")),
+        ClaimOutcome::Failed(e) => Err(format!("lock tool failed, nothing was changed: {e}")),
         ClaimOutcome::Ran(r) => r,
     }
 }
@@ -376,6 +377,7 @@ pub fn rename_group_noted(roots: &Roots, g: &Group, title: &str, lock_dir: &Path
     });
     match outcome {
         ClaimOutcome::Skipped(holder) => Err(format!("conversation is in use by {holder}")),
+        ClaimOutcome::Failed(e) => Err(format!("lock tool failed, nothing was changed: {e}")),
         ClaimOutcome::Ran(r) => r.map(|note| (new, note)),
     }
 }

@@ -354,6 +354,7 @@ pub struct RosterView {
 
 /// Read a team's roster as structured rows. Nothing is signed.
 pub fn roster_view(base: &str, token: &str, name: &str, config_dir: &Path) -> Result<RosterView, String> {
+    crate::team_url::check_scheme(base)?;
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
     // Whatever the caller was handed: surrounding whitespace is never part of a URL, and a
     // trailing space used to surface as "cannot reach the team server".
@@ -406,6 +407,7 @@ pub fn render_roster(view: &RosterView) -> String {
 /// Run a parsed command against the team server. Returns the human text, and for a created
 /// team the one-time authenticator URI (nothing else ever returns it).
 pub fn run_detailed(cmd: &Command, base: &str, token: &str, config_dir: &Path) -> Result<(String, Option<String>), String> {
+    crate::team_url::check_scheme(base)?;
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
     // Whatever the caller was handed: surrounding whitespace is never part of a URL, and a
     // trailing space used to surface as "cannot reach the team server".
