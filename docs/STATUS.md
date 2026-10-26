@@ -105,6 +105,39 @@ tests win, and you fix this file. Update it at the end of every work session.
   can re-seal them (only the author signs its records).
 - **Suites** (Windows, sandboxed): `sesync` 603 passed, `sesync-team` 199 passed, 0 failed.
 
+## 2026-10-26: context fit on every message-based mirror (branch `context-fit`)
+
+Worktree `/home/yocoms/projects/sesync-wt-context-fit`, from `herdr-open`. Committed, not pushed.
+
+- **Fit** (`sesync-conv/src/fit.rs`). Claude, OpenCode and Antigravity copies are cut to
+  `window x share - overhead` tokens (defaults 0.75 and 16384): the compaction note, then the
+  newest user turns that fit, cut where no call is split from its result. When the note and the
+  newest turn alone do not fit, the write is refused ("nothing was written"). Estimate:
+  `ceil(bytes / 3)`, no tokenizer. omp and Pi copies stay whole files.
+- **Sources.** `from-claude` reads `compact_boundary` and `isCompactSummary` as a compaction record;
+  `from-opencode` reads a finished `summary: true` assistant message the same way. Assistant turns
+  keep their model. Fixed: a Claude record holding text and a `tool_result` linked the result to
+  itself, breaking the live chain; results now come before the text, as Claude's API orders them.
+- **Window** (`sesync/src/harness/window.rs`). `SESYNC_CONTEXT_WINDOW` (and `_CLAUDE`, `_OPENCODE`,
+  `_ANTIGRAVITY`), then OpenCode's `limit.context` from its config, Claude 200000, else 128000.
+  Antigravity gets 128000: its Gemini models are larger, so large conversations are cut sooner than
+  needed. `SESYNC_CONTEXT_SHARE`, `SESYNC_CONTEXT_OVERHEAD`.
+- **Note prefix.** `COMPACTION_NOTE_PREFIX` is now "Earlier turns of this conversation were ", so the
+  fit's note is never read as a prompt.
+- **Measured.** Synthetic 2000-turn omp session (22.9 MB) to Claude at 200000: about 7.22M estimated
+  tokens before, 130,065 after (limit 133,616, 36 turns kept). Independent recount of the written
+  copy's content: about 129,976.
+- **omp: not fitted, unverified.** The omp binary's strings show a pre-turn compaction on the stored
+  token count (`runPrePromptCompactionIfNeeded`) with bounded summary input, and failures such as
+  "kept history alone exceeds the context budget". No real resume was run, so no omp opt-in ships.
+- **Verified.** `sh build-test.sh` green under a sandboxed HOME: sesync-conv 85 (73 before), daemon
+  667 passed, team-server 196 passed. New: the fit suite (3 sources x 3 targets, cut rule at every
+  position, both refusals, budget arithmetic) and `sesync/tests/context_fit.rs` (4).
+- **Not verified.** No real Claude, OpenCode or agy resume of a fitted copy (no CLI, no model call).
+  The window values are estimates, except OpenCode's own `limit.context`.
+- **Next action.** Resume a fitted Claude copy in a throwaway container (`HS_E2E=1`) and check it
+  opens on the note. Add an omp opt-in only if a real over-window omp resume fails.
+
 ## 2026-10-21: team exits, refusals that say so, and files filed where the harness lists them
 
 Found by running a team end to end on this machine (an in-memory team server, five sandboxed

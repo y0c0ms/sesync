@@ -327,7 +327,7 @@ names a harness: outside `harness/`, no production code contains a harness id.
 | `claude/` | Claude Code | files | `~/.claude/projects/<bucket>/<uuid>.jsonl`; `CLAUDE_CONFIG_DIR` |
 | `opencode/` | OpenCode | store | `~/.local/share/opencode/opencode.db`, read-only, and the `opencode` CLI; `OPENCODE_DB`, `OPENCODE_BIN` |
 | `antigravity/` | Antigravity (`agy`) | files | `~/.gemini/antigravity-cli/conversations/<id>.db` plus its WAL; `ANTIGRAVITY_CLI_HOME`, `AGY_BIN` |
-| `journal.rs` | shared | | JSONL helpers for omp, Pi and Claude: file names, listing, windowed titles, prompt times, install through `sesync-conv to-<id>` |
+| `window.rs` | shared | | the context window of each message-based target and the `--context-*` flags of a copy (see "Context fit") |
 | `retired.rs` | Gemini CLI | retired | released at load, never deleted |
 
 The trait, by what sesync does with a harness:
@@ -398,6 +398,76 @@ crate: with `harness/opencode/` deleted and a throwaway `dummy` harness added (P
 `~/.dummy`: one new file and two changed lines in `harness/mod.rs`), the library and the daemon
 compiled with no other change, and a `--once` pass mirrored an omp session into `~/.dummy` and
 recorded the copy and its sync time.
+
+## Context fit
+
+A copy written for a message-based harness (Claude Code, OpenCode, Antigravity) must fit that
+harness's context window. Before this rule the live window was written as it was: an omp session
+compacted to about 30k tokens was once exported to OpenCode as 3.4M, and a Claude transcript of
+millions of tokens was copied whole into omp.
+
+**What is kept.** `sesync-conv` builds the copy from the live window (the active branch cut at
+the last compaction, `Journal::messages`), in `sesync-conv/src/fit.rs`:
+
+1. The note, first: the compaction summary when the conversation was compacted, and a line saying
+   that turns were left out when the fit cut some.
+2. The newest user turns that fit, oldest first. A cut falls only on a user message, and only
+   where every tool result after it answers a call after it, so a call and its result always
+   travel together. A user message sent between a call and its result is not a cut point.
+3. When the note and the newest valid turn alone do not fit, the fit refuses. `sesync-conv` exits
+   with `context fit for <target>: ... nothing was written`; sesync reports it as a mirror failure
+   (`sesync-conv to-<id> failed: ...`), and the copy already in the store is left alone.
+
+**Budget.** `limit = window x share - overhead`. Defaults: share 0.75 and overhead 16384 tokens
+(the target's own prompt, tool definitions and reply). The converter takes `--context-window`,
+`--context-share` and `--context-overhead`; sesync passes them, and a run without
+`--context-window` assumes 128000.
+
+**Estimate.** No tokenizer is loaded. A string costs `ceil(bytes / 3)` tokens (only its content:
+record keys and the envelope are not counted, since the target does not show them to the model),
+an image 1600, and each message 8. Bytes per token are about 4 for English prose and about 3 for
+code and JSON, so the estimate errs high. Every converter run prints what the fit did:
+`fit: <target>: kept K of N user turn(s), ~A of ~B estimated tokens (limit L)`.
+
+**Where the window comes from** (`sesync/src/harness/window.rs`, first match wins):
+
+| Source | Window | Origin |
+|---|---|---|
+| `SESYNC_CONTEXT_WINDOW_<TARGET>` | any | operator override for one target (`CLAUDE`, `OPENCODE`, `ANTIGRAVITY`) |
+| `SESYNC_CONTEXT_WINDOW` | any | operator override for every target |
+| OpenCode: `provider.<p>.models.<m>.limit.context` | the model's own | OpenCode's config, `opencode.json` or `opencode.jsonc` under `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), for the provider and model the journal's last assistant turn names. Comments are stripped; a file that does not parse is skipped |
+| Claude: 200000 | Anthropic's standard window for the Claude models Claude Code runs | built-in `TABLE` |
+| Anything else: 128000 | the smallest window in the table | `CONSERVATIVE_WINDOW`. Antigravity has no config to read, and its Gemini models are larger, so its large conversations are cut sooner than needed until an override is set |
+
+The model reaches the window lookup through the journal: omp and Pi name it on each assistant
+turn, `from-opencode` keeps `provider` and `model`, and `from-claude` keeps `model`.
+
+**Sources record their compactions.** Claude Code writes a `system` record with
+`subtype: "compact_boundary"` and a user record with `isCompactSummary: true` that holds the
+summary. `from-claude` turns that summary into a compaction record, so the live window starts at
+it. OpenCode writes a user message with a `compaction` part and, after it, a finished assistant
+message with `summary: true`; `from-opencode` turns the summary into a compaction record and drops
+the marker. Both journals keep the turns before the compaction, for copies that keep the whole
+file. `from-claude` also emits a user's tool results before the text in the same record (the order
+Claude's API requires), and no longer links a result to itself: the self-link broke the live
+chain of any transcript with such a record.
+
+**omp and Pi are not fitted.** `to-pi` and `to-omp` copy the whole journal, archive included.
+What the omp binary shows (read from its embedded strings; no model was called, and omp was not
+run): before each prompt, `runPrePromptCompactionIfNeeded` compares the session's token count
+with a threshold (a token count, a percentage, or the window less a reserve) and runs an
+auto-compaction when it is crossed. The summary input is rendered under frame budgets (`maxFrames`
+80), with snapcompact as the fallback, which can fail with "kept history alone exceeds the context
+budget". So a stored session over its window is expected to compact before the next prompt. Not
+verified: that an omp copy of several million tokens resumes cleanly. That needs a real resume, so
+no omp opt-in ships. If an over-window omp resume is seen to fail, the fit can be applied to omp by
+writing a fitted journal (a compaction record plus the kept turns) from `to-omp` and `to-pi`.
+
+**Where it is checked.** `sesync-conv/src/fit/tests.rs`: long omp, Claude and OpenCode sessions
+through every message-based target, the cut rule at every position, both refusals, and a
+budget that fits without a cut. `sesync/tests/context_fit.rs`: the daemon's own install path
+through the real converter. `sesync/src/harness/window.rs`: the window rules and the OpenCode
+config reader.
 
 ## Local sync
 
@@ -936,6 +1006,10 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `SESYNC_TEAM_QUIET` | `120` | team quiet seconds before a push is due |
 | `SESYNC_TEAM_POLL_MAX` | `60` | cap for the team poll backoff |
 | `SESYNC_ADMIN_TOKEN_FILE` | unset | admin token for `sesync team` commands |
+| `SESYNC_CONTEXT_WINDOW` | per target, see "Context fit" | context window in tokens for every message-based target |
+| `SESYNC_CONTEXT_WINDOW_CLAUDE`, `SESYNC_CONTEXT_WINDOW_OPENCODE`, `SESYNC_CONTEXT_WINDOW_ANTIGRAVITY` | unset | the same, for one target; wins over `SESYNC_CONTEXT_WINDOW` |
+| `SESYNC_CONTEXT_SHARE` | `0.75` | share of the window a copy may fill, above 0 and at most 1 |
+| `SESYNC_CONTEXT_OVERHEAD` | `16384` | tokens reserved for the target's own prompt and reply |
 | `HS_TEAM_URL`, `HS_TEAM_TOKEN`, `HS_TEAM_MACHINE` | unset | TUI remote view (legacy names) |
 | `HS_E2E`, `HS_REQUIRE_CLAUDE` | unset | opt-in real-CLI tests |
 | `HERDR_BIN_PATH` | `herdr` on PATH | herdr CLI used by "Open in herdr"; herdr sets it in its panes and popups |
