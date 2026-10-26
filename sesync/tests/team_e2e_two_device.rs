@@ -237,7 +237,8 @@ fn two_devices_share_a_session_through_a_real_server() {
         .expect("run sesync --watch");
     assert!(out.status.success(), "the daemon exits cleanly: {}", String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("team pull:"), "the watch loop reports its team pull: {stderr}");
+    assert!(stderr.contains("team pull [personal]: 0 shown, 1 dropped"),
+        "after the revoke the daemon's pull refuses the writer's record and counts it: {stderr}");
     assert!(sandbox.join("state").join("state.json").exists(), "the daemon ran in the sandbox state dir, not the real one");
 
     let _ = std::fs::remove_dir_all(&dir);

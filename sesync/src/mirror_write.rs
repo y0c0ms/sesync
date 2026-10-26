@@ -175,6 +175,7 @@ fn install_into(
     });
     let key = match outcome {
         ClaimOutcome::Skipped(holder) => return Err(format!("held by {holder}; will retry")),
+        ClaimOutcome::Failed(e) => return Err(format!("lock tool failed: {e}; will retry")),
         ClaimOutcome::Ran(r) => r?,
     };
     match h.kind() {

@@ -21,11 +21,10 @@ pub struct HttpRemote {
 impl HttpRemote {
     /// Build a client from the environment. Returns None if any setting is missing.
     pub fn from_env() -> Option<HttpRemote> {
-        Some(HttpRemote::new(
-            std::env::var("HS_TEAM_URL").ok()?,
-            std::env::var("HS_TEAM_TOKEN").ok()?,
-            std::env::var("HS_TEAM_MACHINE").ok()?,
-        ))
+        let base = std::env::var("HS_TEAM_URL").ok()?;
+        // An unsafe URL yields no client, so nothing is ever sent with the token.
+        crate::team_url::check_scheme(&base).ok()?;
+        Some(HttpRemote::new(base, std::env::var("HS_TEAM_TOKEN").ok()?, std::env::var("HS_TEAM_MACHINE").ok()?))
     }
 
     pub fn new(base: String, token: String, machine: String) -> HttpRemote {
