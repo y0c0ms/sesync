@@ -38,9 +38,10 @@ fn press(a: &mut App, ev: Ev) {
     a.handle(ev, Instant::now());
 }
 
-/// Enter on the only session, then two rows down, then Enter: the mirror-target picker.
+/// Enter on the only session, then three rows down, then Enter: the mirror-target picker.
 fn open_picker(a: &mut App) {
     press(a, Ev::Enter);
+    press(a, Ev::Down);
     press(a, Ev::Down);
     press(a, Ev::Down);
     press(a, Ev::Enter);
@@ -116,7 +117,7 @@ fn the_menu_lists_the_session_actions() {
     let sb = sandbox("rows");
     let a = app(&sb, fixture(&sb));
     let titles: Vec<&str> = a.session_menu_rows().iter().map(|(t, _)| *t).collect();
-    assert_eq!(titles, vec!["Rename", "Mark / unmark for team", "Mirror to harness", "Show transcript", "Copy its path", "Delete"]);
+    assert_eq!(titles, vec!["Open in herdr", "Rename", "Mark / unmark for team", "Mirror to harness", "Show transcript", "Copy its path", "Delete"]);
 }
 
 #[test]
@@ -124,7 +125,8 @@ fn rename_from_the_menu_enters_rename_mode() {
     let sb = sandbox("rename");
     let mut a = app(&sb, fixture(&sb));
     press(&mut a, Ev::Enter);
-    press(&mut a, Ev::Enter); // row 0: Rename
+    press(&mut a, Ev::Down);
+    press(&mut a, Ev::Enter); // row 1: Rename
     assert_eq!(a.mode(), Mode::Rename, "Rename from the menu runs the same path as the r key");
 }
 
@@ -135,7 +137,8 @@ fn mark_from_the_menu_shares_the_session_with_the_team() {
     a.set_teams(vec!["team-a".into()]);
     press(&mut a, Ev::Enter);
     press(&mut a, Ev::Down);
-    press(&mut a, Ev::Enter); // row 1: share with the team
+    press(&mut a, Ev::Down);
+    press(&mut a, Ev::Enter); // row 2: share with the team
     assert_eq!(a.mode(), Mode::Browse);
     assert!(a.status().contains("shared with team 'team-a'"), "status: {}", a.status());
     assert!(a.is_selected_marked(), "the view shows the share");
@@ -149,7 +152,8 @@ fn mirror_picker_offers_only_installed_harnesses_other_than_the_source() {
     press(&mut a, Ev::Enter);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Down);
-    press(&mut a, Ev::Enter); // row 2: Mirror to harness
+    press(&mut a, Ev::Down);
+    press(&mut a, Ev::Enter); // row 3: Mirror to harness
     assert_eq!(a.mode(), Mode::MirrorPick);
     let targets = a.picker_targets();
     assert!(!targets.contains(&"omp".to_string()), "the source's own format is never offered");
@@ -164,7 +168,8 @@ fn mirror_picker_offers_antigravity_once_installed() {
     press(&mut a, Ev::Enter);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Down);
-    press(&mut a, Ev::Enter); // row 2: Mirror to harness
+    press(&mut a, Ev::Down);
+    press(&mut a, Ev::Enter); // row 3: Mirror to harness
     assert_eq!(a.mode(), Mode::MirrorPick);
     assert_eq!(a.picker_targets(), vec!["antigravity".to_string(), "pi".to_string()],
         "antigravity is offered, the source's own format is never offered");
@@ -176,6 +181,7 @@ fn opening_the_picker_writes_nothing_until_confirmed() {
     let mut a = app(&sb, fixture(&sb));
     a.set_installed_targets(vec!["pi".into()]);
     press(&mut a, Ev::Enter);
+    press(&mut a, Ev::Down);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Down);
     press(&mut a, Ev::Enter);
@@ -249,7 +255,7 @@ fn unticking_everything_clears_the_mirror_intent() {
 fn show_transcript_opens_the_file_in_the_tui() {
     let sb = sandbox("transcript");
     let mut a = app(&sb, fixture(&sb));
-    open_menu_row(&mut a, 3); // Show transcript
+    open_menu_row(&mut a, 4); // Show transcript
     assert_eq!(a.mode(), Mode::Transcript, "the menu opens the transcript view");
     let t = a.transcript_view().expect("the transcript is loaded");
     assert!(t.lines.iter().any(|l| l.contains("\"type\":\"session\"")), "the file's lines are there");
@@ -269,7 +275,7 @@ fn huge_transcripts_are_cut_to_their_tail() {
     }
     std::fs::write(&path, body).unwrap();
     let mut a = App::new(roots, State::default(), sb.join("locks"), sb.join("no-sesync_lock"));
-    open_menu_row(&mut a, 3);
+    open_menu_row(&mut a, 4);
     let t = a.transcript_view().expect("loaded");
     assert_eq!(t.lines.len(), sesync::app::TRANSCRIPT_MAX_LINES + 1,
         "one marker line plus the kept tail");
@@ -283,7 +289,7 @@ fn huge_transcripts_are_cut_to_their_tail() {
 fn copy_path_from_the_menu_copies_the_session_file() {
     let sb = sandbox("copy-path");
     let mut a = app(&sb, fixture(&sb));
-    open_menu_row(&mut a, 4); // Copy its path
+    open_menu_row(&mut a, 5); // Copy its path
     assert!(a.status().contains("copied"), "status: {}", a.status());
     assert!(a.status().contains("2026-10-01T10-00-00-000Z"), "the copied thing is the file path: {}", a.status());
 }

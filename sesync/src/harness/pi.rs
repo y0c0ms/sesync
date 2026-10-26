@@ -33,6 +33,11 @@ impl Harness for Pi {
     fn cwd(&self, path: &Path) -> Option<String> {
         journal::cwd_from_head(path)
     }
+    /// `pi --session` takes the session file's path. Unverified: Pi is not installed on the machine
+    /// this was written on, so check the flag against `pi --help` before relying on it.
+    fn resume_argv(&self, _loc: &Location, key: &str) -> Result<Vec<String>, String> {
+        Ok(vec!["pi".into(), "--session".into(), key.into()])
+    }
     fn placed_by_cwd(&self) -> bool {
         true
     }
