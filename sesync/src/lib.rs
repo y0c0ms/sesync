@@ -64,3 +64,6 @@ pub mod team_push;
 pub mod team_sync;
 pub mod team_watch;
 pub mod turns;
+
+// Phone bridge: `sesync bridge`, the WebSocket server the Orca app pairs with. Only that subcommand runs it.
+pub mod bridge;

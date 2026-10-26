@@ -1,0 +1,3 @@
+node_modules/
+# Copied from the orca-phone checkout by interop.mts on every run; never edit or commit.
+orca/

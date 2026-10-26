@@ -650,6 +650,20 @@ fn main() {
     if args.first().map(String::as_str) == Some("herdr") {
         std::process::exit(run_herdr(&args[1..]));
     }
+    // The phone bridge reads sessions but never saves state, so it too runs before the state is loaded.
+    if args.first().map(String::as_str) == Some("bridge") {
+        let env = Env::from_env();
+        let state_file = env.state_file();
+        let roots = sesync::manage::Roots {
+            locations: env.locations.clone(),
+            home: env.home.clone(),
+            sesync_conv: env.sesync_conv.clone(),
+        };
+        let code = sesync::bridge::cli::run(&args[1..], &team_config_dir().join("bridge"), move || {
+            std::sync::Arc::new(sesync::bridge::catalog::StateCatalog { roots, state_file })
+        });
+        std::process::exit(code);
+    }
     let env = Env::from_env();
     let _ = std::fs::create_dir_all(&env.state_dir);
     let mut state = match State::load(&env.state_file()) {

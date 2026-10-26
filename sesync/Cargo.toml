@@ -22,6 +22,11 @@ sha2 = "0.10"
 zstd = "0.14"
 ureq = { version = "2", features = ["json"] }
 qrcodegen = "1"
+# The phone bridge (`sesync bridge`): a WebSocket server on tokio. Only the bridge subcommand runs it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal"] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's
@@ -32,6 +37,5 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 proptest = "1"
 postgres = "0.19"
 # The client end-to-end tests run the real team-server router in-process over a TCP socket.
-# Both are already in the lock file through sesync-team.
-tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# axum is already in the lock file through sesync-team.
 axum = "0.7"
