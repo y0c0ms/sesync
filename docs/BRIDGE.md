@@ -253,7 +253,7 @@ env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test 
   `ping` with Enter and reads the echo `got: ping` back as an Output frame, subscribes again with the
   JSON events, unsubscribes, and reads the status stream.
 - `tests/bridge_resources.rs` starts the built `sesync bridge serve` with no phone connected and asserts
-  its resident memory is under 20 MB (measured 12.7 MB).
+  its resident memory is under 20 MB (measured 12–13 MB across runs).
 
 Interop with Orca's own TypeScript (`tools/bridge-interop`): it copies the Orca files it needs
 (pairing codec and schema, compat gate, host status schema, method-unavailable rule, mock E2EE
