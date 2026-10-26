@@ -108,6 +108,24 @@ details pane), and a double-click works like Enter. Two TUIs can be open at once
 each saves only the choices made in it (shares, mirror targets, deletes), so neither overwrites
 the other, and each shows the other's choices as soon as the state file changes.
 
+Open in herdr. The session menu's first row, or `o` in the list, opens the selected session in
+herdr (a terminal multiplexer for coding agents). If a herdr pane already runs the session, its tab
+is focused. Otherwise a new tab opens in the session's own directory and types the harness's resume
+command into it: `omp --resume`, `claude --resume <id>`, `opencode --session <id>`. Pi's
+`pi --session` is unverified, and Antigravity has no resume command here. Outside herdr the TUI says
+so and stays open. To open the TUI as a popup from herdr, with `sesync` on herdr's PATH, add this to
+`~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "ctrl+alt+s"
+type = "popup"
+command = "sesync --tui"
+description = "sesync: open a session"
+width = "90%"
+height = "85%"
+```
+
 Team commands. `join` and `renew` run on a member's machine; every other command runs on the
 admin's machine (the one that created the team, which holds the admin key) and also needs
 `SESYNC_ADMIN_TOKEN_FILE`:

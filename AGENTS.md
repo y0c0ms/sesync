@@ -112,7 +112,8 @@ HS_E2E=1 sh build-test.sh
   `display_safe`), `manage`, `members` (members dialog state), `team_actions` (the network work
   behind the team dialogs, run on worker threads), `preview` (the highlighted session's last
   turns, read on a worker thread), `title_worker` (the list's titles, read on a worker thread;
-  the cache is `manage::TitleCache`), `qr`, `clipboard`, `remote`, `remote_http`.
+  the cache is `manage::TitleCache`), `qr`, `clipboard`, `remote`, `remote_http`, `herdr_open` (the
+  herdr CLI behind "Open in herdr").
 - **Team client**: `team_cli` (admin commands), `team_join`, `device_keys`, `sealed`,
   `team_pull_verified` (the live pull), `team_watch`, `team_push`, `team_sync` (trigger),
   `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`, `turns` (completed turns and the comparison).

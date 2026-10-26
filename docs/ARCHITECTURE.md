@@ -340,6 +340,7 @@ The trait, by what sesync does with a harness:
 | List and read a database | `rows`, `row_title`, `fingerprint`, `export`, `remove` |
 | Move a conversation | `to_journal`, `install`, `mirror_id`, `id_in`, `copy_exists` |
 | Follow the user | `newest_prompt` (turn-taking), `rename`, `recent_messages` (the TUI's preview) |
+| Resume it | `resume_argv` (the resume command, the conversation's identifier last), `project_dir` (where it starts; `cwd` by default) |
 
 The TUI's details pane previews the highlighted session's last turns (`preview::Worker`, a
 thread of its own): `recent_messages` reads the end of the canonical journal by default (the
@@ -937,9 +938,30 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `SESYNC_ADMIN_TOKEN_FILE` | unset | admin token for `sesync team` commands |
 | `HS_TEAM_URL`, `HS_TEAM_TOKEN`, `HS_TEAM_MACHINE` | unset | TUI remote view (legacy names) |
 | `HS_E2E`, `HS_REQUIRE_CLAUDE` | unset | opt-in real-CLI tests |
+| `HERDR_BIN_PATH` | `herdr` on PATH | herdr CLI used by "Open in herdr"; herdr sets it in its panes and popups |
+| `HERDR_ACTIVE_WORKSPACE_ID` | unset | workspace new herdr tabs open in; herdr sets it for a custom command |
 
 Unknown or malformed values fall back to the default; a bad env var must never panic the
 daemon.
+
+## Opening a session in herdr
+
+`sesync/src/herdr_open.rs` is the only code that talks to herdr. "Open in herdr" (the session
+menu's first row, or `o`) builds a plan from the harness: `resume_argv` (the command, the
+conversation's identifier last) and `project_dir` (the new tab's directory; the home directory when
+it is unknown or gone, and the status line says so). Then it asks herdr through its CLI, one JSON
+answer per call, in this order:
+
+- A pane whose foreground process was started with the identifier as a flag's value
+  (`omp --resume <path>`, `claude --resume <uuid>`, `opencode --session <id>`) is that session: its
+  tab is focused and nothing starts. A bare picker, or a program that only names the file, is not.
+- Otherwise a tab opens in the directory, labelled `harness: title`, and the command is typed into
+  its root pane. If that typing fails, the tab is closed again.
+- A pane whose processes cannot be read stops the open. A copy that might be the session is never
+  started.
+
+Success leaves the TUI, which closes the popup. Each herdr call times out after five seconds.
+Matching is per tab: the tab of the matched pane is focused, even when other panes share it.
 
 ## Failure behaviour
 
