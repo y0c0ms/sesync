@@ -26,6 +26,7 @@ pub mod omp;
 pub mod opencode;
 pub mod pi;
 mod retired;
+pub mod window;
 
 pub use retired::{Retired, RETIRED};
 

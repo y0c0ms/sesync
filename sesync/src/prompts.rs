@@ -6,9 +6,11 @@
 //! nobody typing anything. A real answer leaves a user prompt stamped later than every prompt of
 //! the source, because every copy sesync writes carries the source's own timestamps.
 
-/// The note the converters put in front of a compacted conversation. It is a user message by
-/// shape, stamped with the compaction's time, but sesync wrote it: it is never a prompt.
-pub const COMPACTION_NOTE_PREFIX: &str = "Earlier turns of this conversation were compacted.";
+/// The note the converters put in front of a conversation whose start was left out: a compaction
+/// summary, or the turns a context fit left out (`sesync-conv` `fit.rs`). It is a user message by
+/// shape, stamped with the time of the first turn it introduces, but sesync wrote it: it is never a
+/// prompt. The shared opening is what matches both.
+pub const COMPACTION_NOTE_PREFIX: &str = "Earlier turns of this conversation were ";
 
 /// Seconds since the epoch of an RFC 3339 timestamp such as `2026-10-09T18:15:51.408Z` or
 /// `2026-10-09T19:15:51+01:00`. None for anything else.
