@@ -7,6 +7,7 @@
 //!   uuid / parentUuid   -> id / parentId (the chain the reader walks)
 //!   sessionId, cwd      -> session header
 //!   user / assistant    -> message records (role from `message.role`)
+//!   isCompactSummary user   -> compaction record {summary}; the live window starts there
 //!   text blocks         -> text content blocks
 //!   tool_use            -> toolCall block {id, name, arguments} in the assistant message
 //!   tool_result         -> one toolResult message per result {toolCallId, toolName,
@@ -43,6 +44,8 @@ pub struct Stats {
     pub tool_results: usize,
     pub orphan_tool_results: usize,
     pub duplicate_tool_results: usize,
+    /// Claude compaction summaries converted to compaction records.
+    pub compactions: usize,
 }
 
 /// Convert the whole transcript text. Returns the omp journal lines, header
@@ -62,6 +65,9 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
     // A source record that was split into several messages: its uuid -> the id of the last
     // one, so a later record whose parent is that uuid links to the end of the split.
     let mut alias: std::collections::HashMap<String, String> = Default::default();
+    // A result split off a record with text links to the message before it in that record. Those
+    // links are taken as they are: the alias would send the first result back to itself.
+    let mut direct: std::collections::HashMap<String, String> = Default::default();
     // Tool call id -> tool name, for every call seen so far; results pair against it.
     let mut calls: std::collections::HashMap<String, String> = Default::default();
     let mut answered: std::collections::HashSet<String> = Default::default();
@@ -104,6 +110,30 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
         if r.get("isMeta").and_then(Value::as_bool).unwrap_or(false) {
             stats.skipped_records += 1;
             continue;
+        }
+        // Claude's compaction: the summary of the turns before it is a user record flagged
+        // isCompactSummary, after a system compact_boundary record. It becomes a compaction record
+        // that the live window starts at. The turns before it stay in the journal, for the copy
+        // that keeps the whole file.
+        if r.get("isCompactSummary").and_then(Value::as_bool).unwrap_or(false) {
+            let id = r.get("uuid").and_then(Value::as_str).unwrap_or("").to_string();
+            let summary = text_of(r.get("message").and_then(|m| m.get("content")));
+            if !id.is_empty() && !summary.trim().is_empty() {
+                let ts = r.get("timestamp").and_then(Value::as_str).unwrap_or("").to_string();
+                if first_ts.is_empty() && !ts.is_empty() {
+                    first_ts = ts.clone();
+                }
+                kept_parent.push((id.clone(), r.get("parentUuid").and_then(Value::as_str).map(str::to_string)));
+                let mut m = Map::new();
+                m.insert("type".into(), "compaction".into());
+                m.insert("id".into(), id.into());
+                m.insert("parentId".into(), Value::Null);
+                m.insert("timestamp".into(), ts.into());
+                m.insert("summary".into(), summary.into());
+                out.push(m);
+                stats.compactions += 1;
+                continue;
+            }
         }
         let Some(msg) = r.get("message").and_then(Value::as_object) else {
             stats.skipped_records += 1;
@@ -221,25 +251,18 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
         if first_ts.is_empty() && !ts.is_empty() {
             first_ts = ts.clone();
         }
-        // The source record's own content, if any, keeps the source uuid.
+        // Claude sends a user's tool results before its own text in the same record, so the results
+        // come first here too. The text is then a turn of its own, after the call it answers, and a
+        // cut may start at it.
         let mut chain_parent = parent.clone();
         let mut last_id: Option<String> = None;
-        if !content.is_empty() {
-            kept_parent.push((id.clone(), parent.clone()));
-            let mut m = Map::new();
-            m.insert("type".into(), "message".into());
-            m.insert("id".into(), id.clone().into());
-            m.insert("parentId".into(), parent.clone().map(Value::from).unwrap_or(Value::Null));
-            m.insert("timestamp".into(), ts.clone().into());
-            m.insert("message".into(), json!({"role": role, "content": content}));
-            out.push(m);
-            stats.messages += 1;
-            last_id = Some(id.clone());
-        }
         // Each result is its own message, chained one after another. The first result
         // links to the source's parent (the record holding the call); later ones link to
         // the result before them. Results are resolved against the source parent below.
         for (rid, rm) in result_msgs.drain(..) {
+            if let Some(prev) = last_id.clone() {
+                direct.insert(rid.clone(), prev);
+            }
             let p = last_id.clone().or_else(|| chain_parent.clone());
             kept_parent.push((rid.clone(), p.clone()));
             let mut m = Map::new();
@@ -252,6 +275,25 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
             stats.messages += 1;
             last_id = Some(rid);
             chain_parent = None;
+        }
+        if !content.is_empty() {
+            kept_parent.push((id.clone(), parent.clone()));
+            if let Some(prev) = last_id.clone() {
+                direct.insert(id.clone(), prev);
+            }
+            let mut m = Map::new();
+            m.insert("type".into(), "message".into());
+            m.insert("id".into(), id.clone().into());
+            m.insert("parentId".into(), parent.clone().map(Value::from).unwrap_or(Value::Null));
+            m.insert("timestamp".into(), ts.clone().into());
+            let mut message = json!({"role": role, "content": content});
+            if role == "assistant" {
+                message["model"] = model_of(&msg).into();
+            }
+            m.insert("message".into(), message);
+            out.push(m);
+            stats.messages += 1;
+            last_id = Some(id.clone());
         }
         // Later records whose parent is this source uuid must link to its last message.
         if let Some(l) = &last_id {
@@ -290,7 +332,10 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
         .collect();
     for m in out.iter_mut() {
         let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-        let p = resolved.get(&id).cloned().flatten();
+        let p = match direct.get(&id) {
+            Some(d) => Some(d.clone()),
+            None => resolved.get(&id).cloned().flatten(),
+        };
         m.insert("parentId".into(), p.map(Value::from).unwrap_or(Value::Null));
     }
     if session_id.is_empty() {
@@ -313,6 +358,20 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
 /// The model that wrote a Claude assistant message, from its message.model field.
 fn model_of(msg: &Map<String, Value>) -> String {
     msg.get("model").and_then(Value::as_str).unwrap_or("unknown").to_string()
+}
+
+/// The text of a Claude message content: a string as it is, or the text blocks of an array joined.
+fn text_of(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Claude wraps local commands and reminders in <tags>; those are not turns.

@@ -15,6 +15,7 @@
 
 mod antigravity;
 mod claude;
+mod fit;
 mod from_antigravity;
 mod from_claude;
 mod from_opencode;
@@ -68,14 +69,15 @@ fn usage() -> ! {
         "sesync-conv inspect <journal>\n\
          sesync-conv to-pi <journal> --out-dir <pi-agent/sessions> [--id UUID] [--title T]\n\
          sesync-conv to-omp <journal> --out-dir <omp-agent/sessions> --home <HOME> [--id UUID] [--title T]\n\
-         sesync-conv to-opencode <journal> [--out bundle.json] --id SES_ID --title T [--cli-version V] [--no-thinking]\n\
+         sesync-conv to-opencode <journal> [--out bundle.json] --id SES_ID --title T [--cli-version V] [--no-thinking] [--context-window N] [--context-share F] [--context-overhead N]\n\
          sesync-conv from-claude <transcript.jsonl> --out <journal.jsonl>\n\
          sesync-conv from-opencode <export.json> --out <journal.jsonl>\n\
-         sesync-conv to-antigravity <journal.jsonl> --store <~/.gemini/antigravity-cli> --id <conversation id> [--title T]\n\
+         sesync-conv to-antigravity <journal.jsonl> --store <~/.gemini/antigravity-cli> --id <conversation id> [--title T] [--context-window N] [--context-share F] [--context-overhead N]\n\
          sesync-conv from-antigravity <conversation.db> --out <journal.jsonl>\n\
          sesync-conv antigravity-retitle --store <~/.gemini/antigravity-cli> --id <conversation id> --title T\n\
            (exit 2: a summary cache is locked by a running agy; the annotations title is written)\n\
-         sesync-conv to-claude <journal> --out-dir <~/.claude/projects> [--id UUID] [--title T] [--cli-version V]\n\
+         sesync-conv to-claude <journal> --out-dir <~/.claude/projects> [--id UUID] [--title T] [--cli-version V] [--context-window N] [--context-share F] [--context-overhead N]\n\
+         (--context-* fit the copy to the target's window: see docs/ARCHITECTURE.md \"Context fit\".)\n\
          sesync-conv ids <seed>            (prints the deterministic opencode and claude ids)\n\
          Output path is printed on stdout for to-pi/to-omp/to-claude/to-antigravity/from-*."
     );
@@ -151,8 +153,8 @@ fn main() {
                     let mut text = lines.join("\n");
                     text.push('\n');
                     fs::write(&out, text).map_err(|e| format!("{out}: {e}"))?;
-                    eprintln!("from-claude: {} message(s), {} text block(s), skipped {} tool / {} thinking / {} records / {} bad line(s)",
-                        stats.messages, stats.text_blocks, stats.skipped_tool_blocks, stats.skipped_thinking_blocks, stats.skipped_records, stats.skipped_bad_lines);
+                    eprintln!("from-claude: {} message(s), {} text block(s), {} compaction(s), skipped {} tool / {} thinking / {} records / {} bad line(s)",
+                        stats.messages, stats.text_blocks, stats.compactions, stats.skipped_tool_blocks, stats.skipped_thinking_blocks, stats.skipped_records, stats.skipped_bad_lines);
                     println!("{out}");
                     Ok(())
                 })
@@ -168,8 +170,8 @@ fn main() {
                     let mut text = lines.join("\n");
                     text.push('\n');
                     fs::write(&out, text).map_err(|e| format!("{out}: {e}"))?;
-                    eprintln!("from-opencode: {} message(s), {} text part(s), skipped {} tool / {} reasoning",
-                        stats.messages, stats.text_parts, stats.skipped_tool_parts, stats.skipped_reasoning_parts);
+                    eprintln!("from-opencode: {} message(s), {} text part(s), {} compaction(s), skipped {} tool / {} reasoning",
+                        stats.messages, stats.text_parts, stats.compactions, stats.skipped_tool_parts, stats.skipped_reasoning_parts);
                     println!("{out}");
                     Ok(())
                 })
@@ -180,7 +182,10 @@ fn main() {
             let id = arg(&args, "--id").unwrap_or_else(|| usage());
             let (j, _) = read_with_blobs(&p)?;
             let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
-            let (db, s, notes) = to_antigravity::install(&j, &store, &id, &title)?;
+            let budget = fit::Budget::from_args(&args)?;
+            let win = j.fit("antigravity", &budget)?;
+            eprintln!("{}", win.report.line("antigravity"));
+            let (db, s, notes) = to_antigravity::install(&j, &win, &store, &id, &title)?;
             for n in notes {
                 eprintln!("to-antigravity: {n}");
             }
@@ -273,7 +278,10 @@ fn main() {
                 let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
                 let dir = j.cwd().unwrap_or("").to_string();
                 let ver = arg(&args, "--cli-version").unwrap_or_else(|| "1.18.16".into());
-                let bundle = opencode::to_bundle(&j, &opencode::Options { session_id: &sid, title: &title, directory: &dir, cli_version: &ver, include_thinking: !flag(&args, "--no-thinking") });
+                let budget = fit::Budget::from_args(&args)?;
+                let win = j.fit("opencode", &budget)?;
+                eprintln!("{}", win.report.line("opencode"));
+                let bundle = opencode::to_bundle(&win, &opencode::Options { session_id: &sid, title: &title, directory: &dir, cli_version: &ver, include_thinking: !flag(&args, "--no-thinking") });
                 let text = serde_json::to_string(&bundle).unwrap();
                 match arg(&args, "--out") {
                     Some(o) => fs::write(&o, text).map_err(|e| format!("{o}: {e}")).map(|_| println!("{o}")),
@@ -290,7 +298,10 @@ fn main() {
                 let cwd = j.cwd().unwrap_or("").to_string();
                 let ver = arg(&args, "--cli-version").unwrap_or_else(|| "2.1.245".into());
                 let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
-                let lines = claude::to_lines(&j, &claude::Options { session_id: &sid, cwd: &cwd, cli_version: &ver, title: &title });
+                let budget = fit::Budget::from_args(&args)?;
+                let win = j.fit("claude", &budget)?;
+                eprintln!("{}", win.report.line("claude"));
+                let lines = claude::to_lines(&win, &claude::Options { session_id: &sid, cwd: &cwd, cli_version: &ver, title: &title });
                 if lines.is_empty() {
                     return Err("no resumable conversation (no user/assistant messages)".into());
                 }

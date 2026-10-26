@@ -200,9 +200,7 @@ impl Journal {
     /// The last compaction in this journal, as `(summary, timestamp)`.
     ///
     /// The turns it archived are outside the live window, so the summary is the only record of
-    /// them. Every target that exports the live window has to carry it, or the copy silently
-    /// loses that history: an OpenCode export maps it to a compaction part, and Claude and the
-    /// others get it as a message.
+    /// them. The message-based writers carry it through `fit::Window::note`.
     pub fn live_compaction(&self) -> Option<(&str, &str)> {
         let r = self
             .records
@@ -212,14 +210,6 @@ impl Journal {
         let summary = r.get("summary").and_then(Value::as_str)?;
         let ts = r.get("timestamp").and_then(Value::as_str).unwrap_or("");
         Some((summary, ts))
-    }
-
-    /// The last compaction's summary as a note for targets that have no compaction concept of
-    /// their own. Without it, dropping the archive would lose those turns silently; OpenCode gets
-    /// the compaction record itself instead, as a compaction part.
-    pub fn compaction_note(&self) -> Option<String> {
-        self.live_compaction()
-            .map(|(s, _)| format!("Earlier turns of this conversation were compacted. Their summary:\n\n{s}"))
     }
 
     /// omp title-slot line: exactly TITLE_SLOT_BYTES-1 bytes of JSON + "\n".
