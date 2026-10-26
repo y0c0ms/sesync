@@ -21,6 +21,9 @@
 //!                         an OpenCode reasoning block has no omp signature
 //!                         and is not needed to resume the conversation)
 //!   time.created (ms)  -> record `timestamp` (ISO); never the epoch
+//!   summary assistant (summary: true, finished) -> compaction record {summary}; the live window
+//!                         starts there. The user message holding the compaction part has no text
+//!                         and is dropped with the other empty turns.
 
 use serde_json::{json, Map, Value};
 
@@ -36,6 +39,8 @@ pub struct Stats {
     pub tool_calls: usize,
     pub tool_results: usize,
     pub unfinished_tool_parts: usize,
+    /// Completed compaction summaries converted to compaction records.
+    pub compactions: usize,
 }
 
 /// Parse the export text (banner allowed) into a JSON value.
@@ -76,6 +81,37 @@ pub fn to_journal_lines(export: &Value) -> Result<(Vec<String>, Stats), String> 
         let id = minfo.get("id").and_then(Value::as_str).map(str::to_string)
             .unwrap_or_else(|| format!("oc-{session_id}-{i}"));
         let created = minfo.get("time").and_then(|t| t.get("created")).and_then(Value::as_i64).unwrap_or(created_ms);
+        // OpenCode's compaction: a finished assistant message flagged `summary` is the summary of the
+        // turns before it. The live window starts there, as OpenCode's own filterCompacted stops
+        // there too. It becomes a compaction record; the turns before it stay in the journal.
+        if role == "assistant"
+            && minfo.get("summary").and_then(Value::as_bool) == Some(true)
+            && minfo.get("finish").is_some_and(|f| !f.is_null())
+            && minfo.get("error").map_or(true, Value::is_null)
+        {
+            let summary: Vec<&str> = m
+                .get("parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .filter(|t| !t.trim().is_empty())
+                .collect();
+            let summary = summary.join("\n");
+            if !summary.trim().is_empty() {
+                let mut rec = Map::new();
+                rec.insert("type".into(), "compaction".into());
+                rec.insert("id".into(), id.clone().into());
+                rec.insert("parentId".into(), prev.clone().map(Value::from).unwrap_or(Value::Null));
+                rec.insert("timestamp".into(), iso_ms(created).into());
+                rec.insert("summary".into(), summary.into());
+                lines.push(serde_json::to_string(&rec).map_err(|e| e.to_string())?);
+                prev = Some(id);
+                stats.compactions += 1;
+                continue;
+            }
+        }
 
         let mut content: Vec<Value> = Vec::new();
         // Tool results found in this message: (call id, tool name, text, is_error).
@@ -142,6 +178,8 @@ pub fn to_journal_lines(export: &Value) -> Result<(Vec<String>, Stats), String> 
                         _ => stats.unfinished_tool_parts += 1,
                     }
                 }
+                // The compaction part on a user message only marks the summary above; nothing to carry.
+                Some("compaction") => {}
                 Some(_) => stats.skipped_tool_parts += 1,
                 None => {}
             }
@@ -153,6 +191,11 @@ pub fn to_journal_lines(export: &Value) -> Result<(Vec<String>, Stats), String> 
         let mut msg = Map::new();
         msg.insert("role".into(), role.into());
         msg.insert("content".into(), Value::Array(content));
+        // The model that wrote an assistant turn: the window a copy must fit is per model.
+        if let (Some(p), true) = (minfo.get("providerID").and_then(Value::as_str), role == "assistant") {
+            msg.insert("provider".into(), p.into());
+            msg.insert("model".into(), model_name(minfo).into());
+        }
         let mut rec = Map::new();
         rec.insert("type".into(), "message".into());
         rec.insert("id".into(), id.clone().into());

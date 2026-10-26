@@ -16,6 +16,7 @@
 //! functionCall) and second results for one call.
 
 use crate::antigravity::{self as ag, with_suffix};
+use crate::fit::Window;
 use crate::journal::{parse_iso_ms, Journal};
 use crate::protobuf::{timestamp, Writer};
 use base64::Engine;
@@ -97,8 +98,8 @@ fn user_step(text: &str, images: &[(String, Vec<u8>)], ms: i64) -> Step {
 }
 
 /// The steps for the journal's live window, plus the trajectory start time (ms).
-pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
-    let msgs = j.messages();
+pub fn build_steps(j: &Journal, win: &Window) -> Result<(Vec<Step>, Stats, i64), String> {
+    let msgs = &win.msgs;
     if !msgs.iter().any(|m| m.role == "user" || m.role == "assistant") {
         return Err("empty conversation: the journal has no user or assistant message".into());
     }
@@ -109,7 +110,7 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
         .unwrap_or(0);
     let mut st = Stats::default();
     let mut steps = Vec::new();
-    if let Some(note) = j.compaction_note() {
+    if let Some((note, _)) = win.note() {
         steps.push(user_step(&note, &[], start_ms));
         st.user_steps += 1;
     }
@@ -119,7 +120,7 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
     let mut answered: HashSet<String> = HashSet::new();
     let mut call_seq = 0usize;
 
-    for m in &msgs {
+    for m in msgs {
         let ms = m.timestamp_ms;
         match m.role {
             "user" => {
@@ -527,13 +528,13 @@ fn check_id(id: &str) -> Result<(), String> {
 }
 
 /// Convert and install. Returns the installed `.db` path, stats and stderr notes.
-pub fn install(j: &Journal, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
+pub fn install(j: &Journal, win: &Window, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
     check_id(id)?;
     let cwd = j.cwd().unwrap_or("").trim();
     if cwd.is_empty() {
         return Err("the journal header has no cwd: Antigravity lists conversations by workspace".into());
     }
-    let (steps, stats, start_ms) = build_steps(j)?;
+    let (steps, stats, start_ms) = build_steps(j, win)?;
     let dir = store.join("conversations");
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let db = dir.join(format!("{id}.db"));
@@ -557,6 +558,15 @@ pub mod tests {
     use super::*;
     use crate::from_antigravity;
     use crate::protobuf::{timestamp_ms, Msg};
+
+    /// The writer on a journal's whole live window, nothing fitted.
+    fn install(j: &Journal, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
+        super::install(j, &j.window(), store, id, title)
+    }
+
+    fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
+        super::build_steps(j, &j.window())
+    }
 
     /// A scratch directory whose path has a space and an accent, like real Windows profiles.
     pub fn scratch(name: &str) -> PathBuf {

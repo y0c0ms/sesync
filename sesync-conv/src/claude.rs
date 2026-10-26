@@ -18,7 +18,8 @@
 //! Ids are uuid5 of (session seed, record id) so a re-run rewrites the same
 //! uuids and the daemon's replace-in-place keeps working.
 
-use crate::journal::{iso_from_ms, Journal};
+use crate::fit::Window;
+use crate::journal::iso_from_ms;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -41,8 +42,7 @@ fn tool_id(raw: &str) -> String {
     format!("toolu_{}", &Uuid::new_v5(&NS, format!("{raw}|tool").as_bytes()).simple().to_string()[..24])
 }
 
-pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
-    let msgs = j.messages();
+pub fn to_lines(win: &Window, o: &Options) -> Vec<String> {
     let mut out = Vec::new();
     // The session starts with a custom-title, as /rename and `-n` write. Claude
     // prefers it over ai-title; without one it labels the session by its first
@@ -58,10 +58,10 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
         Uuid::new_v5(&NS, format!("{}|{}|{}", o.session_id, rid, n).as_bytes()).to_string()
     };
 
-    // The turns a compaction archived are not in `msgs` any more: its summary is the only record
-    // of them, so it is carried as the first message. Without this a compacted journal exports a
-    // conversation that simply starts mid-thread.
-    if let (Some(text), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
+    // The note stands in for what is not carried: the turns a compaction archived (its summary is
+    // the only record of them) and the turns a fit left out. It goes first, so the conversation
+    // never starts mid-thread without a word.
+    if let Some((text, ts)) = win.note() {
         let uuid = uid("compaction-summary");
         let rec = json!({
             "parentUuid": parent, "isSidechain": false, "userType": "external",
@@ -73,7 +73,7 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
         parent = Some(uuid);
     }
 
-    for m in &msgs {
+    for m in &win.msgs {
         let ts = iso_from_ms(m.timestamp_ms);
         let (typ, message): (&str, Value) = match m.role {
             "user" => {
@@ -182,6 +182,13 @@ pub fn bucket(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::journal::Journal;
+
+    /// The writer on a journal's whole live window, nothing fitted.
+    fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
+        super::to_lines(&j.window(), o)
+    }
 
     fn journal_of(lines: &[String]) -> Journal {
         // Unique per call: tests run in parallel, and a shared name let one test read
