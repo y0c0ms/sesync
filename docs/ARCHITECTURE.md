@@ -425,9 +425,10 @@ the last compaction, `Journal::messages`), in `sesync-conv/src/fit.rs`:
 
 **Estimate.** No tokenizer is loaded. A string costs `ceil(bytes / 3)` tokens (only its content:
 record keys and the envelope are not counted, since the target does not show them to the model),
-an image 1600, and each message 8. Bytes per token are about 4 for English prose and about 3 for
-code and JSON, so the estimate errs high. Every converter run prints what the fit did:
-`fit: <target>: kept K of N user turn(s), ~A of ~B estimated tokens (limit L)`.
+an image the larger of two bounds read from its header (see "Attachments"; 1600 when the header cannot
+be read), and each message 8. Bytes per token are about 4 for English prose and about 3 for code and
+JSON, so the estimate errs high. An image the copy withholds costs its note instead. Every converter
+run prints what the fit did: `fit: <target>: kept K of N user turn(s), ~A of ~B estimated tokens (limit L)`.
 
 **Where the window comes from** (`sesync/src/harness/window.rs`, first match wins):
 
@@ -464,10 +465,84 @@ no omp opt-in ships. If an over-window omp resume is seen to fail, the fit can b
 writing a fitted journal (a compaction record plus the kept turns) from `to-omp` and `to-pi`.
 
 **Where it is checked.** `sesync-conv/src/fit/tests.rs`: long omp, Claude and OpenCode sessions
-through every message-based target, the cut rule at every position, both refusals, and a
-budget that fits without a cut. `sesync/tests/context_fit.rs`: the daemon's own install path
-through the real converter. `sesync/src/harness/window.rs`: the window rules and the OpenCode
-config reader.
+through every message-based target, the cut rule at every position, both refusals, a budget that
+fits without a cut, and image-heavy windows (whole turns with their images, the estimate from a
+known size, a withheld image costing its note). `sesync-conv/src/attach/tests.rs`: header sizes,
+tokens, limits, notes, the round trips, and the tool-result, URL, OpenCode file and many-image
+cases. `sesync/tests/context_fit.rs`: the daemon's own install path through the real converter.
+`sesync/src/harness/window.rs`: the window rules and the OpenCode config reader.
+
+## Attachments
+
+A copy written for a message-based target carries an image as that target's own image block when
+the target takes it. Anything it does not carry leaves a text note **in the same message, at the same
+position**, so the reader sees that something was there. The note is ordinary text, so every
+converter and target carries it. The counters of each converter still count what was dropped.
+Code: `sesync-conv/src/attach.rs` (the one decision, `judge`, plus the note format, limits, header
+sizes and token bounds); tests in `sesync-conv/src/attach/tests.rs`.
+
+**The note.** `[attachment not carried: <name> (<mime>, <size>) — <reason>; kept in the source session]`.
+The name is the source's own `filename` only. A path or a URL is never written, because a path can hold
+private directories and a URL a query. Sizes are decimal (`1.2 KB`, `5 MB`). Never content.
+
+**What is not carried, and what leaves a note:**
+
+| Attachment | Source | Target | Note reason |
+|---|---|---|---|
+| File, path, http URL, non-image data URL | OpenCode `file` part | all | kept in the source session |
+| Image by URL, or by Files API id | Claude `image` source `url` / `file` | all | kept in the source session |
+| Image with no bytes, or a blob reference the journal does not hold | any | all | the journal holds no bytes / only a blob reference |
+| Image with no inline bytes, file or thumbnail | Antigravity user step | all | the conversation holds no bytes for it |
+| Image whose base64 does not decode | any | Antigravity | its base64 data does not decode |
+| Image over a target limit (below) | any | that target | over the limit; kept in the source session |
+| Tool-result image | any | Claude, OpenCode, Antigravity | this copy does not carry tool-result images (Antigravity: no slot for them) |
+| Image in a reply (assistant turn) | any | Claude, Antigravity | the planner step has no slot for images |
+
+OpenCode carries an image in a reply as a file part, as it does a user image.
+
+**Limits**, checked on the image's base64 text (`attach::CLAUDE`, `OPENCODE`, `ANTIGRAVITY`):
+
+| Target | Bytes per image | Pixels per side | Rule | Source (checked 2026-10-26) |
+|---|---|---|---|---|
+| Claude | 5 MB base64 | 8000 | above 20 images in one request, 2000 | Claude vision docs, "Request limits": 10 MB on the API, 5 MB on Bedrock, 8000 px, the 2000 px rule above 20 images (`platform.claude.com/docs/en/build-with-claude/vision`) |
+| OpenCode | 5 MB base64 | 8000 | none | OpenCode sends to whichever provider the session uses; the copy keeps to the smallest documented limit (Claude on Bedrock) |
+| Antigravity | 20 MB base64 | none | none | Gemini: "inline image data limits your total request size ... to 20MB" (`ai.google.dev/gemini-api/docs/image-understanding`); no per-image pixel limit documented |
+
+Claude runs on Bedrock too, so the copy keeps to Bedrock's 5 MB. The Claude 2000 px rule applies to
+every image of a request above 20 images, and the copy is one request, so the writer counts the
+user images it carries (`attach::carried_count`) and withholds only the ones above 2000 px when the
+count exceeds 20. The request-size limit (32 MB on Claude's standard endpoints) applies to the whole
+request, not to one image, and is **not** enforced: the fit budgets tokens, not bytes.
+
+**Image tokens** (`attach::image_tokens`). The estimate is the larger of two upper bounds, read from the
+image's header (PNG, JPEG, GIF, WebP; `attach::dims`):
+
+- Claude: one token per 28 x 28 pixel patch, `ceil(w/28) * ceil(h/28)`, capped at 4784, the
+  high-resolution tier (Claude 4.7 and later). The standard tier caps at 1568. The copy does not
+  know which model resumes it, so the larger cap is used. Downscaling only lowers the count, so this
+  bounds the cost after any resize.
+- OpenAI tiles (`gpt-4o` family, `detail: high`): scale to fit 2048 px, scale the shorter side to 768
+  px, then `85 + 170` per 512 px tile.
+
+A header that cannot be read costs 1600 (`FALLBACK_IMAGE_TOKENS`). Examples: 1920 x 1080 costs 2691,
+1000 x 1000 costs 1296, 100 x 100 costs 255. The patch rule is the one the current Claude documentation
+gives; an earlier `w x h / 750` estimate is superseded.
+
+**Round trips.** `to-claude`, `to-opencode`, `to-antigravity` and their `from-*` readers carry a user
+image's bytes, MIME type, turn and place among the text byte for byte (checked in
+`attach/tests.rs`: omp to Claude to OpenCode and back, and omp to Antigravity and back). Antigravity
+stores an image apart from the text, so it keeps the order of the images, not their place among the
+text.
+
+**Real data** (read-only check, 2026-10-26, the five omp sessions with images, copies written to a
+temp dir with `--context-window 100000000`): the user-turn images carried into each copy equal the
+images the source holds on its live branch, in count and in the SHA-256 of their bytes, for both
+Claude and OpenCode. Tool-result images (27 in two sessions) are not carried by either target and
+leave a note. Images on inactive or archived branches are not in the live window and are not copied.
+
+**Not carried, and why it is still open.** Tool-result images could be carried into a Claude copy
+(its `tool_result` content takes images); they are noted for now. The request-size limit is not
+enforced (see above).
 
 ## Local sync
 
