@@ -42,6 +42,11 @@ impl Harness for Claude {
     fn cwd(&self, path: &Path) -> Option<String> {
         journal::cwd_from_head(path)
     }
+    /// `claude --resume` takes the session's id, and finds the session from the directory it runs in.
+    fn resume_argv(&self, _loc: &Location, key: &str) -> Result<Vec<String>, String> {
+        let id = self.id_in(key).ok_or_else(|| format!("claude: '{key}' is not a session file named by its id"))?;
+        Ok(vec!["claude".into(), "--resume".into(), id])
+    }
     fn newest_prompt(&self, _loc: &Location, key: &str) -> Option<f64> {
         journal::newest_prompt(Path::new(key), prompt_time)
     }

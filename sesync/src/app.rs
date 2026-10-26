@@ -5,6 +5,7 @@
 use crate::lock::ClaimOutcome;
 use crate::manage::{self, Group, Roots};
 use crate::palette::{self};
+use crate::herdr_open;
 use crate::state::State;
 use crate::tui::{Key, Model};
 use std::path::PathBuf;
@@ -299,6 +300,8 @@ pub struct App {
     last_pull: Option<(Instant, usize, usize)>,
     /// Cursor and picks for the per-session menu and the mirror-target picker.
     menu_cursor: usize,
+    /// The herdr client "Open in herdr" talks through. Read from the environment at start-up.
+    herdr: herdr_open::Herdr,
     installed_targets: Vec<String>,
     /// When the state file was last read from disk, in seconds since the epoch. Drawn in the tab bar.
     state_written: Option<f64>,
@@ -451,6 +454,7 @@ impl App {
             palette_query: String::new(),
             palette_cursor: 0,
             menu_cursor: 0,
+            herdr: herdr_open::Herdr::from_env(Box::new(herdr_open::Process)),
             installed_targets: Vec::new(),
             state_written: None,
             pick_cursor: 0,
@@ -1575,6 +1579,8 @@ impl App {
                 }
                 self.toggle_mark();
             }
+            // o opens the selected session in herdr: its tab if one runs it, else a new tab that resumes it.
+            Ev::Char('o') => self.open_in_herdr(),
             // s opens the share picker (explicit team choice); u stops sharing everywhere.
             Ev::Char('s') => {
                 if self.view != View::Sessions {
@@ -1789,6 +1795,7 @@ impl App {
         match self.view {
             View::Sessions => vec![
                 ("enter", "open the selected session's menu (rename, mark, mirror, delete)"),
+                ("o", "open the session in herdr: focus its tab, or resume it in a new one"),
                 ("m", "mark / unmark the session for the team push"),
                 ("/", "filter the list by title; enter keeps it, esc clears it"),
                 ("f", "cycle what is listed: all, marked, mirrored, failing"),
@@ -1885,6 +1892,7 @@ impl App {
     /// The session menu options, in display order. Each runs the same event its normal key sends.
     pub fn session_menu_rows(&self) -> Vec<(&'static str, &'static str)> {
         vec![
+            ("Open in herdr", "o"),
             ("Rename", "r"),
             ("Mark / unmark for team", "m"),
             ("Mirror to harness", ""),
@@ -1915,16 +1923,48 @@ impl App {
                 let choice = self.menu_cursor;
                 self.close_session_menu();
                 match choice {
-                    0 => self.handle(Ev::Char('r'), now),
-                    1 => self.handle(Ev::Char('m'), now),
-                    2 => self.open_mirror_pick(),
-                    3 => self.open_transcript(),
-                    4 => self.copy_selected_path(),
-                    5 => self.handle(Ev::CtrlD, now),
+                    0 => self.handle(Ev::Char('o'), now),
+                    1 => self.handle(Ev::Char('r'), now),
+                    2 => self.handle(Ev::Char('m'), now),
+                    3 => self.open_mirror_pick(),
+                    4 => self.open_transcript(),
+                    5 => self.copy_selected_path(),
+                    6 => self.handle(Ev::CtrlD, now),
                     _ => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Open the selected session in herdr (see `herdr_open`): focus the tab that already runs it,
+    /// or open a tab that resumes it. Success leaves the TUI, so the popup closes onto that tab.
+    fn open_in_herdr(&mut self) {
+        if self.view != View::Sessions {
+            self.say("herdr opens local sessions; press tab");
+            return;
+        }
+        let Some(g) = self.selected() else {
+            self.say("nothing selected");
+            return;
+        };
+        if g.orphan {
+            self.fail(format!("'{}' is no longer on disk, so there is nothing to open", g.title));
+            return;
+        }
+        let plan = match herdr_open::plan(&self.roots.locations, &self.roots.home, &g.fmt, &g.key, &g.title) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.fail(e);
+                return;
+            }
+        };
+        match herdr_open::open(&self.herdr, &plan) {
+            Ok(opened) => {
+                self.say(opened.message(&plan));
+                self.quit = true;
+            }
+            Err(e) => self.fail(e),
         }
     }
 
@@ -1997,6 +2037,11 @@ impl App {
     /// The harnesses installed on this machine, as format names. Set by the caller at start-up.
     pub fn set_installed_targets(&mut self, targets: Vec<String>) {
         self.installed_targets = targets;
+    }
+
+    /// Replace the herdr client "Open in herdr" uses. Tests drive a fake herdr through this.
+    pub fn set_herdr(&mut self, herdr: herdr_open::Herdr) {
+        self.herdr = herdr;
     }
 
     pub fn menu_cursor(&self) -> usize { self.menu_cursor }

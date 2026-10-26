@@ -52,6 +52,14 @@ impl Harness for OpenCode {
     fn id_in(&self, key: &str) -> Option<String> {
         Some(key.to_string()).filter(|k| !k.is_empty())
     }
+    /// `opencode --session` takes the session id. Never `--fork`, which would start a copy.
+    fn resume_argv(&self, loc: &Location, key: &str) -> Result<Vec<String>, String> {
+        Ok(vec![Self::cli(loc).display().to_string(), "--session".into(), key.into()])
+    }
+    /// OpenCode keeps the directory a session ran in in its database.
+    fn project_dir(&self, loc: &Location, key: &str) -> Option<String> {
+        store::session_directory(&loc.root, key)
+    }
     /// The import goes by the bundle's directory, the conversation's own workspace. The
     /// delete-first runs where the store keeps the copy now, the only place the CLI finds it (a
     /// first write has no row yet).
