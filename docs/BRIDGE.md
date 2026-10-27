@@ -28,7 +28,7 @@ another route. Nothing here opens a firewall port: the host's firewalld zone dec
 (`SESYNC_LOCK`, else the binary beside `sesync`; `SESYNC_LOCK_DIR`, else the stored locks directory). If
 the lock binary is not installed, prompts are sent without a claim, as the daemon's own writes are.
 
-`serve` also runs the phase-2 background work. The ntfy token command runs once at startup (default `sudo -n systemd-creds decrypt --name=agenthub-ntfy-token /opt/homelab-creds/agenthub-ntfy-token.cred -`, 20 s limit). Its output is the publish token and is never logged; a failure leaves push off and says why. `--no-ntfy` turns push off. Plan usage runs `<omp> usage --json` every `--usage-every` seconds (no model call); `--no-usage` turns it off. `SESYNC_USAGE_FIXTURE=<file>` makes the refresh read that file instead of running omp; the e2e backend uses it. A herdr watcher reads agent statuses every 250 ms for notifications, the same cadence as the terminal poll, so a short turn is seen going `working` → `idle`.
+`serve` also runs the phase-2 background work. The ntfy token command runs once at startup (default `sudo -n systemd-creds decrypt --name=agenthub-ntfy-token /opt/homelab-creds/agenthub-ntfy-token.cred -`, 20 s limit). Its output is the publish token and is never logged; a failure leaves push off and says why. `--no-ntfy` turns push off. Plan usage runs `<omp> usage --json` every `--usage-every` seconds (no model call); `--no-usage` turns it off. `SESYNC_USAGE_FIXTURE=<file>` makes the refresh read that file instead of running omp; the e2e backend uses it. The notification watcher follows herdr's agent-status events (see Notifications).
 
 Exit codes: 0 success, 2 usage, 1 failure (as in `sesync team`).
 
@@ -157,7 +157,7 @@ from `pane.send_keys` and `pane.send_text` produced no event). `pane.output_matc
 matching line appears, and an events connection fixes its pane set when it opens, so it cannot follow
 panes that come and go. The bridge therefore polls: a screen every 250 ms (sent only when it changed),
 the tab and status lists every second, and the conversation list from disk every 5 seconds.
-herdr's `pane.agent_status_changed` is not used for the same reason.
+herdr's `pane.agent_status_changed` is not used for screens, but it is used for notifications: a per-pane `events.subscribe` delivers every status change (see Notifications), so no turn is missed between samples.
 
 ## Prompt turns
 
@@ -237,11 +237,11 @@ When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines a
 
 ## Notifications
 
-A watcher reads herdr's agent statuses every 250 ms. Detection is by pane polling, so a turn that starts and ends entirely between two samples produces no `working` sample and no event. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push enabled, each event is also published on a detached thread to `<ntfy url>/<topic>` with `Authorization: Bearer`, the headers `Ti…
+A watcher subscribes to herdr's `pane.agent_status_changed` event for each pane it knows (`events.subscribe`, one subscription per pane), and applies every status change as it arrives, so a turn is seen however short it is. The pane list is re-read every second to follow panes that open or close, and the subscription is reopened then. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push e…
 
 ## Plan usage
 
-`accounts.list` and `accounts.subscribe` answer the app's `AccountsSnapshot`: the `claude` and `codex` account lists and the `rateLimits.claude|codex.{session,weekly}` bars (`usedPercent`, `windowMinutes`, `resetsAt` in ms or null). The bridge maps `omp usage --json` to it: the 5-hour window is the session bar and the 7-day untiered window the weekly bar; Anthropic is `claude`, OpenAI Codex is `codex`. Nothing else from the report is shown. The schema comes from omp's own source, not from a live run, so a live check is still to do. A failed refresh keeps the last good snapshot, and a subscriber gets a frame only when the usage changes. The bridge never sends provider credentials to the phone.
+`accounts.list` and `accounts.subscribe` answer the app's `AccountsSnapshot`: the `claude` and `codex` account lists and the `rateLimits.claude|codex.{session,weekly}` bars (`usedPercent`, `windowMinutes`, `resetsAt` in ms or null). The bridge maps `omp usage --json` to it: the 5-hour window is the session bar and the 7-day untiered window the weekly bar; Anthropic is `claude`, OpenAI Codex is `codex`. Every login is also an inactive row. omp does not say which login is the system default, so with exactly one login for a provider that login's usage also fills `rateLimits.claude` (or `codex`), the bars the app draws for the system default; with several logins those stay null and the app shows no default bars. Nothing else from the report is shown. A failed refresh keeps the last good snapshot, and a subscriber gets a frame only when the usage changes. The bridge never sends provider credentials to the phone. Verified live against the e2e fixture (one login: `rateLimits.claude.session.usedPercent` 25).
 
 ## Session data
 

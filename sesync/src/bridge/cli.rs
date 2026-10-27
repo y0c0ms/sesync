@@ -24,8 +24,9 @@ const DEFAULT_NTFY_TOKEN_COMMAND: &str =
     "sudo -n systemd-creds decrypt --name=agenthub-ntfy-token /opt/homelab-creds/agenthub-ntfy-token.cred -";
 /// How often plan usage is refreshed with `omp usage --json`, unless `--usage-every` says otherwise.
 const DEFAULT_USAGE_EVERY_SECS: u64 = 600;
-/// How often herdr's agent statuses are read to raise notifications.
-const NOTIFY_EVERY: Duration = Duration::from_millis(250);
+/// How often the pane list is re-read to follow panes that open or close. Agent statuses arrive as herdr
+/// events in between, so a turn is seen however short it is.
+const NOTIFY_EVERY: Duration = Duration::from_secs(1);
 /// The flags of `serve` that take no value.
 const SERVE_FLAGS: &[&str] = &["no-ntfy", "no-usage"];
 const USAGE: &str = "usage: sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]

@@ -315,8 +315,10 @@ fn run_usage(omp: &Path, timeout: Duration) -> Result<Value, String> {
 ///
 /// Only Claude (`anthropic`) and Codex (`openai-codex`) reports are mapped; other providers have no
 /// section in the app's snapshot and are dropped. Each credential becomes one account row. omp does
-/// not say which account is active, so `activeAccountId` and the `claude`/`codex` `rateLimits` are null
-/// and every account's usage is an inactive entry, which the app renders as a bar row.
+/// not say which account is active, so `activeAccountId` is null. With exactly one login for a provider that
+/// login is the system default, so its usage also fills the `claude`/`codex` `rateLimits` (the bars the app
+/// draws for the system default); with several, those stay null. Every account's usage is also an inactive
+/// entry, which the app renders as a bar row.
 fn map_usage(usage: &Value, now: u64) -> Result<Value, String> {
     let reports = usage
         .get("reports")
@@ -329,8 +331,8 @@ fn map_usage(usage: &Value, now: u64) -> Result<Value, String> {
         "claude": { "accounts": claude.accounts, "activeAccountId": null },
         "codex": { "accounts": codex.accounts, "activeAccountId": null },
         "rateLimits": {
-            "claude": null,
-            "codex": null,
+            "claude": single_default(&claude.inactive),
+            "codex": single_default(&codex.inactive),
             "claudeTarget": host_target(),
             "codexTarget": host_target(),
             "inactiveClaudeAccounts": claude.inactive,
@@ -339,6 +341,14 @@ fn map_usage(usage: &Value, now: u64) -> Result<Value, String> {
     }))
 }
 
+
+/// The system-default usage for a provider with exactly one login: that login's rate limits. None otherwise.
+fn single_default(inactive: &[Value]) -> Value {
+    match inactive {
+        [only] => only["rateLimits"].clone(),
+        _ => Value::Null,
+    }
+}
 #[derive(Default)]
 struct Lane {
     accounts: Vec<Value>,
@@ -592,6 +602,27 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn a_single_login_fills_the_system_default_bars() {
+        let one = json!({ "reports": [{
+            "provider": "anthropic",
+            "fetchedAt": NOW,
+            "limits": [{
+                "id": "anthropic:5h", "label": "Claude 5 Hour",
+                "scope": { "provider": "anthropic", "windowId": "5h", "shared": true },
+                "window": { "id": "5h", "label": "5 Hour", "durationMs": 18000000_u64, "resetsAt": 1790003600000_u64 },
+                "amount": { "used": 25, "limit": 100, "remaining": 75, "usedFraction": 0.25, "remainingFraction": 0.75, "unit": "percent" },
+                "status": "ok"
+            }],
+            "metadata": { "source": "ratelimit-headers", "accountId": "acct-claude-1", "email": "alice@example.com" }
+        }] });
+        let snap = map_usage(&one, NOW).unwrap();
+        let inactive = snap["rateLimits"]["inactiveClaudeAccounts"][0]["rateLimits"].clone();
+        assert_eq!(inactive["session"]["usedPercent"].as_f64(), Some(25.0));
+        assert_eq!(snap["rateLimits"]["claude"], inactive, "the one login is the system default");
+        assert!(snap["rateLimits"]["codex"].is_null(), "no codex login, no default bars");
     }
 
     #[test]

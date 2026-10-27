@@ -28,6 +28,17 @@ pub fn default_socket() -> PathBuf {
 pub trait Herdr: Send + Sync {
     /// Run `method` with `params` and return the reply's `result`, or herdr's error message.
     fn call(&self, method: &str, params: Value) -> Result<Value, String>;
+
+    /// Pane agent-status changes for `pane_ids`. Canned answers have none, so the default refuses.
+    fn status_events(&self, _pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
+        Err("herdr status events are not available here".into())
+    }
+}
+
+/// A stream of pane agent-status changes, read with a timeout.
+pub trait StatusSource: Send {
+    /// The next `(pane_id, agent_status)`, or None when `wait` passes first. An error ends the stream.
+    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String>;
 }
 
 /// herdr over its Unix socket.
@@ -61,12 +72,99 @@ impl Herdr for Socket {
             .map_err(|e| format!("herdr did not answer {method} ({e})"))?;
         reply(method, &line)
     }
+
+    fn status_events(&self, pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
+        StatusEvents::open(&self.path, pane_ids).map(|events| Box::new(events) as Box<dyn StatusSource>)
+    }
 }
 
 #[cfg(not(unix))]
 impl Herdr for Socket {
     fn call(&self, _method: &str, _params: Value) -> Result<Value, String> {
         Err("herdr's socket API needs a Unix socket; this platform has none".into())
+    }
+}
+#[cfg(unix)]
+impl StatusSource for StatusEvents {
+    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+        StatusEvents::next(self, wait)
+    }
+}
+
+/// A subscription to `pane.agent_status_changed` for a set of panes. herdr pushes one event line per
+/// change, in order, so no status between two reads is lost. Sampling cannot promise that: an agent
+/// turn can start and finish between two samples.
+#[cfg(unix)]
+pub struct StatusEvents {
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    pending: String,
+}
+
+#[cfg(unix)]
+impl StatusEvents {
+    /// Subscribe to the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
+    pub fn open(path: &Path, pane_ids: &[String]) -> Result<StatusEvents, String> {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let mut stream = UnixStream::connect(path)
+            .map_err(|e| format!("herdr is not reachable at {} ({e})", path.display()))?;
+        stream.set_write_timeout(Some(CALL_TIMEOUT)).map_err(|e| e.to_string())?;
+        let subscriptions: Vec<Value> = pane_ids
+            .iter()
+            .map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id }))
+            .collect();
+        let request = json!({ "id": "sesync-events", "method": "events.subscribe", "params": { "subscriptions": subscriptions } });
+        writeln!(stream, "{request}").map_err(|e| format!("herdr did not take the event subscription ({e})"))?;
+        let mut events = StatusEvents { reader: std::io::BufReader::new(stream), pending: String::new() };
+        let ack = events.line(CALL_TIMEOUT)?.ok_or("herdr did not acknowledge the event subscription")?;
+        let ack: Value = serde_json::from_str(ack.trim()).map_err(|e| format!("herdr's subscription reply: {e}"))?;
+        if ack["result"]["type"] != "subscription_started" {
+            return Err(format!("herdr refused the event subscription: {}", ack["error"]["message"]));
+        }
+        Ok(events)
+    }
+
+    /// The next pane status change as `(pane_id, agent_status)`, or None when `wait` passes without one.
+    /// Other events are skipped. An error means the connection ended and the subscription must be reopened.
+    pub fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+        loop {
+            let Some(line) = self.line(wait)? else { return Ok(None) };
+            let event: Value = match serde_json::from_str(line.trim()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if event["event"] != "pane.agent_status_changed" {
+                continue;
+            }
+            let data = &event["data"];
+            if let (Some(pane), Some(status)) = (data["pane_id"].as_str(), data["agent_status"].as_str()) {
+                return Ok(Some((pane.to_string(), status.to_string())));
+            }
+        }
+    }
+
+    /// One whole line from the socket, or None when `wait` passes first. A partial line waits in `pending`.
+    fn line(&mut self, wait: Duration) -> Result<Option<String>, String> {
+        use std::io::BufRead;
+        self.reader.get_ref().set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
+        loop {
+            if let Some(end) = self.pending.find('\n') {
+                let rest = self.pending.split_off(end + 1);
+                let line = std::mem::replace(&mut self.pending, rest);
+                return Ok(Some(line));
+            }
+            let mut chunk = String::new();
+            match self.reader.read_line(&mut chunk) {
+                Ok(0) => return Err("herdr closed the event subscription".into()),
+                Ok(_) => self.pending.push_str(&chunk),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    // read_line keeps what it read before the timeout in `chunk`; keep it for the next line.
+                    self.pending.push_str(&chunk);
+                    return Ok(None);
+                }
+                Err(e) => return Err(format!("herdr's event stream failed ({e})")),
+            }
+        }
     }
 }
 
