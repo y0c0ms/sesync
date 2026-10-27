@@ -20,69 +20,88 @@ fn sandbox(name: &str) -> PathBuf {
     d
 }
 
+/// Save the title cache a previous TUI run would have left in `state`, so the list shows the
+/// session's title in its first frame. Tests about other screens use this: a title the worker
+/// fills in later is redrawn only in the cells that changed, so the stripped text can split it.
+fn seed_titles(sb: &PathBuf, session: &PathBuf) {
+    let mut cache = sesync::manage::TitleCache::default();
+    cache.put(sesync::manage::read_title(&session.display().to_string(), "omp").unwrap());
+    cache.save(&sb.join("state").join("titles.json")).unwrap();
+}
+
+/// Draws the session and quits on q, and on a lone Esc: the TUI runs as a herdr popup
+/// (ctrl+alt+s) and must close the way every other popup does.
 #[test]
-fn tui_draws_the_session_and_quits_on_q() {
-    let sb = sandbox("draw");
-    let sid = "aaaaaaaa-1111-2222-3333-444444444444";
-    let dir = sb.join("omp").join("sessions").join("-tmp");
-    fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
-    fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
-    fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
-        format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyVisibleTitle\"}}\n")).unwrap();
+fn tui_draws_the_session_and_quits_on_q_or_esc() {
+    for (name, quit_key) in [("draw-q", &b"q"[..]), ("draw-esc", &b"\x1b"[..])] {
+        let sb = sandbox(name);
+        let sid = "aaaaaaaa-1111-2222-3333-444444444444";
+        let dir = sb.join("omp").join("sessions").join("-tmp");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+        fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
+        // Not seeded: the title arrives from the worker after a first frame showing "untitled".
+        // Redrawn cell by cell, so this title shares no letter position with "untitled".
+        fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
+            format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyVisibleTitle\"}}\n")).unwrap();
 
-    let (mut master, slave) = {
-        let mut m: libc_fd::Pair = libc_fd::open_pty();
-        let _ = &mut m;
-        (m.master, m.slave)
-    };
-    let mut child = std::process::Command::new(BIN)
-        .arg("--tui")
-        .env("SESYNC_DIR", sb.join("state"))
-        .env("SESYNC_CONFIG_DIR", sb.join("config"))
-        .env("OMP_AGENT_DIR", sb.join("omp"))
-        .env("PI_AGENT_DIR", sb.join("pi"))
-        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
-        // Point O-penCode at an empty sandbox path so the TUI never lists the real store.
-        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
-        .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
-        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
-        .env("SESYNC_CONV", sesync_conv())
-        .env("SESYNC_TRACE", sb.join("tui-trace.log"))
-        .env("TERM", "xterm-256color")
-        .stdin(unsafe_stdio(slave))
-        .stdout(unsafe_stdio(slave))
-        .stderr(unsafe_stdio(slave))
-        .spawn()
-        .expect("spawn --tui");
+        let (mut master, slave) = {
+            let mut m: libc_fd::Pair = libc_fd::open_pty();
+            let _ = &mut m;
+            (m.master, m.slave)
+        };
+        // A pty starts at 0x0, which gives the TUI an empty frame. Size it before the TUI starts,
+        // as a terminal or a herdr popup is, so its first (loading) frame is drawn too.
+        set_winsize(master, 24, 100);
+        let mut child = std::process::Command::new(BIN)
+            .arg("--tui")
+            .env("SESYNC_DIR", sb.join("state"))
+            .env("SESYNC_CONFIG_DIR", sb.join("config"))
+            .env("OMP_AGENT_DIR", sb.join("omp"))
+            .env("PI_AGENT_DIR", sb.join("pi"))
+            .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+            // Point O-penCode at an empty sandbox path so the TUI never lists the real store.
+            .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+            .env("OPENCODE_BIN", sb.join("no-opencode-bin"))
+            .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+            .env("SESYNC_CONV", sesync_conv())
+            .env("SESYNC_TRACE", sb.join("tui-trace.log"))
+            .env("TERM", "xterm-256color")
+            .stdin(unsafe_stdio(slave))
+            .stdout(unsafe_stdio(slave))
+            .stderr(unsafe_stdio(slave))
+            .spawn()
+            .expect("spawn --tui");
 
-    // A pty starts at 0x0, which gives the TUI an empty frame. Set a real size first.
-    set_winsize(master, 24, 100);
-
-    let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut buf = [0u8; 4096];
-    while Instant::now() < deadline {
-        if let Ok(n) = read_nonblocking(master, &mut buf) {
-            seen.extend_from_slice(&buf[..n]);
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            if let Ok(n) = read_nonblocking(master, &mut buf) {
+                seen.extend_from_slice(&buf[..n]);
+            }
+            if strip_ansi(&seen).contains("PtyVisibleTitle") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        if strip_ansi(&seen).contains("PtyVisibleTitle") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        let text = strip_ansi(&seen);
+        assert!(text.contains("PtyVisibleTitle"), "the TUI must draw the session title, got:\n{text}");
+        // Something is on screen before the sessions are read, so a herdr popup is never blank.
+        // (The renderer moves the cursor over blank cells, so stripped text loses the space.)
+        let loading = text.find("Reading")
+            .unwrap_or_else(|| panic!("a loading line must be drawn first ({name}), got:\n{text:?}"));
+        assert!(loading < text.find("PtyVisibleTitle").unwrap(), "the loading line must come before the list");
+
+        let mut m = unsafe_file(master);
+        m.write_all(quit_key).unwrap();
+        let status = wait_with_timeout_reading(&mut child, master, &mut seen, Duration::from_secs(10));
+        let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
+        assert!(status.is_some(),
+            "the TUI must exit on {name}; the last frames were:\n{}\nthe child's own trace:\n{}",
+            strip_ansi(&seen), trace);
+        assert!(status.unwrap().success(), "a clean quit must exit 0 ({name})");
     }
-    let text = strip_ansi(&seen);
-    assert!(text.contains("PtyVisibleTitle"), "the TUI must draw the session title, got:\n{text}");
-
-    let mut m = unsafe_file(master);
-    m.write_all(b"q").unwrap();
-    let status = wait_with_timeout_reading(&mut child, master, &mut seen, Duration::from_secs(10));
-    let trace = fs::read_to_string(sb.join("tui-trace.log")).unwrap_or_default();
-    assert!(status.is_some(),
-        "the TUI must exit on q; the last frames were:\n{}\nthe child's own trace:\n{}",
-        strip_ansi(&seen), trace);
-    assert!(status.unwrap().success(), "a clean quit must exit 0");
-
 }
 
 /// Enter and ctrl+p open the command list; tab shows the Team pane; ctrl+c still quits.
@@ -95,8 +114,10 @@ fn tui_opens_the_command_list_and_the_team_tab() {
     fs::create_dir_all(&dir).unwrap();
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
-    fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
+    let session = dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl"));
+    fs::write(&session,
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyPaletteTitle\"}}\n")).unwrap();
+    seed_titles(&sb, &session);
 
     let (mut master, slave) = {
         let mut m: libc_fd::Pair = libc_fd::open_pty();
@@ -175,9 +196,11 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
     fs::create_dir_all(sb.join("claude").join("projects")).unwrap();
     let text = "hello from the tui mirror test ".repeat(30);
-    fs::write(dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl")),
+    let session = dir.join(format!("2026-10-01T10-00-00-000Z_{sid}.jsonl"));
+    fs::write(&session,
         format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{sid}\",\"cwd\":\"/tmp\",\"title\":\"PtyMenuTitle\"}}\n\
 {{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-10-01T10:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")).unwrap();
+    seed_titles(&sb, &session);
 
     let (mut master, slave) = {
         let mut m: libc_fd::Pair = libc_fd::open_pty();

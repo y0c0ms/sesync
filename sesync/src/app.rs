@@ -239,6 +239,12 @@ pub struct App {
     /// Titles already read, keyed by file size and mtime, so a re-list does not read
     /// unchanged files again. See [`crate::manage::TitleCache`].
     titles: crate::manage::TitleCache,
+    /// The TUI reads titles on a worker (`title_worker`): listing never opens a conversation, and
+    /// the conversations still needing a title wait here until the caller takes them.
+    defer_titles: bool,
+    title_wanted: Vec<(String, String)>,
+    /// Asked for and not answered yet, so a re-list does not ask twice.
+    title_asked: std::collections::HashSet<String>,
     /// Set when a key changed a field the app owns (a mark or a mirror choice); the
     /// caller saves state only then, not on every keypress.
     user_dirty: bool,
@@ -362,17 +368,35 @@ pub struct TranscriptView {
 pub const TRANSCRIPT_MAX_LINES: usize = 4000;
 
 impl App {
+    /// Lists the sessions and reads every title before it returns. The CLI and tests use this;
+    /// the TUI uses [`App::new_deferred`].
     pub fn new(roots: Roots, state: State, lock_dir: PathBuf, sesync_lock: PathBuf) -> App {
+        Self::build(roots, state, lock_dir, sesync_lock, crate::manage::TitleCache::default(), false)
+    }
+
+    /// Lists the sessions without opening any: titles come from `titles` (the cache a previous run
+    /// saved) or the daemon's records, and `take_title_requests` names the ones still to read.
+    pub fn new_deferred(roots: Roots, state: State, lock_dir: PathBuf, sesync_lock: PathBuf,
+                        titles: crate::manage::TitleCache) -> App {
+        Self::build(roots, state, lock_dir, sesync_lock, titles, true)
+    }
+
+    fn build(roots: Roots, state: State, lock_dir: PathBuf, sesync_lock: PathBuf,
+             mut titles: crate::manage::TitleCache, defer_titles: bool) -> App {
         let mut state = state;
         // A session deleted in an earlier run whose record no daemon has dropped yet.
         state.forget_deleted(unix_now());
-        let mut titles = crate::manage::TitleCache::default();
-        let groups = manage::list_groups_cached(&roots, &state, &mut titles);
+        let (groups, title_wanted) = if defer_titles {
+            manage::list_groups_deferred(&roots, &state, &mut titles)
+        } else {
+            (manage::list_groups_cached(&roots, &state, &mut titles), Vec::new())
+        };
         let visible: Vec<usize> = (0..groups.len()).collect();
         let model = Model::new(groups.iter().map(|g| g.title.clone()).collect());
         App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
+            defer_titles, title_wanted, title_asked: Default::default(),
             team: Vec::new(),
             team_copies: Vec::new(),
             team_index: 0,
@@ -435,6 +459,54 @@ impl App {
     /// Whether ctrl+r asked for a team refresh since the last call. The caller performs it.
     pub fn take_refresh_request(&mut self) -> bool {
         std::mem::take(&mut self.refresh_requested)
+    }
+
+    /// The conversations whose title is still to be read, rows on screen first, each named once
+    /// until its answer is applied. Empty unless the app was made with [`App::new_deferred`].
+    pub fn take_title_requests(&mut self) -> Vec<(String, String)> {
+        let mut wanted = std::mem::take(&mut self.title_wanted);
+        wanted.retain(|(key, _)| self.title_asked.insert(key.clone()));
+        let position: std::collections::HashMap<&str, usize> = self.visible.iter().enumerate()
+            .map(|(pos, &i)| (self.groups[i].key.as_str(), pos)).collect();
+        wanted.sort_by_key(|(key, _)| position.get(key.as_str()).copied().unwrap_or(usize::MAX));
+        wanted
+    }
+
+    /// Show titles the worker read and keep them for the next run.
+    pub fn apply_titles(&mut self, reads: Vec<crate::manage::TitleRead>) {
+        if reads.is_empty() {
+            return;
+        }
+        for read in reads {
+            self.title_asked.remove(&read.key);
+            if let Some(g) = self.groups.iter_mut().find(|g| g.key == read.key) {
+                g.title = read.title.clone();
+            }
+            self.titles.put(read);
+        }
+        let keep = self.selected().map(|g| g.key.clone());
+        self.recompute_visible();
+        self.rebuild_model_keep(keep);
+    }
+
+    /// The titles read so far, for the caller to save.
+    pub fn title_cache(&mut self) -> &mut crate::manage::TitleCache {
+        &mut self.titles
+    }
+
+    /// List the sessions: deferred titles in the TUI, read on the spot otherwise.
+    fn list(&mut self) -> Vec<Group> {
+        if self.defer_titles {
+            let (groups, wanted) = manage::list_groups_deferred(&self.roots, &self.state, &mut self.titles);
+            for w in wanted {
+                if !self.title_wanted.contains(&w) {
+                    self.title_wanted.push(w);
+                }
+            }
+            groups
+        } else {
+            manage::list_groups_cached(&self.roots, &self.state, &mut self.titles)
+        }
     }
 
     /// Read-only view of the state the app is working from (for tests and status).
@@ -1287,7 +1359,7 @@ impl App {
     /// message. Used for the background refresh after absorbing the daemon's state.
     pub fn refresh_rows(&mut self) {
         let keep = self.selected().map(|g| g.key.clone());
-        self.groups = manage::list_groups_cached(&self.roots, &self.state, &mut self.titles);
+        self.groups = self.list();
         self.recompute_visible();
         self.rebuild_model_keep(keep);
     }
@@ -1297,7 +1369,7 @@ impl App {
     fn reload(&mut self) {
         let keep = self.selected().map(|g| g.key.clone());
         let index = self.model.selected();
-        self.groups = manage::list_groups_cached(&self.roots, &self.state, &mut self.titles);
+        self.groups = self.list();
         self.recompute_visible();
         let found = keep.and_then(|k| self.visible.iter().position(|i| self.groups[*i].key == k));
         self.model = Model::new(self.visible.iter().map(|i| self.groups[*i].title.clone()).collect());
@@ -1330,9 +1402,14 @@ impl App {
             return;
         }
         // The first ctrl+d arms and only an immediate second one deletes. Anything typed in
-        // between, in any mode, cancels the arm, so a stale arm cannot fire later.
+        // between, in any mode, cancels the arm, so a stale arm cannot fire later. Esc on an
+        // armed delete does only that, so backing out of a delete never closes the TUI.
         if ev != Ev::CtrlD {
+            let was_armed = self.model.armed().is_some();
             self.disarm(now);
+            if was_armed && ev == Ev::Esc && self.mode == Mode::Browse {
+                return;
+            }
         }
         match self.mode {
             Mode::Confirm => self.handle_confirm(ev),
@@ -1496,7 +1573,15 @@ impl App {
                 self.mode = Mode::Rename;
                 self.say("Enter a new name; Esc cancels.");
             }
-            Ev::Char('q') => {
+            // Esc backs out one step: a kept filter first, then the TUI itself, so a popup that
+            // runs it (herdr's ctrl+alt+s) closes the way every other popup does.
+            Ev::Esc if !self.filter_text.is_empty() => {
+                self.filter_text.clear();
+                self.recompute_visible();
+                self.rebuild_model_keep(None);
+                self.say("filter cleared");
+            }
+            Ev::Char('q') | Ev::Esc => {
                 self.quit = true;
             }
             _ => {}
@@ -1644,14 +1729,14 @@ impl App {
                 ("ctrl+t", "change the colour scheme"),
                 ("tab", "switch to the team list"),
                 ("ctrl+p", "open the command list"),
-                ("q", "quit"),
+                ("q / esc", "quit (esc clears a kept filter first)"),
             ],
             View::Team => vec![
                 ("i", "import the selected team session into this harness"),
                 ("ctrl+r", "pull the team's verified sessions from the server"),
                 ("tab", "back to the local sessions"),
                 ("ctrl+p", "open the command list"),
-                ("q", "quit"),
+                ("q / esc", "quit"),
             ],
         }
     }

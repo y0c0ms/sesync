@@ -150,6 +150,14 @@ pub fn claude_title_from_lines(lines: &[&str]) -> (String, bool) {
     let (mut custom, mut ai, mut agent, mut first, mut has_user) =
         (String::new(), String::new(), String::new(), String::new(), false);
     for line in lines {
+        // Parsing is most of the cost on long transcripts. A line can only matter if it spells
+        // one of the name records below or, until a prompt is chosen, a user record.
+        let wants_user = first.is_empty() || !has_user;
+        if !(line.contains("custom-title") || line.contains("ai-title") || line.contains("agent-name")
+            || (wants_user && line.contains("\"user\"")))
+        {
+            continue;
+        }
         let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
         let kind = rec.get("type").and_then(Value::as_str).unwrap_or("");
         let field = |k: &str| rec.get(k).and_then(Value::as_str).map(|s| s.trim().to_string());

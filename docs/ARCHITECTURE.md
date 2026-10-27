@@ -349,6 +349,40 @@ stamp (`mirror::copy_stamp`, or the store fingerprint) every second and reads ag
 moves, so a new message shows without a key press. The converter's output is captured, never
 printed onto the screen.
 
+### What the TUI reads, and when
+
+Opening the TUI never reads every conversation. The list is built from the folder listing and
+file sizes and change times alone: a row's title comes from the title cache the previous run
+saved (`titles.json` beside `state.json`, valid while the file's size and change time match),
+else the last title read for it, else the name the daemon recorded, else "untitled". A worker
+(`title_worker::Worker`) reads the remaining titles, rows on screen first, and the list updates
+as they arrive; the cache is saved when the worker is idle and on quit. Only the highlighted
+session's transcript is read, by the preview worker.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant T as TUI thread
+    participant C as titles.json
+    participant W as title worker
+    participant P as preview worker
+    participant F as session files
+    U->>T: sesync --tui (in a terminal, or a popup such as herdr's)
+    T->>U: "Reading sessions…"
+    T->>C: load the saved titles
+    T->>F: list folders, size and change time only
+    T->>U: the list: saved title, else the daemon's, else "untitled"
+    T->>W: titles of changed or unknown files, rows on screen first
+    W->>F: read each title (head, and the tail back to a rename)
+    W-->>T: title read
+    T->>U: the row updates
+    U->>T: highlights a session
+    T->>P: that session only
+    P->>F: read its last turns
+    P-->>T: preview
+    T->>C: save, when the worker is idle and on quit
+```
+
 Every conversation crosses harnesses as one canonical journal (the omp/Pi format):
 `to_journal` makes it from the source (`sesync-conv from-<id>`, or nothing when the source
 already is one), and `install` writes it into each chosen target (`sesync-conv to-<id>`). The
