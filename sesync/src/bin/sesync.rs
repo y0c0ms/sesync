@@ -24,7 +24,7 @@ struct Env {
 
 impl Env {
     fn from_env() -> Env {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         let get = |k: &str, d: PathBuf| std::env::var_os(k).map(PathBuf::from).unwrap_or(d);
         let num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         // install.sh puts sesync-conv and sesync-lock next to this binary (~/.local/bin by default).
@@ -54,7 +54,7 @@ impl Env {
         Tools { home: &self.home, sesync_conv: &self.sesync_conv }
     }
     fn lock_dir(&self) -> PathBuf {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         sesync::lock::lock_dir_for(&home, std::env::var_os("SESYNC_LOCK_DIR").map(PathBuf::from))
     }
 }
@@ -68,7 +68,7 @@ fn now_secs() -> f64 {
 /// `team join` is visible to all of them.
 fn team_config_dir() -> PathBuf {
     std::env::var_os("SESYNC_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         home.join(".config").join("sesync")
     })
 }

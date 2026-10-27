@@ -37,9 +37,29 @@ fn lock_dir() -> PathBuf {
     if let Ok(d) = env::var("SESYNC_LOCK_DIR") {
         return PathBuf::from(d);
     }
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_else(|_| ".".into());
+    let home = home_dir().unwrap_or_else(|| ".".into());
     // Stored state directory: existing lock files live here, so it keeps its value until a migration moves them.
     Path::new(&home).join(".local").join("share").join("harness-sync").join("locks")
+}
+
+/// The home directory, chosen exactly as `sesync::home::home_dir` chooses it: `HOME` when usable,
+/// else `USERPROFILE` on Windows. The two must agree, or a hook's claim and the daemon's sweep
+/// would look in different lock directories.
+fn home_dir() -> Option<String> {
+    home_from(&|k| env::var(k).ok(), cfg!(windows))
+}
+
+fn home_from(var: &dyn Fn(&str) -> Option<String>, windows: bool) -> Option<String> {
+    let usable = |key: &str| var(key).filter(|v| !v.is_empty() && (!windows || windows_absolute(v)));
+    usable("HOME").or_else(|| if windows { usable("USERPROFILE") } else { None })
+}
+
+/// An absolute drive (`C:\`, `C:/`) or UNC (`\\server\share`) path.
+fn windows_absolute(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || s.starts_with("\\\\")
+        || s.starts_with("//")
 }
 
 fn now() -> u64 {
@@ -392,4 +412,32 @@ fn main() {
         _ => usage(),
     };
     process::exit(code);
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::home_from;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k| owned.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn windows_without_home_uses_userprofile() {
+        assert_eq!(home_from(&env(&[("USERPROFILE", "C:\\Users\\u")]), true).as_deref(), Some("C:\\Users\\u"));
+    }
+
+    #[test]
+    fn windows_skips_a_msys_home() {
+        let e = env(&[("HOME", "/c/Users/u"), ("USERPROFILE", "C:\\Users\\u")]);
+        assert_eq!(home_from(&e, true).as_deref(), Some("C:\\Users\\u"));
+    }
+
+    #[test]
+    fn unix_uses_home_and_ignores_userprofile() {
+        let e = env(&[("HOME", "/home/u"), ("USERPROFILE", "C:\\Users\\u")]);
+        assert_eq!(home_from(&e, false).as_deref(), Some("/home/u"));
+        assert_eq!(home_from(&env(&[("USERPROFILE", "C:\\Users\\u")]), false), None);
+    }
 }
