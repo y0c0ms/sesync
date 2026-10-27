@@ -10,15 +10,32 @@ const NOT_A_PROGRAM: [&str; 10] = [
     "git.exe", "starship.exe", "oh-my-posh.exe",
 ];
 
-/// Whether a process other than a shell, a console host or a prompt helper runs anywhere below
-/// `pid`. None when the process list cannot be read, or off Windows (not needed there).
+/// How long a program must last to count: a prompt starts short-lived tools while it draws (git
+/// for the branch, MSYS helpers), which one snapshot can catch.
+const LASTS: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a program other than a shell, a console host or a prompt helper runs below `pid` and
+/// is still there [`LASTS`] later. None when the process list cannot be read, or off Windows (not
+/// needed there).
 pub fn program_running_under(pid: u32) -> Option<bool> {
-    let procs = processes()?;
-    Some(runs_a_program(&procs, pid))
+    let first = programs_below(&processes()?, pid);
+    if first.is_empty() {
+        return Some(false);
+    }
+    std::thread::sleep(LASTS);
+    let second = programs_below(&processes()?, pid);
+    Some(!first.is_disjoint(&second))
 }
 
-/// The decision on a process list of (pid, parent pid, executable name).
+/// Whether one process list shows a program below `root` (see [`programs_below`]).
 pub fn runs_a_program(procs: &[(u32, u32, String)], root: u32) -> bool {
+    !programs_below(procs, root).is_empty()
+}
+
+/// The pids below `root` in a process list of (pid, parent pid, executable name) that are not a
+/// shell, a console host or a prompt helper.
+pub fn programs_below(procs: &[(u32, u32, String)], root: u32) -> std::collections::HashSet<u32> {
+    let mut found = std::collections::HashSet::new();
     let mut frontier = vec![root];
     let mut seen = std::collections::HashSet::from([root]);
     while let Some(parent) = frontier.pop() {
@@ -27,12 +44,12 @@ pub fn runs_a_program(procs: &[(u32, u32, String)], root: u32) -> bool {
                 continue;
             }
             if !NOT_A_PROGRAM.contains(&name.to_ascii_lowercase().as_str()) {
-                return true;
+                found.insert(*pid);
             }
             frontier.push(*pid);
         }
     }
-    false
+    found
 }
 
 #[cfg(windows)]

@@ -35,3 +35,15 @@ fn names_are_compared_without_case_and_a_pid_loop_ends() {
     let procs = list(&[(10, 11, "Bash.EXE"), (11, 10, "BASH.exe")]);
     assert!(!runs_a_program(&procs, 10));
 }
+
+#[test]
+fn a_helper_seen_in_one_snapshot_only_is_not_a_running_program() {
+    use sesync::proc_tree::programs_below;
+    // The prompt's `uname` in the first snapshot, gone in the second: the shell is idle. The agent
+    // with the same pid in both lasts.
+    let first = list(&[(10, 1, "bash.exe"), (11, 10, "bash.exe"), (50, 11, "uname.exe")]);
+    let second = list(&[(10, 1, "bash.exe"), (11, 10, "bash.exe")]);
+    assert!(programs_below(&first, 10).is_disjoint(&programs_below(&second, 10)));
+    let busy = list(&[(10, 1, "bash.exe"), (11, 10, "bash.exe"), (60, 11, "node.exe")]);
+    assert!(!programs_below(&busy, 10).is_disjoint(&programs_below(&busy, 10)));
+}
