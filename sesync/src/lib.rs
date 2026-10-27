@@ -29,6 +29,7 @@ pub mod turn;
 pub mod app;
 pub mod clipboard;
 pub mod form;
+pub mod herdr_check;
 pub mod herdr_open;
 pub mod keys;
 pub mod manage;

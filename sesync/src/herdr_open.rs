@@ -36,39 +36,73 @@ pub struct Process;
 
 impl Runner for Process {
     fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot run {program}: {e}"))?;
-        // Both pipes are read while the child runs: a full pipe would stop it, and the wait
-        // would end in a timeout.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let out_reader = std::thread::spawn(move || read_pipe(stdout));
-        let err_reader = std::thread::spawn(move || read_pipe(stderr));
-        let deadline = Instant::now() + CALL_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("{program} did not answer within {}s", CALL_TIMEOUT.as_secs()));
-                }
-                Err(e) => return Err(format!("cannot wait for {program}: {e}")),
-            }
-        };
-        let stdout = out_reader.join().unwrap_or_default();
-        if status.success() {
-            return Ok(stdout);
-        }
-        let stderr = err_reader.join().unwrap_or_default();
-        Err(failure_text(&stdout, &stderr, status))
+        let mut command = Command::new(program);
+        command.args(args);
+        run_command(command, program)
     }
+}
+
+/// Like [`Process`], for a herdr other than the one this process may run under: every inherited
+/// `HERDR_*` variable is dropped (inside a herdr pane they name that herdr's server), then `env` is
+/// set.
+pub struct Isolated {
+    pub env: Vec<(String, String)>,
+}
+
+impl Isolated {
+    /// A command for `program` with this environment.
+    pub fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("HERDR_") {
+                command.env_remove(&key);
+            }
+        }
+        command.envs(self.env.iter().map(|(k, v)| (k, v)));
+        command
+    }
+}
+
+impl Runner for Isolated {
+    fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
+        let mut command = self.command(program);
+        command.args(args);
+        run_command(command, program)
+    }
+}
+
+fn run_command(mut command: Command, program: &str) -> Result<String, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
+    // Both pipes are read while the child runs: a full pipe would stop it, and the wait
+    // would end in a timeout.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_reader = std::thread::spawn(move || read_pipe(stdout));
+    let err_reader = std::thread::spawn(move || read_pipe(stderr));
+    let deadline = Instant::now() + CALL_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{program} did not answer within {}s", CALL_TIMEOUT.as_secs()));
+            }
+            Err(e) => return Err(format!("cannot wait for {program}: {e}")),
+        }
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    if status.success() {
+        return Ok(stdout);
+    }
+    let stderr = err_reader.join().unwrap_or_default();
+    Err(failure_text(&stdout, &stderr, status))
 }
 
 fn read_pipe<R: Read>(pipe: Option<R>) -> String {
@@ -301,13 +335,22 @@ impl PaneShell {
     }
 }
 
-/// herdr's config file: `%APPDATA%\herdr\config.toml` on Windows, else under `$XDG_CONFIG_HOME` or `~/.config`.
+/// herdr's config file, `config.toml` in [`herdr_config_dir`].
 fn config_path(home: &Path) -> Option<PathBuf> {
-    if cfg!(windows) {
-        return non_empty_env("APPDATA").map(|dir| PathBuf::from(dir).join("herdr").join("config.toml"));
+    herdr_config_dir(home).map(|dir| dir.join("config.toml"))
+}
+
+/// herdr's configuration directory, by herdr's own rule (`config::config_dir`):
+/// `$XDG_CONFIG_HOME/herdr` when that is set, else `%APPDATA%\herdr` on Windows and
+/// `~/.config/herdr` elsewhere.
+pub fn herdr_config_dir(home: &Path) -> Option<PathBuf> {
+    if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("herdr"));
     }
-    let base = non_empty_env("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
-    Some(base.join("herdr").join("config.toml"))
+    if cfg!(windows) {
+        return non_empty_env("APPDATA").map(|dir| PathBuf::from(dir).join("herdr"));
+    }
+    Some(home.join(".config").join("herdr"))
 }
 
 /// The `default_shell` set in a config.toml's `[terminal]` table, when it is set and non-empty.
