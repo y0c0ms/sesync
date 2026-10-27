@@ -1163,6 +1163,51 @@ times out after five seconds. Matching is per tab: the tab of the matched pane i
 other panes share it. `tests/herdr_open_live.rs` checks this against a real herdr on every
 platform (opt-in, `--ignored`), including the resume into an idle tab on Windows.
 
+### Checking a herdr build, and guarding `herdr update`
+
+`sesync herdr check --herdr <exe>` (`herdr_check.rs`) tells whether a herdr build still does what
+sesync needs, without touching the user's herdr. It starts that build's server headless under a
+throwaway session name, with a copy of the user's herdr config (so the pane shell and the
+ctrl+alt+s popup binding are the user's), and drives the real `herdr_open::open` with a stand-in
+session: `sesync herdr probe`, which records its folder and `HERDR_BIN_PATH` and stays until
+asked to stop. Steps: the binary runs; a server starts; `config check` accepts the config; a
+workspace is created; "Open in herdr" opens a new tab and the typed command runs in the session's
+folder with `HERDR_BIN_PATH` set; the tab keeps its label; a second open focuses that tab; on
+Windows, once the probe ends, a third open types the command into the same tab. It stops at the
+first failure, then stops the probe and the server and deletes the session. Exit 0 when all pass.
+
+`sesync herdr guard` writes `update-guard.toml` in herdr's configuration directory (`name` and
+the `check` command, the candidate binary appended). Our herdr build (branch
+`fix/windows-split-mouse-report`, `src/update_guard.rs`) reads it in `herdr update`: after finding
+a newer release and before downloading, it warns that sesync relies on this build, lists the build's
+own fixes an official release may lack, and asks: test first, install anyway, or cancel (the
+default; without a terminal it refuses, `--skip-integration-check` skips the question). Test first
+downloads the release, unpacks it (Windows: `Expand-Archive`), runs the check on its binary, and
+asks again (default no). Official herdr builds do not read the file, so once one is installed, later
+updates do not warn.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant H as herdr update (our build)
+    participant S as sesync herdr check
+    participant N as candidate herdr (throwaway session)
+    U->>H: herdr update
+    H->>H: newer release found, update-guard.toml present
+    H->>U: warning: sesync relies on this build; [t] test first, [i] install anyway, [c] cancel
+    alt cancel (default)
+        H->>U: Herdr was not updated
+    else install anyway
+        H->>H: download and install, as upstream
+    else test first
+        H->>H: download, unpack, nothing installed
+        H->>S: run the check with the candidate binary
+        S->>N: server, config check, workspace, Open in herdr with a probe
+        S-->>H: exit 0 (all passed) or 1
+        H->>U: passed/failed: install? [y/N]
+    end
+```
+
 ## Failure behaviour
 
 | Situation | What happens |

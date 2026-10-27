@@ -55,6 +55,27 @@ tests win, and you fix this file. Update it at the end of every work session.
   after a push and not after a change; the tab pulls only when stale and only with a team),
   `tests/team_pull_verified.rs` (a record signed by this device is its own).
 
+## 2026-10-27: `sesync herdr check` and a guarded `herdr update`
+
+- **Why.** The work PC runs a patched herdr (Windows mouse fix), and `herdr update` would replace
+  it with an official build without saying that sesync's popup and "Open in herdr" may stop
+  working.
+- **sesync.** `sesync herdr check [--herdr <exe>]` (`herdr_check.rs`): a throwaway headless herdr
+  session with a copy of the user's config, the real `herdr_open::open` driving a stand-in session
+  (`sesync herdr probe`). `sesync herdr guard [--remove]` writes `update-guard.toml` beside herdr's
+  config.toml. `herdr_open::Isolated` runs herdr with every inherited `HERDR_*` dropped;
+  `herdr_open::herdr_config_dir` follows herdr's own rule (`XDG_CONFIG_HOME` first).
+- **herdr fork** (`fix/windows-split-mouse-report`, `src/update_guard.rs`): `herdr update` warns
+  and asks test first / install anyway / cancel before downloading; test first runs the check on
+  the downloaded binary and asks again. ARCHITECTURE "Checking a herdr build, and guarding
+  `herdr update`" has the sequence.
+- **Verified on the work PC.** The check against the installed herdr: 11 of 11 in 8.6 s, nothing
+  left behind. `herdr update` on the preview channel (a throwaway config): cancel leaves
+  everything; test first downloaded 0.9.4-preview, the check passed 11 of 11, declining left the
+  `current` junction unchanged; a check that fails asks "install anyway? [y/N]". Tests:
+  `tests/herdr_check.rs` (the guard file round-trips a Windows path with spaces and quotes, which
+  herdr's own test reads back; the probe reports and stops), herdr `update_guard` unit tests.
+
 ## 2026-10-27: "Open in herdr" on Windows: no per-pane wait, nothing typed in front of the command
 
 - **Seen.** On the work PC (16 herdr panes) the open showed nothing for more than five seconds, and
