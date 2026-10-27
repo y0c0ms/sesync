@@ -39,31 +39,43 @@ fn fake_herdr(answer: impl Fn(&[String]) -> Result<String, String> + 'static) ->
     (Herdr::new("herdr-bin", Some("w3".to_string()), Box::new(runner)), calls)
 }
 
-/// A herdr with these panes: (pane id, tab id, foreground argument lists). A new tab is always
-/// `w9:t9` with root pane `w9:p9`. Every call succeeds except a process-info for an unknown pane.
-fn herdr_with_panes(panes: Vec<(&str, &str, Vec<Vec<&str>>)>) -> (Herdr, Calls) {
-    let panes: Vec<(String, String, Vec<Vec<String>>)> = panes
+/// A herdr with these panes: (pane id, tab id, directory, foreground argument lists), and these
+/// tabs: (tab id, label). A new tab is always `w9:t9` with root pane `w9:p9`. Every call succeeds
+/// except a process-info for an unknown pane.
+fn herdr_with(panes: Vec<(&str, &str, &str, Vec<Vec<&str>>)>, tabs: Vec<(&str, &str)>) -> (Herdr, Calls) {
+    let panes: Vec<(String, String, String, Vec<Vec<String>>)> = panes
         .into_iter()
-        .map(|(pane, tab, argvs)| (pane.to_string(), tab.to_string(), argvs.iter().map(|a| words(a)).collect()))
+        .map(|(pane, tab, cwd, argvs)| (pane.to_string(), tab.to_string(), cwd.to_string(), argvs.iter().map(|a| words(a)).collect()))
         .collect();
+    let tabs: Vec<_> = tabs.into_iter().map(|(tab, label)| json!({"tab_id": tab, "label": label})).collect();
     fake_herdr(move |args| {
         let argv_words: Vec<&str> = args.iter().map(String::as_str).collect();
         match argv_words.as_slice() {
             ["pane", "list"] => {
-                let listed: Vec<_> = panes.iter().map(|(pane, tab, _)| json!({"pane_id": pane, "tab_id": tab})).collect();
+                let listed: Vec<_> = panes.iter().map(|(pane, tab, cwd, _)| json!({"pane_id": pane, "tab_id": tab, "cwd": cwd})).collect();
                 Ok(json!({"id": "cli:pane:list", "result": {"panes": listed}}).to_string())
             }
             ["pane", "process-info", "--pane", pane] => {
-                let (_, _, argvs) = panes.iter().find(|(p, _, _)| p.as_str() == *pane).ok_or("pane not found")?;
+                let (_, _, _, argvs) = panes.iter().find(|(p, _, _, _)| p.as_str() == *pane).ok_or("pane not found")?;
                 let procs: Vec<_> = argvs.iter().map(|argv| json!({"argv": argv, "cmdline": argv.join(" ")})).collect();
                 Ok(json!({"result": {"process_info": {"foreground_processes": procs}}}).to_string())
             }
-            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
+            ["tab", "list"] => Ok(json!({"result": {"tabs": tabs}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
             ["pane", "run", ..] | ["tab", "focus", ..] | ["tab", "close", ..] => Ok(json!({"result": {}}).to_string()),
             other => Err(format!("unexpected herdr call {other:?}")),
         }
     })
+}
+
+/// Panes with their foreground argument lists, all in `/elsewhere`, and no labelled tabs.
+fn herdr_with_panes(panes: Vec<(&str, &str, Vec<Vec<&str>>)>) -> (Herdr, Calls) {
+    herdr_with(panes.into_iter().map(|(pane, tab, argvs)| (pane, tab, "/elsewhere", argvs)).collect(), vec![])
+}
+
+/// The herdr calls made, without the binary, as words: `["tab", "list"]`, ...
+fn verbs(calls: &Calls) -> Vec<Vec<String>> {
+    calls.borrow().iter().map(|c| c[1..].to_vec()).collect()
 }
 
 fn sandbox(name: &str) -> PathBuf {
@@ -357,55 +369,91 @@ fn omp_plan(sb: &Path) -> (Roots, herdr_open::Plan) {
     (roots, plan)
 }
 
+/// herdr on Linux and macOS: process info shows the programs running in a pane's shell.
+const SHOWS_PROGRAMS: bool = true;
+/// herdr on Windows: process info shows only the pane's shell.
+const SHELL_ONLY: bool = false;
+
 #[test]
-fn a_session_already_running_is_focused_and_nothing_starts() {
+fn a_session_already_running_is_focused_and_only_panes_in_its_directory_are_asked() {
     let sb = sandbox("focus");
     let (_roots, plan) = omp_plan(&sb);
     let running = plan.argv.clone();
     let argv: Vec<&str> = running.iter().map(String::as_str).collect();
-    let (herdr, calls) = herdr_with_panes(vec![
-        ("w2:p1", "w2:t1", vec![vec!["/bin/bash"]]),
-        ("w2:p4", "w2:t4", vec![argv]),
-    ]);
-    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap();
+    let project = plan.cwd.to_str().unwrap().to_string();
+    let (herdr, calls) = herdr_with(
+        vec![("w2:p1", "w2:t1", "/elsewhere", vec![vec!["/bin/bash"]]), ("w2:p4", "w2:t4", project.as_str(), vec![argv])],
+        vec![],
+    );
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap();
     assert_eq!(opened, Opened::Focused { tab_id: "w2:t4".into() });
-    let calls = calls.borrow();
-    assert!(calls.contains(&words(&["herdr-bin", "tab", "focus", "w2:t4"])), "{calls:?}");
-    assert!(!calls.iter().any(|c| c.contains(&"create".to_string())), "no tab is created: {calls:?}");
+    let verbs = verbs(&calls);
+    assert!(verbs.contains(&words(&["tab", "focus", "w2:t4"])), "{verbs:?}");
+    assert!(!verbs.iter().any(|c| c.contains(&"create".to_string())), "no tab is created: {verbs:?}");
+    assert!(!verbs.contains(&words(&["pane", "process-info", "--pane", "w2:p1"])), "a pane elsewhere is never asked: {verbs:?}");
     assert!(opened.message(&plan).contains("already open"));
 }
 
 #[test]
-fn a_session_not_running_gets_a_tab_in_its_directory_that_resumes_it() {
+fn a_session_not_running_gets_a_tab_that_is_focused_only_once_its_command_is_typed() {
     let sb = sandbox("create");
     let (_roots, plan) = omp_plan(&sb);
     let (herdr, calls) = herdr_with_panes(vec![("w2:p1", "w2:t1", vec![vec!["/bin/bash"]])]);
-    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap();
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap();
     assert_eq!(opened, Opened::Created { tab_id: "w9:t9".into() });
-    let calls = calls.borrow();
-    let create = words(&[
-        "herdr-bin", "tab", "create", "--cwd", plan.cwd.to_str().unwrap(),
-        "--label", plan.label.as_str(), "--focus", "--workspace", "w3",
-    ]);
-    assert!(calls.contains(&create), "{calls:?}");
+    let verbs = verbs(&calls);
+    let create = words(&["tab", "create", "--cwd", plan.cwd.to_str().unwrap(), "--label", plan.label.as_str(), "--no-focus", "--workspace", "w3"]);
     let command = format!("omp --resume {}", plan.ident());
-    let run = words(&["herdr-bin", "pane", "run", "w9:p9", command.as_str()]);
-    assert!(calls.contains(&run), "{calls:?}");
+    let run = words(&["pane", "run", "w9:p9", command.as_str()]);
+    let focus = words(&["tab", "focus", "w9:t9"]);
+    let at = |call: &Vec<String>| verbs.iter().position(|c| c == call).unwrap_or_else(|| panic!("{call:?} missing: {verbs:?}"));
+    assert!(at(&create) < at(&run) && at(&run) < at(&focus), "created unfocused, typed, then focused: {verbs:?}");
+    assert!(!verbs.iter().any(|c| c.get(..2) == Some(&words(&["pane", "process-info"])[..])), "no pane is in the session's directory: {verbs:?}");
 }
 
 #[test]
-fn a_pane_whose_processes_cannot_be_read_stops_the_open_before_anything_starts() {
+fn where_herdr_shows_only_the_shell_the_tab_sesync_labelled_is_the_session_in_one_call() {
+    let sb = sandbox("tagged");
+    let (_roots, plan) = omp_plan(&sb);
+    let label = herdr_open::tab_label("omp", "Renamed since", &plan.tag);
+    let (herdr, calls) = herdr_with(
+        vec![("w2:p6", "w2:t6", plan.cwd.to_str().unwrap(), vec![vec!["bash.exe"]])],
+        vec![("w2:t1", "omp: another · 00000000"), ("w2:t6", label.as_str())],
+    );
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHELL_ONLY).unwrap();
+    assert_eq!(opened, Opened::Focused { tab_id: "w2:t6".into() });
+    assert_eq!(verbs(&calls), vec![words(&["tab", "list"]), words(&["tab", "focus", "w2:t6"])], "no pane is asked about");
+}
+
+#[test]
+fn where_herdr_shows_only_the_shell_a_new_tab_takes_four_calls_whatever_the_number_of_panes() {
+    let sb = sandbox("shell-only");
+    let (_roots, plan) = omp_plan(&sb);
+    let many: Vec<(String, String)> = (0..16).map(|i| (format!("w1:p{i}"), format!("w1:t{i}"))).collect();
+    let (herdr, calls) = herdr_with(
+        many.iter().map(|(p, t)| (p.as_str(), t.as_str(), plan.cwd.to_str().unwrap(), vec![vec!["bash.exe"]])).collect(),
+        vec![],
+    );
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHELL_ONLY).unwrap();
+    assert_eq!(opened, Opened::Created { tab_id: "w9:t9".into() });
+    let firsts: Vec<String> = verbs(&calls).iter().map(|c| c[..2].join(" ")).collect();
+    assert_eq!(firsts, vec!["tab list", "tab create", "pane run", "tab focus"]);
+}
+
+#[test]
+fn a_pane_in_the_sessions_directory_whose_processes_cannot_be_read_stops_the_open() {
     let sb = sandbox("unreadable");
     let (_roots, plan) = omp_plan(&sb);
-    let (herdr, calls) = fake_herdr(|args| {
+    let project = plan.cwd.to_str().unwrap().to_string();
+    let (herdr, calls) = fake_herdr(move |args| {
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match words.as_slice() {
-            ["pane", "list"] => Ok(json!({"result": {"panes": [{"pane_id": "w2:p1", "tab_id": "w2:t1"}]}}).to_string()),
+            ["pane", "list"] => Ok(json!({"result": {"panes": [{"pane_id": "w2:p1", "tab_id": "w2:t1", "cwd": project}]}}).to_string()),
             ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             _ => Err("pane closed".to_string()),
         }
     });
-    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap_err();
     assert!(err.contains("could not read the processes of pane w2:p1"), "{err}");
     assert!(!calls.borrow().iter().any(|c| c.contains(&"create".to_string())), "fails closed, no second copy");
 }
@@ -414,10 +462,12 @@ fn a_pane_whose_processes_cannot_be_read_stops_the_open_before_anything_starts()
 fn herdr_not_running_is_said_and_nothing_else_is_tried() {
     let sb = sandbox("no-herdr");
     let (_roots, plan) = omp_plan(&sb);
-    let (herdr, calls) = fake_herdr(|_| Err("cannot run herdr-bin: No such file or directory".to_string()));
-    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
-    assert!(err.starts_with("herdr is not reachable"), "{err}");
-    assert_eq!(calls.borrow().len(), 1, "only the pane list was asked");
+    for shows_programs in [SHOWS_PROGRAMS, SHELL_ONLY] {
+        let (herdr, calls) = fake_herdr(|_| Err("cannot run herdr-bin: No such file or directory".to_string()));
+        let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, shows_programs).unwrap_err();
+        assert!(err.starts_with("herdr is not reachable"), "{err}");
+        assert_eq!(verbs(&calls), vec![words(&["tab", "list"])], "only the tab list was asked");
+    }
 }
 
 #[test]
@@ -435,9 +485,11 @@ fn a_tab_is_closed_again_when_its_command_cannot_be_typed() {
             other => Err(format!("unexpected {other:?}")),
         }
     });
-    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap_err();
     assert!(err.contains("could not start the resume command"), "{err}");
-    assert!(calls.borrow().contains(&words(&["herdr-bin", "tab", "close", "w9:t9"])));
+    let verbs = verbs(&calls);
+    assert!(verbs.contains(&words(&["tab", "close", "w9:t9"])));
+    assert!(!verbs.contains(&words(&["tab", "focus", "w9:t9"])), "a tab that is closed again is never shown");
 }
 
 #[test]
@@ -452,7 +504,7 @@ fn a_herdr_error_message_is_passed_on_as_herdrs_words() {
             _ => Ok(json!({"error": {"code": "workspace_not_found", "message": "workspace w3 not found"}}).to_string()),
         }
     });
-    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap_err();
     assert_eq!(err, "workspace w3 not found");
 }
 
@@ -467,8 +519,24 @@ fn app_with(sb: &Path, herdr: Herdr) -> App {
     app
 }
 
+/// A key, then what the TUI's loop does next: draw, and run an "Open in herdr" the key asked for.
 fn press(app: &mut App, ev: Ev) {
     app.handle(ev, Instant::now());
+    app.run_pending_open();
+}
+
+#[test]
+fn the_open_says_it_started_before_any_herdr_call_is_made() {
+    let sb = sandbox("feedback");
+    let (herdr, calls) = herdr_with_panes(vec![]);
+    let mut app = app_with(&sb, herdr);
+    app.handle(Ev::Char('o'), Instant::now());
+    assert!(app.has_pending_open());
+    assert!(app.status().starts_with("opening '"), "the frame drawn now says so: {}", app.status());
+    assert!(calls.borrow().is_empty(), "nothing is asked of herdr before that frame");
+    app.run_pending_open();
+    assert!(!app.has_pending_open());
+    assert!(app.should_quit());
 }
 
 #[test]
@@ -514,10 +582,10 @@ fn a_run_that_answers_nothing_is_a_success() {
             ["pane", "list"] => Ok(json!({"result": {"panes": []}}).to_string()),
             ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
-            ["pane", "run", ..] => Ok(String::new()),
+            ["pane", "run", ..] | ["tab", "focus", ..] => Ok(String::new()),
             other => Err(format!("unexpected {other:?}")),
         }
     });
-    assert_eq!(herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
+    assert_eq!(herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
     assert!(calls.borrow().iter().any(|c| c.get(1..3) == Some(&["pane".to_string(), "run".to_string()][..])));
 }
