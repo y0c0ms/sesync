@@ -23,6 +23,11 @@ zstd = "0.14"
 ureq = { version = "2", features = ["json"] }
 qrcodegen = "1"
 
+[target.'cfg(windows)'.dependencies]
+# The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's
+# shell. Already in the lock file through other crates.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
 [dev-dependencies]
 proptest = "1"
 postgres = "0.19"

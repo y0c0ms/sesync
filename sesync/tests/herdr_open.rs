@@ -3,7 +3,7 @@
 //! and no real session store is read: every path is under a sandbox directory.
 use rusqlite::Connection;
 use sesync::app::{App, Ev, Mode};
-use sesync::herdr_open::{self, Herdr, Opened, PaneProcs, Runner};
+use sesync::herdr_open::{self, Detect, Herdr, Opened, PaneProcs, Runner};
 use sesync::manage::Roots;
 use sesync::state::State;
 use serde_json::json;
@@ -58,7 +58,7 @@ fn herdr_with(panes: Vec<(&str, &str, &str, Vec<Vec<&str>>)>, tabs: Vec<(&str, &
             ["pane", "process-info", "--pane", pane] => {
                 let (_, _, _, argvs) = panes.iter().find(|(p, _, _, _)| p.as_str() == *pane).ok_or("pane not found")?;
                 let procs: Vec<_> = argvs.iter().map(|argv| json!({"argv": argv, "cmdline": argv.join(" ")})).collect();
-                Ok(json!({"result": {"process_info": {"foreground_processes": procs}}}).to_string())
+                Ok(json!({"result": {"process_info": {"foreground_processes": procs, "shell_pid": 4242}}}).to_string())
             }
             ["tab", "list"] => Ok(json!({"result": {"tabs": tabs}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
@@ -370,9 +370,18 @@ fn omp_plan(sb: &Path) -> (Roots, herdr_open::Plan) {
 }
 
 /// herdr on Linux and macOS: process info shows the programs running in a pane's shell.
-const SHOWS_PROGRAMS: bool = true;
-/// herdr on Windows: process info shows only the pane's shell.
-const SHELL_ONLY: bool = false;
+const SHOWS_PROGRAMS: Detect<'static> = Detect::Programs;
+fn running(_shell_pid: u32) -> Option<bool> {
+    Some(true)
+}
+fn idle(_shell_pid: u32) -> Option<bool> {
+    Some(false)
+}
+fn unknown(_shell_pid: u32) -> Option<bool> {
+    None
+}
+/// herdr on Windows: process info shows only the pane's shell; the shell runs nothing.
+const SHELL_ONLY: Detect<'static> = Detect::ShellOnly(&idle);
 
 #[test]
 fn a_session_already_running_is_focused_and_only_panes_in_its_directory_are_asked() {
@@ -412,17 +421,46 @@ fn a_session_not_running_gets_a_tab_that_is_focused_only_once_its_command_is_typ
 }
 
 #[test]
-fn where_herdr_shows_only_the_shell_the_tab_sesync_labelled_is_the_session_in_one_call() {
+fn where_herdr_shows_only_the_shell_the_tagged_tab_running_a_program_is_focused() {
     let sb = sandbox("tagged");
     let (_roots, plan) = omp_plan(&sb);
     let label = herdr_open::tab_label("omp", "Renamed since", &plan.tag);
-    let (herdr, calls) = herdr_with(
-        vec![("w2:p6", "w2:t6", plan.cwd.to_str().unwrap(), vec![vec!["bash.exe"]])],
-        vec![("w2:t1", "omp: another · 00000000"), ("w2:t6", label.as_str())],
-    );
+    for (seen, what) in [(running as fn(u32) -> Option<bool>, "running"), (unknown, "unknown")] {
+        let (herdr, calls) = herdr_with(
+            vec![("w2:p1", "w2:t1", "/elsewhere", vec![vec!["bash.exe"]]), ("w2:p6", "w2:t6", "/elsewhere", vec![vec!["bash.exe"]])],
+            vec![("w2:t1", "omp: another · 00000000"), ("w2:t6", label.as_str())],
+        );
+        let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, Detect::ShellOnly(&seen)).unwrap();
+        assert_eq!(opened, Opened::Focused { tab_id: "w2:t6".into() }, "{what}");
+        assert_eq!(
+            verbs(&calls),
+            vec![words(&["tab", "list"]), words(&["pane", "list"]), words(&["pane", "process-info", "--pane", "w2:p6"]), words(&["tab", "focus", "w2:t6"])],
+            "only the tagged tab's pane is asked about ({what}; unknown fails closed)"
+        );
+    }
+}
+
+#[test]
+fn where_herdr_shows_only_the_shell_an_idle_tagged_tab_gets_the_command_again() {
+    let sb = sandbox("tagged-idle");
+    let (_roots, plan) = omp_plan(&sb);
+    let label = herdr_open::tab_label("omp", "Old", &plan.tag);
+    let (herdr, calls) = herdr_with(vec![("w2:p6", "w2:t6", "/elsewhere", vec![vec!["bash.exe"]])], vec![("w2:t6", label.as_str())]);
     let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHELL_ONLY).unwrap();
-    assert_eq!(opened, Opened::Focused { tab_id: "w2:t6".into() });
-    assert_eq!(verbs(&calls), vec![words(&["tab", "list"]), words(&["tab", "focus", "w2:t6"])], "no pane is asked about");
+    assert_eq!(opened, Opened::Resumed { tab_id: "w2:t6".into() });
+    let command = format!("omp --resume {}", plan.ident());
+    assert_eq!(
+        verbs(&calls),
+        vec![
+            words(&["tab", "list"]),
+            words(&["pane", "list"]),
+            words(&["pane", "process-info", "--pane", "w2:p6"]),
+            words(&["pane", "run", "w2:p6", command.as_str()]),
+            words(&["tab", "focus", "w2:t6"]),
+        ],
+        "typed into its own tab, no second tab"
+    );
+    assert!(opened.message(&plan).starts_with("resumed"));
 }
 
 #[test]

@@ -61,11 +61,16 @@ tests win, and you fix this file. Update it at the end of every work session.
   the new tab once read `exitomp --resume '…'`.
 - **Why it was slow.** Before opening, `open` asked herdr for the processes of every pane, one CLI
   process per pane (about 0.4 s each on Windows, about 8 s in all), and it could never match there:
-  herdr on Windows reports a pane's shell (`bash.exe`), never the program inside it. Now one `tab
-  list` finds the tab sesync labelled with the session's tag; process info is asked only on Linux
-  and macOS, and only for the tagged tab's panes and panes in the session's project directory
-  (`panes_show_programs`, `Pane::cwd`). Windows: 2 calls to focus, 4 to open, whatever the number
-  of panes. The key now draws "opening … in herdr…" before the calls (`App::run_pending_open`).
+  herdr on Windows reports a pane's shell (`bash.exe`) and its pid, never the program inside it,
+  even while one runs. Now one `tab list` finds the tab sesync labelled with the session's tag. On
+  Linux and macOS process info is asked only for the tagged tab's panes and panes in the session's
+  project directory (`Detect::Programs`, `Pane::cwd`). On Windows sesync reads the process list
+  itself for the tagged tab's shell (`Detect::ShellOnly`, `proc_tree::program_running_under`,
+  `windows-sys` ToolHelp): a program below it means the session runs (focus); a tab back at its
+  prompt, as after a herdr restart restores the tabs, gets the command typed again
+  (`Opened::Resumed`), not a second tab. Windows: 4 calls to open, 4 or 5 to focus or resume,
+  whatever the number of panes. The key now draws "opening … in herdr…" before the calls
+  (`App::run_pending_open`).
 - **Why text could precede the command.** The tab was created focused and the command typed into
   it afterwards; keys typed during the wait reached the new shell first. Reproduced paths (sandbox
   herdr with the same config, `tab create` then `pane run`, and the full popup flow) typed the
@@ -73,9 +78,12 @@ tests win, and you fix this file. Update it at the end of every work session.
   is now created with `--no-focus`, the command typed, and only then focused.
 - **Tests.** `tests/herdr_open.rs` models both kinds of herdr (programs shown, shell only): the
   calls made and their order, panes outside the session's directory never asked, 16 panes still 4
-  calls, the tag focusing in one call, the status drawn before any call.
-  `tests/herdr_open_live.rs` was Unix-only; it now runs on Windows too against a real herdr
-  (opt-in): call counts, the pane's directory, and the typed line holding the command alone.
+  calls, a tagged tab running something focused (unknown counts as running), an idle tagged tab
+  getting the command again, the status drawn before any call. `tests/proc_tree.rs`: Git Bash at
+  its prompt (launcher, inner bash, git) runs nothing; an agent below it does; another pane's does
+  not count. `tests/herdr_open_live.rs` was Unix-only; it now runs on Windows too against a real
+  herdr (opt-in): call counts, the pane's directory, the typed line holding the command alone, and
+  the resume into the same tab once the program has ended.
 - **Not covered.** The live test needs a running herdr, so CI does not run it.
 
 ## 2026-10-27: the TUI opens without reading every conversation, and Esc closes it

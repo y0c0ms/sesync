@@ -1108,16 +1108,21 @@ in herdr…"; the TUI draws that and then runs the open (`App::run_pending_open`
 herdr call is a process of its own (about half a second each on Windows). The open asks:
 
 - **The tab list, once.** sesync labels its tabs `harness: title · <tag>` (the tag: 8 hex digits of
-  the session key's SHA-256). Where herdr shows only a pane's shell (Windows,
-  `panes_show_programs`), a tab with this session's tag is the session: it is focused and nothing
-  starts.
-- **Process info, only for panes that can be the session** (Linux and macOS, where herdr reports a
-  pane's foreground programs): the panes of the tagged tab and the panes in the session's project
-  directory (`pane list` gives each pane's directory). A pane whose foreground process was
-  started with the identifier as a flag's value (`omp --resume <path>`, `claude --resume
-  <uuid>`, `opencode --session <id>`) is that session; a tagged pane with no foreground program is
-  too. A bare picker, or a program that only names the file, is not. A pane whose processes cannot
-  be read stops the open: a copy that might be the session is never started.
+  the session key's SHA-256), so a tab it opened is found without asking about every pane.
+- **Linux and macOS** (`Detect::Programs`: herdr reports a pane's foreground programs): process
+  info only for the panes of the tagged tab and the panes in the session's project directory
+  (`pane list` gives each pane's directory). A pane whose foreground process was started with the
+  identifier as a flag's value (`omp --resume <path>`, `claude --resume <uuid>`, `opencode
+  --session <id>`) is that session; a tagged pane with no foreground program is too. A bare picker,
+  or a program that only names the file, is not.
+- **Windows** (`Detect::ShellOnly`: herdr reports only the pane's shell and its `shell_pid`): for the
+  tagged tab's panes, sesync reads the process list itself (`proc_tree::program_running_under`: a
+  process below the shell that is not a shell, a console host or a prompt helper such as `git`). A
+  pane running something is the session: its tab is focused. A tagged tab back at its prompt (herdr
+  restarted and restored the tab, or the harness was quit) gets the command typed again, so the
+  session resumes in its own tab instead of a second one.
+- A pane whose processes cannot be read, or whose process list cannot be read, stops the open or
+  counts as running: a copy that might be the session is never started.
 - **Otherwise a new tab**, created unfocused in the directory, the command typed into its root
   pane, then the tab focused. Keys pressed meanwhile stay in the popup instead of reaching the new
   shell in front of the command. If the typing fails, the tab is closed again.
@@ -1127,15 +1132,22 @@ sequenceDiagram
     actor U as User
     participant T as sesync TUI (herdr popup)
     participant H as herdr CLI
+    participant W as Windows process list
     U->>T: o, or Enter on "Open in herdr"
     T->>U: "opening … in herdr…"
     T->>H: tab list
-    alt a tab carries the session's tag (and, where herdr shows programs, runs it)
+    alt Linux and macOS
+        T->>H: pane list, process info for the tagged tab's panes and the project directory's only
+    else Windows, a tab carries the session's tag
+        T->>H: pane list, process info of that tab's panes (the shell's pid)
+        T->>W: a program below that shell?
+    end
+    alt the session runs in a pane
         T->>H: tab focus
-    else not open
-        opt Linux and macOS: panes in the tagged tab or the project directory only
-            T->>H: pane list, then process info for those panes
-        end
+    else Windows: its tab is back at the prompt
+        T->>H: pane run in that tab: the resume command
+        T->>H: tab focus
+    else not open anywhere
         T->>H: tab create --no-focus, in the project directory
         T->>H: pane run: the resume command
         T->>H: tab focus
@@ -1143,11 +1155,12 @@ sequenceDiagram
     T->>U: quits, so the popup closes onto that tab
 ```
 
-On Windows that is two calls to focus and four to open, whatever the number of panes (it was one
-process-info call per pane, about eight seconds with 16 panes, and could never match there because
-herdr reported only the shell). Each herdr call times out after five seconds. Matching is per tab:
-the tab of the matched pane is focused, even when other panes share it. `tests/herdr_open_live.rs`
-checks this against a real herdr on every platform (opt-in, `--ignored`).
+On Windows that is four calls to open a new tab and four or five to focus or resume the session's
+own tab, whatever the number of panes (it was one process-info call per pane, about eight seconds
+with 16 panes, and could never match there because herdr reports only the shell). Each herdr call
+times out after five seconds. Matching is per tab: the tab of the matched pane is focused, even when
+other panes share it. `tests/herdr_open_live.rs` checks this against a real herdr on every
+platform (opt-in, `--ignored`), including the resume into an idle tab on Windows.
 
 ## Failure behaviour
 

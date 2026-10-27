@@ -1974,7 +1974,7 @@ impl App {
     pub fn run_pending_open(&mut self) {
         let Some(plan) = self.pending_open.take() else { return };
         let shell = herdr_open::PaneShell::current(&self.roots.home);
-        match herdr_open::open(&self.herdr, &plan, shell, herdr_open::panes_show_programs()) {
+        match herdr_open::open(&self.herdr, &plan, shell, herdr_open::Detect::platform()) {
             Ok(opened) => {
                 self.say(opened.message(&plan));
                 self.quit = true;

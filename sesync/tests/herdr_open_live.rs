@@ -89,11 +89,11 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
     let shell = herdr_open::PaneShell::current(&home());
     let calls = Rc::new(Cell::new(0));
     let herdr = Herdr::from_env(Box::new(Counting(Rc::clone(&calls))));
-    let shows_programs = herdr_open::panes_show_programs();
+    let shows_programs = !cfg!(windows);
     let tabs_before = tab_labels().len();
 
     let started = Instant::now();
-    let opened = herdr_open::open(&herdr, &plan, shell, shows_programs).expect("the first open creates a tab");
+    let opened = herdr_open::open(&herdr, &plan, shell, herdr_open::Detect::platform()).expect("the first open creates a tab");
     println!("first open: {:?}, {} herdr calls", started.elapsed(), calls.get());
     let Opened::Created { tab_id } = opened.clone() else {
         panic!("the first open should create a tab, got {opened:?}");
@@ -137,10 +137,24 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
 
     // A second open finds the session's tab and focuses it; no tab is added.
     calls.set(0);
-    let again = herdr_open::open(&herdr, &plan, shell, shows_programs).expect("the second open focuses");
+    let again = herdr_open::open(&herdr, &plan, shell, herdr_open::Detect::platform()).expect("the second open focuses");
     assert_eq!(again, Opened::Focused { tab_id: tab_id.clone() });
     if !shows_programs {
-        assert_eq!(calls.get(), 2, "tab list and tab focus");
+        assert_eq!(calls.get(), 4, "tab list, pane list, the tagged pane's process info, tab focus");
+
+        // The program ends (as after a herdr restart, when the tab comes back at its prompt): the
+        // next open types the command into the same tab instead of opening another.
+        herdr_json(&["pane", "send-keys", &pane.pane_id, "ctrl+c"]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let still_running = || herdr.shell_pid(&pane.pane_id).unwrap().and_then(sesync::proc_tree::program_running_under) == Some(true);
+        while still_running() {
+            assert!(Instant::now() < deadline, "ping did not stop");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let resumed = herdr_open::open(&herdr, &plan, shell, herdr_open::Detect::platform()).expect("the third open resumes");
+        assert_eq!(resumed, Opened::Resumed { tab_id: tab_id.clone() });
+        let lines = screen(&pane.pane_id).lines().filter(|l| l.contains(&command)).count();
+        assert!(lines >= 2, "the command was typed into the same pane again:\n{}", screen(&pane.pane_id));
     }
     let focused = herdr_json(&["tab", "list"])["result"]["tabs"].as_array().unwrap().iter()
         .find(|t| t["tab_id"] == tab_id.as_str())
