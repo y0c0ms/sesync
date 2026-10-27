@@ -25,7 +25,7 @@ const DEFAULT_NTFY_TOKEN_COMMAND: &str =
 /// How often plan usage is refreshed with `omp usage --json`, unless `--usage-every` says otherwise.
 const DEFAULT_USAGE_EVERY_SECS: u64 = 600;
 /// How often herdr's agent statuses are read to raise notifications.
-const NOTIFY_EVERY: Duration = Duration::from_secs(2);
+const NOTIFY_EVERY: Duration = Duration::from_millis(250);
 /// The flags of `serve` that take no value.
 const SERVE_FLAGS: &[&str] = &["no-ntfy", "no-usage"];
 const USAGE: &str = "usage: sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]
