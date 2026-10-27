@@ -1117,7 +1117,8 @@ herdr call is a process of its own (about half a second each on Windows). The op
   or a program that only names the file, is not.
 - **Windows** (`Detect::ShellOnly`: herdr reports only the pane's shell and its `shell_pid`): for the
   tagged tab's panes, sesync reads the process list itself (`proc_tree::program_running_under`: a
-  process below the shell that is not a shell, a console host or a prompt helper such as `git`). A
+  process below the shell that is not a shell, a console host or a prompt helper such as `git`,
+  present in two snapshots 250 ms apart, since a prompt starts short-lived tools while it draws). A
   pane running something is the session: its tab is focused. A tagged tab back at its prompt (herdr
   restarted and restored the tab, or the harness was quit) gets the command typed again, so the
   session resumes in its own tab instead of a second one.

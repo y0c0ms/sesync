@@ -66,7 +66,8 @@ tests win, and you fix this file. Update it at the end of every work session.
   Linux and macOS process info is asked only for the tagged tab's panes and panes in the session's
   project directory (`Detect::Programs`, `Pane::cwd`). On Windows sesync reads the process list
   itself for the tagged tab's shell (`Detect::ShellOnly`, `proc_tree::program_running_under`,
-  `windows-sys` ToolHelp): a program below it means the session runs (focus); a tab back at its
+  `windows-sys` ToolHelp; a program counts when it is in two snapshots 250 ms apart, as a prompt
+  starts short-lived tools): a program below it means the session runs (focus); a tab back at its
   prompt, as after a herdr restart restores the tabs, gets the command typed again
   (`Opened::Resumed`), not a second tab. Windows: 4 calls to open, 4 or 5 to focus or resume,
   whatever the number of panes. The key now draws "opening … in herdr…" before the calls
