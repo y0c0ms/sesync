@@ -578,11 +578,77 @@ fn run_mirrors(env: &Env, state: &mut State, apply: bool) -> i32 {
     0
 }
 
+/// `sesync herdr check [--herdr <exe>]`: does that herdr still do what sesync needs (see
+/// `herdr_check`). `sesync herdr guard [--remove]`: make `herdr update` offer that check first.
+/// `sesync herdr probe --file <f>`: the stand-in session the check runs in a pane.
+fn run_herdr(args: &[String]) -> i32 {
+    use sesync::herdr_check;
+    let usage = "usage: sesync herdr check [--herdr <exe>] | sesync herdr guard [--remove]";
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let home = sesync::home::home_dir();
+    match args.first().map(String::as_str) {
+        Some("probe") => match value("--file") {
+            Some(file) => herdr_check::probe(Path::new(&file)),
+            None => 2,
+        },
+        Some("check") => {
+            let bin = value("--herdr")
+                .or_else(|| std::env::var("HERDR_BIN_PATH").ok().filter(|b| !b.is_empty()))
+                .unwrap_or_else(|| "herdr".to_string());
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => { eprintln!("sesync: cannot find its own program: {e}"); return 1; }
+            };
+            println!("Checking what sesync needs from {bin}, in a throwaway herdr session:");
+            let ok = herdr_check::check(Path::new(&bin), &exe, &home, &mut |step| {
+                let mark = if step.ok { "  ok  " } else { "  FAIL" };
+                if step.detail.is_empty() {
+                    println!("{mark} {}", step.what);
+                } else {
+                    println!("{mark} {}: {}", step.what, step.detail);
+                }
+            });
+            if ok {
+                println!("Every check passed: sesync's popup and \"Open in herdr\" work with this herdr.");
+                0
+            } else {
+                println!("A check failed: with this herdr, sesync's \"Open in herdr\" would not work as it does now.");
+                1
+            }
+        }
+        Some("guard") => {
+            let Some(dir) = sesync::herdr_open::herdr_config_dir(&home) else {
+                eprintln!("sesync: herdr's configuration directory is unknown (APPDATA is not set)");
+                return 1;
+            };
+            if args.iter().any(|a| a == "--remove") {
+                return match herdr_check::remove_guard(&dir) {
+                    Ok(true) => { println!("removed {}", dir.join(herdr_check::GUARD_FILE).display()); 0 }
+                    Ok(false) => { println!("no guard in {}", dir.display()); 0 }
+                    Err(e) => { eprintln!("sesync: {e}"); 1 }
+                };
+            }
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => { eprintln!("sesync: cannot find its own program: {e}"); return 1; }
+            };
+            match herdr_check::install_guard(&dir, &exe) {
+                Ok(path) => { println!("wrote {}: herdr update now warns and can run `sesync herdr check` first", path.display()); 0 }
+                Err(e) => { eprintln!("sesync: {e}"); 1 }
+            }
+        }
+        _ => { eprintln!("{usage}"); 2 }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Team admin commands do not touch the session state, so they run before it is loaded.
     if args.first().map(String::as_str) == Some("team") {
         std::process::exit(run_team(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("herdr") {
+        std::process::exit(run_herdr(&args[1..]));
     }
     let env = Env::from_env();
     let _ = std::fs::create_dir_all(&env.state_dir);
