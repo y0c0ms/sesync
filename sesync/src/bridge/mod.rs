@@ -5,6 +5,12 @@
 //!
 //! Only `sesync bridge …` runs any of this. The daemon, the TUI and the team client never touch it.
 
+pub mod confine;
+pub mod files;
+pub mod git;
+pub mod pins;
+#[cfg(test)]
+pub mod testkit;
 pub mod approvals;
 pub mod catalog;
 pub mod cli;

@@ -226,7 +226,7 @@ async fn an_unserved_method_answers_method_not_found_with_the_request_id() {
     let mut phone = Phone::hello(&b, 9).await;
     phone.auth(&token).await;
 
-    for method in ["files.read", "nativeChat.send", "agentSession.send", "agentSession.currentRequests", "worktree.create", "terminal.multiplex"] {
+    for method in ["git.commit", "nativeChat.send", "agentSession.send", "agentSession.currentRequests", "worktree.create", "terminal.multiplex", "files.writeTerminalArtifact"] {
         let reply = phone.rpc(&token, "rpc-x", method).await;
         assert_eq!(reply["id"], "rpc-x");
         assert_eq!(reply["ok"], false);

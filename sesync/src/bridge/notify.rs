@@ -29,6 +29,8 @@ const FEED_POLL: Duration = Duration::from_millis(250);
 /// The event kinds the watcher raises.
 pub const FINISHED: &str = "finished";
 pub const NEEDS_INPUT: &str = "needs-input";
+/// The kind of the synthetic event `notifications.testPush` sends. Never recorded in the history.
+pub const TEST: &str = "test";
 
 /// What a herdr status change means, if it means anything to the phone. `prev` is the status the
 /// pane had at the last observation, `now` the one it has now.
@@ -86,6 +88,17 @@ impl Event {
     /// The desktop's `MobileNotificationDispatchEvent` for this event. `epoch` is the hub's epoch,
     /// which names the counter `notificationSeq` belongs to.
     pub fn to_json(&self, epoch: &str) -> Value {
+        if self.kind == TEST {
+            return json!({
+                "type": "notification",
+                "source": "test",
+                "title": "Test notification",
+                "body": "Notifications from this host reach this app.",
+                "notificationId": format!("test:{epoch}:{}", self.seq),
+                "notificationEpoch": epoch,
+                "emittedAt": self.at,
+            });
+        }
         json!({
             "type": "notification",
             "source": "agent",
@@ -144,6 +157,7 @@ struct Subscriber {
 #[derive(Default)]
 struct State {
     next_seq: u64,
+    test_seq: u64,
     events: VecDeque<Event>,
     subscribers: Vec<Subscriber>,
 }
@@ -219,6 +233,29 @@ impl Hub {
         let events: Vec<Event> = state.events.iter().filter(|e| stale || e.seq > last_seen).cloned().collect();
         (events, self.inner.epoch.clone())
     }
+
+    /// Send a test notification to every live subscriber and return how many took it. It is not kept in
+    /// the history, takes no sequence number, and never goes to ntfy.
+    pub fn test_push(&self, at: f64) -> usize {
+        let mut state = self.inner.state.lock();
+        state.test_seq += 1;
+        let event = Event {
+            seq: state.test_seq,
+            kind: TEST,
+            worktree_id: String::new(),
+            title: String::new(),
+            repo: String::new(),
+            terminal_id: String::new(),
+            at,
+        };
+        let mut delivered = 0;
+        state.subscribers.retain(|s| {
+            let live = !s.stop.load(Ordering::Relaxed) && s.tx.send(event.clone()).is_ok();
+            delivered += usize::from(live);
+            live
+        });
+        delivered
+    }
 }
 
 /// ntfy's priority and tags for each event kind. The title and body are `heading` and `body_of`.
@@ -276,6 +313,17 @@ fn run_feed(t: Feed) {
 /// notifications; this host keeps no dismissals, so it reports an empty `dismissedPushes`.
 pub fn get_missed_since(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     missed_reply(&ctx.notify, params)
+}
+
+/// `notifications.testPush`: a synthetic notification to every open `notifications.subscribe` stream.
+/// `accepted` is false when no stream is open, so the phone reports the test as not delivered.
+pub fn test_push(_params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
+    let delivered = ctx.notify.test_push(terminals::now_ms());
+    Ok(if delivered > 0 {
+        json!({ "accepted": true })
+    } else {
+        json!({ "accepted": false, "reason": "unavailable" })
+    })
 }
 
 fn missed_reply(hub: &Hub, params: &Value) -> Result<Value, Failure> {
@@ -640,5 +688,39 @@ mod tests {
         let epoch = hub.attach(tx, Arc::new(AtomicBool::new(false)));
         assert_eq!(epoch, hub.missed_since(0, None).1);
         assert!(rx.try_recv().is_err(), "history is served by getMissedSince, not the stream");
+    }
+
+    #[test]
+    fn a_test_push_reaches_a_live_stream_and_is_not_kept_in_the_history() {
+        let hub = Hub::new(None);
+        let (tx, rx) = mpsc::channel();
+        let epoch = hub.attach(tx, Arc::new(AtomicBool::new(false)));
+        assert_eq!(hub.test_push(1000.0), 1);
+        let frame = rx.try_recv().unwrap().to_json(&epoch);
+        assert_eq!(frame["type"], "notification");
+        assert_eq!(frame["source"], "test");
+        assert_eq!(frame["notificationId"], format!("test:{epoch}:1"));
+        assert!(frame.get("notificationSeq").is_none(), "a test takes no place in the event sequence");
+        assert!(hub.missed_since(0, None).0.is_empty());
+    }
+
+    #[test]
+    fn a_test_push_with_no_open_stream_is_refused_and_a_stopped_stream_gets_nothing() {
+        let hub = Hub::new(None);
+        assert_eq!(hub.test_push(1000.0), 0);
+        let (tx, rx) = mpsc::channel();
+        hub.attach(tx, Arc::new(AtomicBool::new(true)));
+        assert_eq!(hub.test_push(1000.0), 0);
+        assert!(rx.try_recv().is_err());
+        let ctx = crate::bridge::testkit::ctx_with(vec![], &std::env::temp_dir());
+        assert_eq!(test_push(&json!({}), &ctx).unwrap(), json!({ "accepted": false, "reason": "unavailable" }));
+    }
+
+    #[test]
+    fn the_test_push_request_is_accepted_once_a_stream_is_open() {
+        let ctx = crate::bridge::testkit::ctx_with(vec![], &std::env::temp_dir());
+        let (tx, _rx) = mpsc::channel();
+        ctx.notify.attach(tx, Arc::new(AtomicBool::new(false)));
+        assert_eq!(test_push(&json!({}), &ctx).unwrap(), json!({ "accepted": true }));
     }
 }

@@ -40,6 +40,8 @@ Under `$SESYNC_CONFIG_DIR/bridge/` (default `~/.config/sesync/bridge/`). The dir
   silently (a new key would strand every paired phone). The public key is derived from it.
 - `devices.json`: `0600`. Per device: `id`, `label`, `created` (unix seconds), `token_sha256`.
   The token itself is never stored: it is 256 random bits, and only its SHA-256 is kept.
+- `pins.json`: `0600`. The pinned conversations (`worktree.set`) as `{"pinned":["<worktree id>", …]}`. A
+  damaged file fails the next pin write rather than being replaced.
 
 Writes are atomic (temp file, then rename) and created owner-only from the start.
 
@@ -78,7 +80,8 @@ Served methods:
 | Method | Result |
 |---|---|
 | `status.get` | `{runtimeId, appVersion, protocolVersion:3, minCompatibleMobileVersion:2, capabilities:[], floatingWorkspaceEnabled:false, hostPlatform, machineName}` |
-| `worktree.ps` | `{worktrees:[…], totalCount, truncated:false}`: one row per sesync conversation, newest first. `status` and `agents` come from the herdr panes running it (see Mapping). Without herdr the rows still load, as not open. |
+| `worktree.ps` | `{worktrees:[…], totalCount, truncated:false}`: one row per sesync conversation, newest first. `status` and `agents` come from the herdr panes running it (see Mapping). Without herdr the rows still load, as not open. `isPinned` is the conversation's pin. |
+| `worktree.set` `{worktree, isPinned}` | `{worktree, isPinned}`: pins a conversation. The pin is kept in `pins.json` under the bridge's state directory, never in sesync's store. Any other non-null field is refused as `bad_request`. |
 | `repo.list` | `{repos:[…]}`: the conversations' project directories, for grouping. Ids match the rows' `repoId`. |
 | `session.tabs.list` `{worktree:"id:<wt>"}` | `{worktree, publicationEpoch, snapshotVersion, tabs:[…], activeTabId, activeTabType}`: one `type:"terminal"` tab per pane running the conversation. Empty when none is open. |
 | `session.tabs.subscribe` `{worktree}` | Streams `{type:"snapshot", …tabs}` then `{type:"updated", …tabs}` when the tab list changes. `session.tabs.unsubscribe {worktree, subscriptionId?}` ends it. |
@@ -86,6 +89,7 @@ Served methods:
 | `terminal.read` `{terminal}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last 200 rows as text. |
 | `terminal.subscribe` `{terminal, client:{id}, viewport?, capabilities?}` | The screen, then live changes. See Terminal streams. `terminal.unsubscribe {subscriptionId, client, requestId}` ends it. |
 | `terminal.send` `{terminal, text?, enter?, interrupt?}` | `{send:{handle, accepted:true, bytesWritten}}`. A prompt (`text` with `enter:true`) takes the conversation's claim first; see Prompt turns. Approval keys are `text` with `enter:false` (see Approvals). |
+| `terminal.clearBuffer` `{terminal}` | `{terminal:{handle, cleared:true}}` after Ctrl-L is sent into the pane. Not a prompt turn, so it claims nothing. |
 | `agentSession.subscribeStatus` | Streams `{type:"snapshot", sessions:[…]}` then `{type:"status", session}` on change: one session per pane running a conversation. |
 | `nativeChat.readSession` `{agent, sessionId, limit?, beforeOffset?}` | `{messages, hasMore, beforeOffset?}` (or `{error}`): the conversation's journal from its live window, paged by row cursor. See Chat view. |
 | `nativeChat.subscribe` `{agent, sessionId, subscriptionId, limit?, capabilities?}` | Streams `snapshot`, then `appended` or `replacement`, with `error` and `end` as the app reads them. `nativeChat.unsubscribe {subscriptionId}` ends it. |
@@ -95,14 +99,27 @@ Served methods:
 | `session.tabs.createTerminal` `{worktree, agent}` | `{tab:{type:"terminal", id, terminal, title}}`: a new herdr tab in the conversation's directory running the agent with no resume. See New sessions. |
 | `notifications.subscribe` `{includeDesktopSuppressed?}` | Streams `{type:"ready", subscriptionId, epoch}`, then `{type:"notification", agentState, paneKey, notificationId, …}` frames: `agentState` is `done` for finished and `blocked` for needs input. `notifications.getMissedSince {lastSeenSeq, epoch?}` replays from memory. See Notifications. |
 | `notifications.registerPush`, `unregisterPush` | `{registered:false}`: there is no FCM. |
+| `notifications.testPush` | `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no `notifications.subscribe` stream is open. A synthetic in-app notification (see Notifications). |
 | `accounts.list` | `AccountsSnapshot`. See Plan usage. |
 | `accounts.subscribe` | Streams `{type:"ready", subscriptionId, snapshot}`, then `{type:"snapshot", snapshot}` on change. `accounts.unsubscribe` ends it. |
+| `files.readDir` `{worktree, relativePath?}` | A bare array `[{name, isDirectory, isSymlink}]`: one directory's entries, directories first. More than 5 000 entries is `directory_too_large`. |
+| `files.read` `{worktree, relativePath}` | `{worktree, relativePath, content, truncated, byteLength}`: a text file, cut to 1 MiB (`truncated` says so; `byteLength` is the full size). A binary file is `binary_file`. |
+| `files.readPreview` `{worktree, relativePath}` | `{worktree, relativePath, content (base64), isBinary:true, isImage:true, mimeType}` for png, jpg, jpeg, gif or webp up to 2 MiB. |
+| `files.resolveTerminalPath` `{worktree, pathText, cwd?}` | `{worktree, relativePath, absolutePath, exists, isDirectory, openTarget?}`: a path a pane printed, resolved inside the project. A file has `openTarget: {kind:"worktree-file", relativePath, absolutePath}`. |
+| `files.searchPaths` `{worktree, query?, limit?, excludePaths?}` | `{worktree, files:[{relativePath, basename, kind}], totalCount, truncated}`: project files whose path matches the query, `.gitignore` honoured. `limit` defaults to 16 and tops out at 200. |
+| `git.status` `{worktree, includeLineStats?}` | `{entries:[{path, status, area, oldPath?, conflictStatus?, conflictStatusSource?, added?, removed?}], branch?, head?, upstreamStatus?}`. `area` is `staged`, `unstaged` or `untracked`. |
+| `git.diff` `{worktree, filePath, staged}` | `{kind:"text", originalContent, modifiedContent}`, `{kind:"binary"}`, or `{kind:"too-large", byteLength}` when a side is over 1 MiB. |
+| `git.history` `{worktree, limit?, baseRef?}` | `{items:[{id, parentIds, subject, displayId, author, timestamp}]}`, newest first. `timestamp` is milliseconds; `limit` defaults to 50 and tops out at 200. |
+| `git.commitCompare` `{worktree, commitId}` | `{entries:[…]}`: the files one commit changed against its first parent. |
+| `git.branchCompare` `{worktree, baseRef}` | `{summary:{baseRef, compareRef, changedFiles, status, baseOid, headOid, mergeBase, commitsAhead, errorMessage?}, entries:[…]}`. `status` is `ready`, `invalid-base`, `unborn-head`, `no-merge-base` or `error`. `compareRef` is the checked-out branch, `HEAD` when detached. |
 
 Every other method, including the structured `agentSession.*` calls (`send`, `currentRequests`, `respondToApproval`, `respondToQuestion`, `create`, `createSupport`) and `worktree.create` and `agent.launch`, answers `error.code: "method_not_found"` with the request's `id`. Terminal-backed chat never calls them: its prompts ride `terminal.send`, its cards ride `interactivePrompt`, and new sessions ride `session.tabs.createTerminal` (the app falls through when `agentSession.create` is refused). Orca reads that as
 "not available here" (`isMobileMethodUnavailableError`) and skips the read. Errors the bridge raises:
 `bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
 reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read),
-`send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder).
+`send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder),
+`invalid_relative_path`, `not_found`, `binary_file`, `file_too_large`, `not_a_file`, `not_a_directory` and
+`directory_too_large` (file reads), `not_a_repository`, `git_refused` and `git_failed` (git reads).
 
 Protocol version: the bridge speaks Orca's mobile protocol 3 (`MOBILE_PROTOCOL_VERSION`), and the
 phone accepts a host with `minCompatibleMobileVersion` 2 or lower.
@@ -174,8 +191,8 @@ does, so the TUI, the daemon and the other harnesses cannot write the same conve
   prompt the agent never acts on releases after 15 s. Every turn releases by 30 min at the latest, so a
   stuck pane cannot lock a conversation. The release is `release <conversation> phone <bridge pid>`.
 
-Other input (`text` without `enter`, `interrupt`) is not a turn and is not claimed. `interrupt` sends
-`ctrl+c`.
+Other input (`text` without `enter`, `interrupt`, `clearBuffer`) is not a turn and is not claimed. `interrupt` sends
+`ctrl+c`; `terminal.clearBuffer` sends `ctrl+l`.
 
 ## Framing: legacy only, and a correction
 
@@ -207,15 +224,27 @@ deferred; the interop check below covers this path.
   frame that does not decrypt is dropped without a reply. Terminal snapshots and frames are 48 KiB
   pieces; a screen is at most the pane's visible rows.
 - **What a paired phone can read:** conversation titles, harness names, project directory paths, and
-  the visible screen and last 200 rows of each pane that runs a conversation. Nothing else from the
-  session stores is sent; the bridge never writes to them. Its only writes are `server.key`,
-  `devices.json`, and the sesync-lock claims for prompt turns.
+  the visible screen and last 200 rows of each pane that runs a conversation. Read-only, it can also
+  read the files under each conversation's project directory and that repository's git status, diffs,
+  history and branch comparisons (see Files and source control). Nothing else from the session stores is
+  sent. Its only writes are `server.key`, `devices.json`, `pins.json`, the sesync-lock claims for prompt
+  turns, and the upload staging.
 - **Notifications and push.** The ntfy publish token is read once at startup and held in memory; it is never logged or written. Publishing is best effort on a detached thread: a failure is logged without the token and never blocks a notification.
 - **Uploads.** Staged images live under `$SESYNC_CONFIG_DIR/bridge/uploads/<conversation>/` (directory `0700`, files `0600`), at most 20 MB decoded per image, and must start with a PNG, JPEG, GIF or WEBP signature. An upload that is refused or idle for 5 minutes is removed.
 - **Approval keys.** A paired phone can answer an approval by typing its key into the pane (`terminal.send` with `enter:false`): the same reach as typing into the pane.
 - **Not done yet:** per-device permissions (a paired phone has every method above), rate limiting,
   audit logging beyond connect/refuse lines, a revocation UI, key rotation for `server.key`, and a
   read-only mode.
+
+## Files and source control (read-only)
+
+The file explorer, file previews, terminal file links, the `@` file search and the Changes and Commits tabs read the conversation's project directory, the `dir` the conversation records. Every path the phone names is checked twice: lexically (no absolute path, no `..`, no NUL byte, no `.git` component), then again after symlinks are followed (a link that leaves the project, or points into `.git`, is `invalid_relative_path`). The check lives in `confine.rs`. `.git` is never listed or read, because its config can hold remote credentials.
+
+Caps: a text file is read up to 1 MiB and marked `truncated` when cut; an image preview is at most 2 MiB; a directory lists at most 5 000 entries (more is `directory_too_large`, never a silent cut); `files.searchPaths` walks at most 50 000 entries and returns `limit` rows.
+
+Git runs only through one runner (`git.rs`). Its allowlist is the verbs `status`, `diff`, `log`, `show`, `merge-base` and `rev-parse`, each with the read-only options the code lists: for example `--porcelain=v2 -z --branch` for status, `--no-ext-diff --no-textconv` for diff, and `--no-show-signature` for log and show, so a repository's own signature settings never run gpg. Any other verb, and any other option (`--output`, `--ext-diff`, `--textconv`, `-c`, `--git-dir`), is refused as `git_refused` before git starts. A revision from the phone is 1 to 255 characters from `[A-Za-z0-9._/@+-]` with no leading `-` and no `..`; a commit id is 40 or 64 hex digits; paths follow `--`. git runs with `-c core.fsmonitor= -c core.hooksPath=/dev/null` and `GIT_OPTIONAL_LOCKS=0`, with `GIT_DIR` and `GIT_WORK_TREE` removed from its environment, a 10 s limit and an 8 MiB output cap.
+
+Apart from pins and `terminal.clearBuffer` (Ctrl-L into the pane), none of these methods writes.
 
 ## Chat view
 
@@ -238,6 +267,8 @@ When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines a
 ## Notifications
 
 A watcher subscribes to herdr's `pane.agent_status_changed` event for each pane it knows (`events.subscribe`, one subscription per pane), and applies every status change as it arrives, so a turn is seen however short it is. The pane list is re-read every second to follow panes that open or close, and the subscription is reopened then. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push e…
+
+`notifications.testPush` sends one synthetic frame, `{type:"notification", source:"test", title:"Test notification", notificationId:"test:<epoch>:<n>"}`, to every open `notifications.subscribe` stream. It is not kept in the history, takes no sequence number and never goes to ntfy. The reply is `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no stream is open.
 
 ## Plan usage
 
@@ -285,6 +316,8 @@ The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`,
   mapping, the tab, terminal and status shapes, the binary frame codec and 48 KiB chunking, the
   stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
   named and a timed release), and the RPC dispatch against canned herdr answers.
+- `src/bridge/pins.rs`: pins survive a reload, the file is owner-only, a damaged file fails the write and is left alone, `isPinned` must be a boolean, and no other field is accepted. `rpc.rs` tests: the pin shows on the worktree row, `terminal.clearBuffer` sends Ctrl-L and reports a missing pane, write verbs and unserved methods answer `method_not_found`, and every read method is routed. `notify.rs`: a test push reaches a live stream, is kept out of the history, and is refused with no stream.
+- `src/bridge/confine.rs`, `files.rs`, `git.rs`: the path confinement (`..`, absolute paths, NUL, `.git`, a symlink that leaves the project or enters `.git`), the size caps, the `.gitignore`-honouring search, the git allowlist (every other verb and each unlisted option is refused before git starts, and a write verb leaves the repository unchanged), and reads of real files and a real `git init` repository in a sandbox. `rpc.rs` also runs a live repository through dispatch.
 - `src/bridge/e2ee.rs` pins the NaCl framing against a tweetnacl vector (both directions, and the
   server public key derivation).
 - `tests/bridge.rs` drives a real loopback WebSocket server with a Rust client: hello, auth, status,

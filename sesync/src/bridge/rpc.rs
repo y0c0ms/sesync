@@ -1,18 +1,21 @@
 //! The RPC subset the phone uses. A sesync conversation is a worktree, its herdr panes are its terminals
 //! and tabs, and the host is this machine (see docs/BRIDGE.md, "Mapping").
 //!   * `status.get`: what this host is, for the app's compatibility gate;
-//!   * `worktree.ps`: the home list, one row per conversation, newest first;
+//!   * `worktree.ps` and `worktree.set`: the home list, one row per conversation, and its pin;
 //!   * `repo.list`: the conversations' project directories, for grouping;
 //!   * `session.tabs.list` / `session.tabs.subscribe` / `session.tabs.unsubscribe`: the panes running a
 //!     conversation;
-//!   * `terminal.list`, `terminal.read`, `terminal.send`, `terminal.subscribe`, `terminal.unsubscribe`;
-//!   * `agentSession.subscribeStatus`: the agent statuses of those panes.
+//!   * `terminal.list`, `terminal.read`, `terminal.send`, `terminal.clearBuffer`, `terminal.subscribe`, `terminal.unsubscribe`;
+//!   * `agentSession.subscribeStatus`: the agent statuses of those panes;
+//!   * `files.*` and `git.*`: read-only, confined to the project directory (files.rs, git.rs);
+//!   * `notifications.testPush`: a synthetic in-app notification.
 //! Every other method answers `method_not_found`. The app reads that as "not available here" and skips
 //! the read, so the rest of its screens degrade rather than fail.
 
 use super::catalog::{self, Catalog, Conversation, Project};
 use super::herdr::{self, Herdr};
 use super::notify;
+use super::{confine, files, git, pins};
 use super::start;
 use super::stream::{self, Conn};
 use super::terminals::{self, Running};
@@ -101,6 +104,19 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
         "notifications.getMissedSince" => notify::get_missed_since(&params, ctx),
         "notifications.registerPush" | "notifications.unregisterPush" => Ok(json!({})),
         "accounts.list" => usage::accounts_list(&params, ctx),
+        "worktree.set" => pins::set(&params, ctx),
+        "terminal.clearBuffer" => terminal_clear(&params, ctx),
+        "notifications.testPush" => notify::test_push(&params, ctx),
+        "files.readDir" => files::read_dir(&params, ctx),
+        "files.read" => files::read(&params, ctx),
+        "files.readPreview" => files::read_preview(&params, ctx),
+        "files.resolveTerminalPath" => files::resolve_terminal_path(&params, ctx),
+        "files.searchPaths" => files::search_paths(&params, ctx),
+        "git.status" => git::status(&params, ctx),
+        "git.diff" => git::diff(&params, ctx),
+        "git.history" => git::history(&params, ctx),
+        "git.commitCompare" => git::commit_compare(&params, ctx),
+        "git.branchCompare" => git::branch_compare(&params, ctx),
         other => return Some(error(&id, "method_not_found", &format!("Unknown method: {other}"))),
     };
     Some(match outcome {
@@ -173,6 +189,23 @@ fn resolve(ctx: &Ctx, worktree: &str) -> Result<(Conversation, Vec<Running>), Fa
     Ok((conversation, panes))
 }
 
+/// The conversation a request's `worktree` selector names. Fails when it is not listed.
+pub fn conversation_of_params(ctx: &Ctx, params: &Value) -> Result<Conversation, Failure> {
+    let worktree = worktree_param(params)?;
+    ctx.catalog
+        .conversations()
+        .map_err(|m| ("unavailable", m))?
+        .into_iter()
+        .find(|c| c.worktree_id() == worktree)
+        .ok_or_else(|| ("worktree_not_found", format!("no conversation {worktree}")))
+}
+
+/// The project directory a request's `worktree` selector names, canonical. The file and git methods
+/// resolve every path under it (confine.rs).
+pub fn project_root(ctx: &Ctx, params: &Value) -> Result<PathBuf, Failure> {
+    confine::root_of(&conversation_of_params(ctx, params)?.dir)
+}
+
 /// The pane a terminal handle names, from herdr's list now.
 fn find_terminal(ctx: &Ctx, handle: &str) -> Result<herdr::Pane, Failure> {
     herdr::list_panes(ctx.herdr.as_ref())
@@ -187,9 +220,17 @@ fn worktree_ps(ctx: &Ctx) -> Result<Value, Failure> {
     // Live state is best-effort: without herdr every conversation shows as not open, and the list still loads.
     let panes = terminals::running_panes(ctx.herdr.as_ref()).unwrap_or_default();
     let now = terminals::now_ms();
+    let pinned = pins::load(&ctx.dir).unwrap_or_else(|m| {
+        eprintln!("sesync bridge: {m}");
+        Default::default()
+    });
     let rows: Vec<Value> = conversations
         .iter()
-        .map(|c| worktree_row(c, &terminals::panes_of(&panes, c), now))
+        .map(|c| {
+            let mut row = worktree_row(c, &terminals::panes_of(&panes, c), now);
+            row["isPinned"] = json!(pinned.contains(&c.worktree_id()));
+            row
+        })
         .collect();
     Ok(json!({ "worktrees": rows, "totalCount": rows.len(), "truncated": false }))
 }
@@ -354,6 +395,15 @@ fn terminal_send(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
         send(herdr::send_keys(h, &pane.pane_id, &["enter"]))?;
     }
     Ok(json!({ "send": { "handle": handle, "accepted": true, "bytesWritten": written } }))
+}
+
+/// `terminal.clearBuffer {terminal}`: Ctrl-L into the pane. A shell clears its screen and a full-screen
+/// agent redraws. Like `interrupt`, it is not a prompt turn, so it claims no conversation.
+fn terminal_clear(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
+    let handle = handle_param(params)?;
+    let pane = find_terminal(ctx, &handle)?;
+    herdr::send_keys(ctx.herdr.as_ref(), &pane.pane_id, &["ctrl+l"]).map_err(|m| ("send_failed", m))?;
+    Ok(json!({ "terminal": { "handle": handle, "cleared": true } }))
 }
 
 /// A prompt submission. When the pane runs a conversation, the conversation is claimed in sesync-lock
@@ -723,6 +773,114 @@ mod tests {
         assert!(reply["error"]["message"].as_str().unwrap().contains("claude 4242"));
         let sent: Vec<String> = h.calls.lock().iter().map(|(m, _)| m.clone()).collect();
         assert!(!sent.iter().any(|m| m.starts_with("agent.") || m == "pane.send_text"), "nothing is typed into a locked conversation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_buffer_sends_ctrl_l_into_the_pane() {
+        let panes = json!({"type":"pane_list","panes":[
+            {"pane_id":"w1:p1","terminal_id":"term_a","tab_id":"w1:t1","focused":true,"agent_status":"idle"}
+        ]});
+        let h = herdr_with(panes, json!({"process_info":{"foreground_processes":[]}}));
+        let c = ctx(Arc::new(Fixed(vec![])), h.clone());
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("c", "terminal.clearBuffer", json!({"terminal": "term_a"})), &c, &conn).unwrap();
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["result"]["terminal"]["cleared"], true);
+        let keys: Vec<Value> = h.calls.lock().iter().filter(|(m, _)| m == "pane.send_keys").map(|(_, p)| p["keys"].clone()).collect();
+        assert_eq!(keys, vec![json!(["ctrl+l"])]);
+    }
+
+    #[test]
+    fn clear_buffer_on_a_pane_that_is_gone_is_terminal_not_found() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_with(json!({"type":"pane_list","panes":[]}), json!({})));
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("c", "terminal.clearBuffer", json!({"terminal": "term_a"})), &c, &conn).unwrap();
+        assert_eq!(reply["error"]["code"], "terminal_not_found");
+    }
+
+    #[test]
+    fn a_pin_shows_on_the_worktree_row_until_it_is_removed() {
+        let dir = crate::bridge::testkit::sandbox("rpc-pin");
+        let project = conv("alpha", "uuid-pin", dir.join("project").to_str().unwrap(), 1.0);
+        let worktree = format!("id:{}", project.worktree_id());
+        let c = crate::bridge::testkit::ctx_with(vec![project], &dir.join("bridge"));
+        let (conn, _rx) = conn();
+        let pinned = |c: &Ctx| {
+            let reply = dispatch(&req("p", "worktree.ps", json!({})), c, &conn).unwrap();
+            reply["result"]["worktrees"][0]["isPinned"].clone()
+        };
+        assert_eq!(pinned(&c), json!(false));
+        let set = dispatch(&req("s", "worktree.set", json!({"worktree": worktree, "isPinned": true})), &c, &conn).unwrap();
+        assert_eq!(set["ok"], true);
+        assert_eq!(pinned(&c), json!(true));
+        dispatch(&req("u", "worktree.set", json!({"worktree": worktree, "isPinned": false})), &c, &conn).unwrap();
+        assert_eq!(pinned(&c), json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_verbs_and_unserved_methods_stay_refused() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_with(json!({}), json!({})));
+        let (conn, _rx) = conn();
+        for method in ["git.commit", "git.push", "git.stage", "files.createFile", "files.writeTerminalArtifact", "accounts.selectClaude", "worktree.create"] {
+            let reply = dispatch(&req("w", method, json!({})), &c, &conn).unwrap();
+            assert_eq!(reply["error"]["code"], "method_not_found", "{method}");
+        }
+    }
+
+    #[test]
+    fn every_read_method_is_routed_to_its_module() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_with(json!({}), json!({})));
+        let (conn, _rx) = conn();
+        for method in [
+            "files.readDir", "files.read", "files.readPreview", "files.resolveTerminalPath", "files.searchPaths",
+            "git.status", "git.diff", "git.history", "git.commitCompare", "git.branchCompare",
+            "worktree.set", "terminal.clearBuffer", "notifications.testPush",
+        ] {
+            let reply = dispatch(&req("r", method, json!({})), &c, &conn).unwrap();
+            assert_ne!(reply["error"]["code"], "method_not_found", "{method} is not routed");
+        }
+    }
+
+    #[test]
+    fn a_live_repository_is_read_through_dispatch_and_confined() {
+        let dir = crate::bridge::testkit::sandbox("rpc-live-git");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&project)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(project.join("a.txt"), "two\n").unwrap();
+        std::fs::write(project.join("new.txt"), "fresh\n").unwrap();
+        let project_conv = conv("alpha", "uuid-live", project.to_str().unwrap(), 1.0);
+        let worktree = format!("id:{}", project_conv.worktree_id());
+        let c = crate::bridge::testkit::ctx_with(vec![project_conv], &dir.join("bridge"));
+        let (conn, _rx) = conn();
+
+        let status = dispatch(&req("g", "git.status", json!({"worktree": worktree})), &c, &conn).unwrap();
+        let entries = status["result"]["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|e| e["path"] == "a.txt" && e["area"] == "unstaged" && e["status"] == "modified"));
+        assert!(entries.iter().any(|e| e["path"] == "new.txt" && e["area"] == "untracked"));
+
+        let tree = dispatch(&req("d", "files.readDir", json!({"worktree": worktree, "relativePath": ""})), &c, &conn).unwrap();
+        let names: Vec<&str> = tree["result"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["a.txt", "new.txt"], "the .git directory is never listed");
+
+        for escape in ["../secret", ".git/config", "/etc/passwd"] {
+            let refused = dispatch(&req("e", "files.read", json!({"worktree": worktree, "relativePath": escape})), &c, &conn).unwrap();
+            assert_eq!(refused["error"]["code"], "invalid_relative_path", "{escape}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

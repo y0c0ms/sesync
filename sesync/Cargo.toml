@@ -27,6 +27,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 base64 = "0.22"
+# The gitignore-aware walk behind the phone's file search (files.rs). Only that module uses it.
+ignore = "0.4"
 # Mutexes the bridge holds for one short section each; parking_lot's guards need no poison handling.
 parking_lot = "0.12"
 
