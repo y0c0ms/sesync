@@ -11,6 +11,7 @@
 //! `opencode --session <id>`). A bare picker, or a program that merely mentions the file, does
 //! not match, so a second tab opens in that case.
 
+use sha2::{Digest, Sha256};
 use crate::harness::{self, Locations};
 use serde_json::Value;
 use std::io::Read;
@@ -141,6 +142,13 @@ impl Herdr {
             .collect())
     }
 
+    /// Every tab herdr has, with its label, in every workspace.
+    pub fn tab_labels(&self) -> Result<Vec<(String, String)>, String> {
+        let v = self.call(&["tab", "list"])?;
+        let tabs = v["result"]["tabs"].as_array().ok_or("herdr's tab list has no tabs")?;
+        Ok(tabs.iter().filter_map(|t| Some((text(t, "tab_id")?, text(t, "label").unwrap_or_default()))).collect())
+    }
+
     /// The argument lists of a pane's foreground processes.
     pub fn foreground_argvs(&self, pane_id: &str) -> Result<Vec<Vec<String>>, String> {
         let v = self.call(&["pane", "process-info", "--pane", pane_id])?;
@@ -202,6 +210,8 @@ pub struct Plan {
     pub cwd_fallback: bool,
     /// The tab's label.
     pub label: String,
+    /// The session's tag: the identifier its tab label ends with (see [`session_tag`]).
+    pub tag: String,
 }
 
 impl Plan {
@@ -221,31 +231,123 @@ pub fn plan(locations: &Locations, home: &Path, fmt: &str, key: &str, title: &st
         Some(dir) => (PathBuf::from(dir), false),
         None => (home.to_path_buf(), true),
     };
-    Ok(Plan { argv, cwd, cwd_fallback, label: tab_label(fmt, title) })
+    let tag = session_tag(key);
+    Ok(Plan { argv, cwd, cwd_fallback, label: tab_label(fmt, title, &tag), tag })
 }
 
-/// The tab's label: the harness, then the session's title, on one line and at most [`LABEL_MAX`]
-/// characters.
-pub fn tab_label(fmt: &str, title: &str) -> String {
+/// The tab's label: the harness, then the session's title, then the session's tag, on one line and
+/// at most [`LABEL_MAX`] characters. The title gives way first, so the tag survives.
+pub fn tab_label(fmt: &str, title: &str, tag: &str) -> String {
     let title: String = crate::session_cols::display_safe(title).chars().filter(|c| !c.is_control()).collect();
-    let text = if title.is_empty() { format!("{fmt} session") } else { format!("{fmt}: {title}") };
-    if text.chars().count() <= LABEL_MAX {
-        return text;
+    let head = if title.is_empty() { format!("{fmt} session") } else { format!("{fmt}: {title}") };
+    let suffix = tag_suffix(tag);
+    let room = LABEL_MAX - suffix.chars().count();
+    if head.chars().count() <= room {
+        return format!("{head}{suffix}");
     }
-    let cut: String = text.chars().take(LABEL_MAX - 1).collect();
-    format!("{cut}…")
+    let cut: String = head.chars().take(room - 1).collect();
+    format!("{cut}…{suffix}")
 }
 
-/// The argument list as one line for a POSIX shell, every argument quoted, so a path with spaces
-/// or quotes arrives as one argument. An argument with a control character is refused: the line
+/// A short identifier for a session, stable across runs: the first 8 hex digits of the SHA-256 of
+/// its key.
+pub fn session_tag(key: &str) -> String {
+    Sha256::digest(key.as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The shell a herdr pane runs a typed line in. The line is quoted for that shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneShell {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+impl PaneShell {
+    /// The shell new panes of the herdr at `home` run: `default_shell` from its config.toml, else
+    /// `$SHELL` on Unix, else herdr's platform default (PowerShell on Windows).
+    pub fn current(home: &Path) -> PaneShell {
+        let config = config_path(home).and_then(|path| std::fs::read_to_string(path).ok());
+        let configured = config.as_deref().and_then(configured_shell);
+        PaneShell::resolve(configured.as_deref(), non_empty_env("SHELL").as_deref(), cfg!(windows))
+    }
+
+    /// The shell for the configured executable, else the platform's default.
+    pub fn resolve(configured: Option<&str>, env_shell: Option<&str>, windows: bool) -> PaneShell {
+        let chosen = configured.or(if windows { None } else { env_shell });
+        match chosen {
+            Some(exe) => PaneShell::from_exe(exe),
+            None if windows => PaneShell::PowerShell,
+            None => PaneShell::Posix,
+        }
+    }
+
+    /// The shell an executable is, by its file name without directory or `.exe`.
+    pub fn from_exe(exe: &str) -> PaneShell {
+        let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe).to_ascii_lowercase();
+        match name.strip_suffix(".exe").unwrap_or(&name) {
+            "pwsh" | "powershell" => PaneShell::PowerShell,
+            "cmd" => PaneShell::Cmd,
+            _ => PaneShell::Posix,
+        }
+    }
+}
+
+/// herdr's config file: `%APPDATA%\herdr\config.toml` on Windows, else under `$XDG_CONFIG_HOME` or `~/.config`.
+fn config_path(home: &Path) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return non_empty_env("APPDATA").map(|dir| PathBuf::from(dir).join("herdr").join("config.toml"));
+    }
+    let base = non_empty_env("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+    Some(base.join("herdr").join("config.toml"))
+}
+
+/// The `default_shell` set in a config.toml's `[terminal]` table, when it is set and non-empty.
+pub fn configured_shell(config: &str) -> Option<String> {
+    let mut in_terminal = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_terminal = line == "[terminal]";
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if !in_terminal || key.trim() != "default_shell" {
+            continue;
+        }
+        let value = value.trim();
+        let shell = if let Some(rest) = value.strip_prefix('"') {
+            rest.split('"').next().unwrap_or("").replace("\\\\", "\\")
+        } else if let Some(rest) = value.strip_prefix('\'') {
+            rest.split('\'').next().unwrap_or("").to_string()
+        } else {
+            value.split('#').next().unwrap_or("").to_string()
+        };
+        return Some(shell.trim().to_string()).filter(|s| !s.is_empty());
+    }
+    None
+}
+
+/// The argument list as one line for `shell`, every argument quoted, so a path with spaces or
+/// quotes arrives as one argument. An argument with a control character is refused: the line
 /// would end early in the pane.
-pub fn shell_line(argv: &[String]) -> Result<String, String> {
+pub fn shell_line(argv: &[String], shell: PaneShell) -> Result<String, String> {
     let mut parts = Vec::with_capacity(argv.len());
     for arg in argv {
         if arg.chars().any(char::is_control) {
             return Err(format!("'{}' has a control character, which a shell line cannot carry", arg.escape_debug()));
         }
-        parts.push(shell_quote(arg));
+        parts.push(match shell {
+            PaneShell::Posix => shell_quote(arg),
+            PaneShell::PowerShell => powershell_quote(arg),
+            PaneShell::Cmd => cmd_quote(arg)?,
+        });
+    }
+    // PowerShell runs a quoted program only after the call operator `&`.
+    if shell == PaneShell::PowerShell {
+        if let Some(program) = parts.first_mut() {
+            *program = format!("& {program}");
+        }
     }
     Ok(parts.join(" "))
 }
@@ -256,22 +358,79 @@ pub fn shell_quote(arg: &str) -> String {
     if plain { arg.to_string() } else { format!("'{}'", arg.replace('\'', r"'\''")) }
 }
 
-/// A pane and the argument lists of its foreground processes.
+/// One argument for PowerShell, single-quoted. PowerShell also reads the typographic single quotes
+/// as quotes, so each of those is doubled too.
+pub fn powershell_quote(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for c in arg.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// One argument for cmd.exe typed at its prompt. A double quote cannot be carried by cmd's quote
+/// handling, so it is refused. Characters cmd reads as operators or expansions are escaped with `^`
+/// outside the quotes. Trailing backslashes are doubled, so the program's argument parser does not
+/// read the closing quote as escaped.
+pub fn cmd_quote(arg: &str) -> Result<String, String> {
+    if arg.contains('"') {
+        return Err(format!("'{arg}' has a double quote, which cmd.exe cannot carry"));
+    }
+    let special = |c: char| c.is_whitespace() || "%!^&|<>()".contains(c);
+    if !arg.is_empty() && !arg.chars().any(special) {
+        return Ok(arg.to_string());
+    }
+    let mut out = String::from("\"");
+    for c in arg.chars() {
+        if "%!^&|<>()".contains(c) {
+            out.push_str(&format!("\"^{c}\""));
+        } else {
+            out.push(c);
+        }
+    }
+    out.push_str(&"\\".repeat(arg.len() - arg.trim_end_matches('\\').len()));
+    out.push('"');
+    Ok(out)
+}
+
+/// A pane, the label of its tab, and the argument lists of its foreground processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneProcs {
     pub pane_id: String,
     pub tab_id: String,
+    /// The tab's label; empty when herdr did not give one.
+    pub tab_label: String,
     pub argvs: Vec<Vec<String>>,
 }
 
-/// The pane whose foreground process was started with `ident` as a flag's value. Nothing matches
-/// an empty identifier.
-pub fn find_open_pane<'a>(panes: &'a [PaneProcs], ident: &str) -> Option<&'a PaneProcs> {
-    if ident.is_empty() {
-        return None;
-    }
-    panes.iter().find(|pane| {
-        pane.argvs.iter().any(|argv| argv.windows(2).any(|pair| pair[0].starts_with('-') && pair[1] == ident))
+/// The suffix a session's tab label ends with. sesync's tabs carry it, so a session stays findable
+/// when herdr reports no argument lists for its pane (Windows).
+fn tag_suffix(tag: &str) -> String {
+    if tag.is_empty() { String::new() } else { format!(" · {tag}") }
+}
+
+/// The pane whose foreground process was started with `ident` as a flag's value. When no pane
+/// matches that way, a pane with no foreground argument list whose tab is labelled with `tag` is
+/// the session. Nothing matches an empty identifier.
+pub fn find_open_pane<'a>(panes: &'a [PaneProcs], ident: &str, tag: &str) -> Option<&'a PaneProcs> {
+    let by_argv = if ident.is_empty() {
+        None
+    } else {
+        panes.iter().find(|pane| {
+            pane.argvs.iter().any(|argv| argv.windows(2).any(|pair| pair[0].starts_with('-') && pair[1] == ident))
+        })
+    };
+    by_argv.or_else(|| {
+        let suffix = tag_suffix(tag);
+        if suffix.is_empty() {
+            return None;
+        }
+        panes.iter().find(|pane| pane.argvs.is_empty() && pane.tab_label.ends_with(&suffix))
     })
 }
 
@@ -301,10 +460,11 @@ impl Opened {
 
 /// Focus the tab already running the session, or open a tab that resumes it. Any failure before a
 /// tab exists changes nothing; a failure to start the command closes the tab it made.
-pub fn open(herdr: &Herdr, plan: &Plan) -> Result<Opened, String> {
+pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell) -> Result<Opened, String> {
     let panes = herdr
         .panes()
         .map_err(|e| format!("herdr is not reachable ({e}); open sesync from a herdr popup while herdr runs"))?;
+    let tab_labels = herdr.tab_labels().map_err(|e| format!("could not read herdr's tabs ({e})"))?;
     let mut procs = Vec::with_capacity(panes.len());
     for pane in panes {
         // Fails closed: a pane whose processes cannot be read might be the session, so no second
@@ -312,13 +472,14 @@ pub fn open(herdr: &Herdr, plan: &Plan) -> Result<Opened, String> {
         let argvs = herdr
             .foreground_argvs(&pane.pane_id)
             .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
-        procs.push(PaneProcs { pane_id: pane.pane_id, tab_id: pane.tab_id, argvs });
+        let tab_label = tab_labels.iter().find(|(tab, _)| *tab == pane.tab_id).map(|(_, label)| label.clone()).unwrap_or_default();
+        procs.push(PaneProcs { pane_id: pane.pane_id, tab_id: pane.tab_id, tab_label, argvs });
     }
-    if let Some(running) = find_open_pane(&procs, plan.ident()) {
+    if let Some(running) = find_open_pane(&procs, plan.ident(), &plan.tag) {
         herdr.focus_tab(&running.tab_id)?;
         return Ok(Opened::Focused { tab_id: running.tab_id.clone() });
     }
-    let command = shell_line(&plan.argv)?;
+    let command = shell_line(&plan.argv, shell)?;
     let (tab_id, pane_id) = herdr.create_tab(&plan.cwd, &plan.label)?;
     if let Err(e) = herdr.run_in_pane(&pane_id, &command) {
         let _ = herdr.close_tab(&tab_id);

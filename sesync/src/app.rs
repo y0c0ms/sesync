@@ -1959,7 +1959,7 @@ impl App {
                 return;
             }
         };
-        match herdr_open::open(&self.herdr, &plan) {
+        match herdr_open::open(&self.herdr, &plan, herdr_open::PaneShell::current(&self.roots.home)) {
             Ok(opened) => {
                 self.say(opened.message(&plan));
                 self.quit = true;
