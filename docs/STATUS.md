@@ -54,6 +54,30 @@ tests win, and you fix this file. Update it at the end of every work session.
 - **Tests.** `tests/team_tab.rs` (row fields; waiting -> on the team -> changed, the pull asked for
   after a push and not after a change; the tab pulls only when stale and only with a team),
   `tests/team_pull_verified.rs` (a record signed by this device is its own).
+
+## 2026-10-27: "Open in herdr" on Windows: no per-pane wait, nothing typed in front of the command
+
+- **Seen.** On the work PC (16 herdr panes) the open showed nothing for more than five seconds, and
+  the new tab once read `exitomp --resume '…'`.
+- **Why it was slow.** Before opening, `open` asked herdr for the processes of every pane, one CLI
+  process per pane (about 0.4 s each on Windows, about 8 s in all), and it could never match there:
+  herdr on Windows reports a pane's shell (`bash.exe`), never the program inside it. Now one `tab
+  list` finds the tab sesync labelled with the session's tag; process info is asked only on Linux
+  and macOS, and only for the tagged tab's panes and panes in the session's project directory
+  (`panes_show_programs`, `Pane::cwd`). Windows: 2 calls to focus, 4 to open, whatever the number
+  of panes. The key now draws "opening … in herdr…" before the calls (`App::run_pending_open`).
+- **Why text could precede the command.** The tab was created focused and the command typed into
+  it afterwards; keys typed during the wait reached the new shell first. Reproduced paths (sandbox
+  herdr with the same config, `tab create` then `pane run`, and the full popup flow) typed the
+  command alone, so the `exit` most likely came from keys pressed while the TUI was blocked. The tab
+  is now created with `--no-focus`, the command typed, and only then focused.
+- **Tests.** `tests/herdr_open.rs` models both kinds of herdr (programs shown, shell only): the
+  calls made and their order, panes outside the session's directory never asked, 16 panes still 4
+  calls, the tag focusing in one call, the status drawn before any call.
+  `tests/herdr_open_live.rs` was Unix-only; it now runs on Windows too against a real herdr
+  (opt-in): call counts, the pane's directory, and the typed line holding the command alone.
+- **Not covered.** The live test needs a running herdr, so CI does not run it.
+
 ## 2026-10-27: the TUI opens without reading every conversation, and Esc closes it
 
 - **Why.** On the work PC the herdr popup (ctrl+alt+s, `sesync --tui`) stayed blank for seconds and

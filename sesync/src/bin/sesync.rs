@@ -1232,6 +1232,11 @@ fn run_tui(
         // Every key goes through the app, so every key cancels a pending delete the same way.
         // Ctrl+R on the Team tab asks for a network refresh; the local list refreshes in the app.
         app.handle(ev, Instant::now());
+        // "Open in herdr" takes a few herdr calls: show that it started before making them.
+        if app.has_pending_open() {
+            term.draw(|f| sesync::ui::draw(f, &app))?;
+            app.run_pending_open();
+        }
         // A team the user chose to leave goes now (a few local files), and the team records are
         // read again, so neither the share picker nor the Team tab offers it any more.
         if let Some(req) = app.take_leave_request() {

@@ -1103,19 +1103,51 @@ this, a daemon started at logon, with no `HOME`, put its state under the working
 `sesync/src/herdr_open.rs` is the only code that talks to herdr. "Open in herdr" (the session
 menu's first row, or `o`) builds a plan from the harness: `resume_argv` (the command, the
 conversation's identifier last) and `project_dir` (the new tab's directory; the home directory when
-it is unknown or gone, and the status line says so). Then it asks herdr through its CLI, one JSON
-answer per call, in this order:
+it is unknown or gone, and the status line says so). The key only plans it and says "opening …
+in herdr…"; the TUI draws that and then runs the open (`App::run_pending_open`), because every
+herdr call is a process of its own (about half a second each on Windows). The open asks:
 
-- A pane whose foreground process was started with the identifier as a flag's value
-  (`omp --resume <path>`, `claude --resume <uuid>`, `opencode --session <id>`) is that session: its
-  tab is focused and nothing starts. A bare picker, or a program that only names the file, is not.
-- Otherwise a tab opens in the directory, labelled `harness: title`, and the command is typed into
-  its root pane. If that typing fails, the tab is closed again.
-- A pane whose processes cannot be read stops the open. A copy that might be the session is never
-  started.
+- **The tab list, once.** sesync labels its tabs `harness: title · <tag>` (the tag: 8 hex digits of
+  the session key's SHA-256). Where herdr shows only a pane's shell (Windows,
+  `panes_show_programs`), a tab with this session's tag is the session: it is focused and nothing
+  starts.
+- **Process info, only for panes that can be the session** (Linux and macOS, where herdr reports a
+  pane's foreground programs): the panes of the tagged tab and the panes in the session's project
+  directory (`pane list` gives each pane's directory). A pane whose foreground process was
+  started with the identifier as a flag's value (`omp --resume <path>`, `claude --resume
+  <uuid>`, `opencode --session <id>`) is that session; a tagged pane with no foreground program is
+  too. A bare picker, or a program that only names the file, is not. A pane whose processes cannot
+  be read stops the open: a copy that might be the session is never started.
+- **Otherwise a new tab**, created unfocused in the directory, the command typed into its root
+  pane, then the tab focused. Keys pressed meanwhile stay in the popup instead of reaching the new
+  shell in front of the command. If the typing fails, the tab is closed again.
 
-Success leaves the TUI, which closes the popup. Each herdr call times out after five seconds.
-Matching is per tab: the tab of the matched pane is focused, even when other panes share it.
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant T as sesync TUI (herdr popup)
+    participant H as herdr CLI
+    U->>T: o, or Enter on "Open in herdr"
+    T->>U: "opening … in herdr…"
+    T->>H: tab list
+    alt a tab carries the session's tag (and, where herdr shows programs, runs it)
+        T->>H: tab focus
+    else not open
+        opt Linux and macOS: panes in the tagged tab or the project directory only
+            T->>H: pane list, then process info for those panes
+        end
+        T->>H: tab create --no-focus, in the project directory
+        T->>H: pane run: the resume command
+        T->>H: tab focus
+    end
+    T->>U: quits, so the popup closes onto that tab
+```
+
+On Windows that is two calls to focus and four to open, whatever the number of panes (it was one
+process-info call per pane, about eight seconds with 16 panes, and could never match there because
+herdr reported only the shell). Each herdr call times out after five seconds. Matching is per tab:
+the tab of the matched pane is focused, even when other panes share it. `tests/herdr_open_live.rs`
+checks this against a real herdr on every platform (opt-in, `--ignored`).
 
 ## Failure behaviour
 

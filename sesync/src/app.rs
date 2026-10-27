@@ -246,6 +246,8 @@ pub struct App {
     title_wanted: Vec<(String, String)>,
     /// Asked for and not answered yet, so a re-list does not ask twice.
     title_asked: std::collections::HashSet<String>,
+    /// An "Open in herdr" asked for and not run yet (see [`App::run_pending_open`]).
+    pending_open: Option<herdr_open::Plan>,
     /// Set when a key changed a field the app owns (a mark or a mirror choice); the
     /// caller saves state only then, not on every keypress.
     user_dirty: bool,
@@ -427,7 +429,7 @@ impl App {
         App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
-            defer_titles, title_wanted, title_asked: Default::default(),
+            defer_titles, title_wanted, title_asked: Default::default(), pending_open: None,
             team: Vec::new(),
             team_copies: Vec::new(),
             team_mine: Default::default(),
@@ -1939,6 +1941,8 @@ impl App {
 
     /// Open the selected session in herdr (see `herdr_open`): focus the tab that already runs it,
     /// or open a tab that resumes it. Success leaves the TUI, so the popup closes onto that tab.
+    /// The herdr calls take a moment (each is a process), so this only says what is about to
+    /// happen; the caller draws that, then calls [`App::run_pending_open`].
     fn open_in_herdr(&mut self) {
         if self.view != View::Sessions {
             self.say("herdr opens local sessions; press tab");
@@ -1952,14 +1956,25 @@ impl App {
             self.fail(format!("'{}' is no longer on disk, so there is nothing to open", g.title));
             return;
         }
-        let plan = match herdr_open::plan(&self.roots.locations, &self.roots.home, &g.fmt, &g.key, &g.title) {
-            Ok(plan) => plan,
-            Err(e) => {
-                self.fail(e);
-                return;
+        match herdr_open::plan(&self.roots.locations, &self.roots.home, &g.fmt, &g.key, &g.title) {
+            Ok(plan) => {
+                self.say(format!("opening '{}' in herdr…", plan.label));
+                self.pending_open = Some(plan);
             }
-        };
-        match herdr_open::open(&self.herdr, &plan, herdr_open::PaneShell::current(&self.roots.home)) {
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Whether an "Open in herdr" waits for [`App::run_pending_open`].
+    pub fn has_pending_open(&self) -> bool {
+        self.pending_open.is_some()
+    }
+
+    /// Run the "Open in herdr" the last key asked for.
+    pub fn run_pending_open(&mut self) {
+        let Some(plan) = self.pending_open.take() else { return };
+        let shell = herdr_open::PaneShell::current(&self.roots.home);
+        match herdr_open::open(&self.herdr, &plan, shell, herdr_open::panes_show_programs()) {
             Ok(opened) => {
                 self.say(opened.message(&plan));
                 self.quit = true;
