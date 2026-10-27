@@ -105,6 +105,27 @@ tests win, and you fix this file. Update it at the end of every work session.
   can re-seal them (only the author signs its records).
 - **Suites** (Windows, sandboxed): `sesync` 603 passed, `sesync-team` 199 passed, 0 failed.
 
+## 2026-10-27: Windows build (branch `windows-build`)
+
+Worktree `/home/yocoms/projects/sesync-wt-windows-build`, from `herdr-open` @07255a3. Committed, not pushed.
+
+- **Home directory on Windows** (`sesync/src/home.rs`; the same rule in `sesync-lock`). Every default
+  was built from `HOME` alone. A daemon started at logon has no `HOME`, so state, team credentials
+  and harness stores resolved under the working directory. Now `HOME` when usable, else
+  `USERPROFILE`; on Windows a `HOME` that is not a drive or UNC path is skipped.
+- **Saving state on Windows** (`state.rs::sync_dir`). The directory fsync (`File::open(dir)`) is
+  refused by Windows (access denied) after the rename, so every save reported "cannot save state"
+  although the file had been replaced. The directory sync is Unix-only.
+- **Cross-build.** `sesync.exe`, `sesync-conv.exe`, `sesync-lock.exe` for `x86_64-pc-windows-gnu`
+  (container, mingw 12). Imports only system DLLs (KERNEL32, msvcrt, ntdll, ws2_32, bcrypt, USERENV).
+- **Wine smoke** (Wine 11, sandboxed prefix, `env -i`, no real home): `--status`, `--once` (omp
+  session written to a Pi copy through `sesync-conv.exe`), `sesync-lock` claim/check/sweep/release
+  with a live Windows pid (second claim refused, exit 2). Not run on Windows itself.
+- **Suite** (`sh build-test.sh`, sandboxed HOME): 1005 passed, 0 failed, 1 ignored (was 997 before).
+- **Not verified**: the TUI, herdr, team join/push/pull, the logon start, real harness CLIs, the
+  Windows-side `device.key` permission model (no POSIX mode on Windows; the profile's ACL applies).
+- **Next action.** Run the team join on the work PC per `~/projects/agent-hub-notes/work-pc-join.md`.
+
 ## 2026-10-26: context fit on every message-based mirror (branch `context-fit`)
 
 Worktree `/home/yocoms/projects/sesync-wt-context-fit`, from `herdr-open`. Committed, not pushed.

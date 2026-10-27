@@ -894,7 +894,7 @@ impl State {
             drop(f);
             fs::rename(&tmp, path)?;
             if let Some(dir) = path.parent() {
-                fs::File::open(dir)?.sync_all()?;
+                sync_dir(dir)?;
             }
             Ok(())
         })();
@@ -903,4 +903,17 @@ impl State {
         }
         result
     }
+}
+
+/// Sync a directory entry after a rename. Unix only: Windows refuses to open a directory for
+/// sync (access denied), and there the rename itself is the durable step. Calling it there made
+/// every save report "cannot save state" after the file had already been replaced.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }

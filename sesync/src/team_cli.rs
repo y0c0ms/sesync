@@ -109,8 +109,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
 /// a dialog is taken literally otherwise, and `~/...` is what people type: the daemon then
 /// reported "cannot read the admin token file" while the file was right there.
 pub fn expand_user_path(input: &str) -> std::path::PathBuf {
-    expand_with(input, std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from).unwrap_or_default().as_path())
+    expand_with(input, &crate::home::home_dir())
 }
 
 /// The pure part of the expansion, so it can be tested without touching the environment.

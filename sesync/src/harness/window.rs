@@ -32,9 +32,9 @@ pub const DEFAULT_OVERHEAD: usize = 16_384;
 const TABLE: &[(&str, &str, usize)] = &[("claude", "", 200_000)];
 
 /// The `--context-*` flags `sesync-conv` takes for a copy written to `harness` from `journal`,
-/// with the window read from the process environment and `$HOME`.
+/// with the window read from the process environment and the home directory (`home::home_dir`).
 pub fn flags(harness: &str, journal: &Path) -> Vec<String> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = Some(crate::home::home_dir()).filter(|h| !h.as_os_str().is_empty());
     flags_with(harness, journal, &|k| std::env::var(k).ok(), home.as_deref())
 }
 

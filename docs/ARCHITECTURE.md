@@ -1093,6 +1093,11 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 Unknown or malformed values fall back to the default; a bad env var must never panic the
 daemon.
 
+`~` in the defaults above is the home directory: `HOME` when it is set and usable, else
+`USERPROFILE` on Windows. On Windows a `HOME` that is not a drive or UNC path (an MSYS shell's
+`/c/Users/...`) is skipped (`sesync/src/home.rs`; `sesync-lock` applies the same rule). Before
+this, a daemon started at logon, with no `HOME`, put its state under the working directory.
+
 ## Opening a session in herdr
 
 `sesync/src/herdr_open.rs` is the only code that talks to herdr. "Open in herdr" (the session

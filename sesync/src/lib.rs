@@ -6,6 +6,9 @@
 // Shared persistent state (local sources and team floors/push records).
 pub mod state;
 
+// The user's home directory, the root of every default path.
+pub mod home;
+
 // The harnesses, one module each behind one interface; everything else asks the registry.
 pub mod harness;
 
