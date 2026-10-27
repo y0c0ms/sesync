@@ -134,6 +134,66 @@ fn q_quits() {
     assert!(a.should_quit());
 }
 
+/// The TUI runs as a herdr popup (ctrl+alt+s); Esc must close it like any other popup.
+#[test]
+fn esc_quits_from_either_list() {
+    for to_team in [false, true] {
+        let sb = sandbox(if to_team { "esc-team" } else { "esc-sessions" });
+        let (roots, _) = fixture(&sb);
+        let mut a = app(&sb, roots);
+        if to_team {
+            a.handle(Ev::Tab, Instant::now());
+            assert_eq!(a.view(), View::Team);
+        }
+        a.handle(Ev::Esc, Instant::now());
+        assert!(a.should_quit(), "esc must quit (team list: {to_team})");
+    }
+}
+
+#[test]
+fn esc_clears_a_kept_filter_before_it_quits() {
+    let sb = sandbox("esc-filter");
+    let (roots, _, _) = two_sessions(&sb);
+    let mut a = app(&sb, roots);
+    a.handle(Ev::Char('/'), Instant::now());
+    for c in "second".chars() {
+        a.handle(Ev::Char(c), Instant::now());
+    }
+    a.handle(Ev::Enter, Instant::now());
+    assert_eq!(a.visible_rows().len(), 1, "the filter is kept after enter");
+    a.handle(Ev::Esc, Instant::now());
+    assert!(!a.should_quit(), "the first esc only clears the kept filter");
+    assert_eq!(a.visible_rows().len(), 2);
+    a.handle(Ev::Esc, Instant::now());
+    assert!(a.should_quit());
+}
+
+#[test]
+fn esc_on_an_armed_delete_cancels_it_and_keeps_the_tui_open() {
+    let sb = sandbox("esc-armed");
+    let (roots, path) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    let t = Instant::now();
+    a.handle(Ev::CtrlD, t);
+    a.handle(Ev::Esc, t);
+    assert!(!a.should_quit(), "backing out of a delete must not close the TUI");
+    assert_eq!(a.status(), "delete cancelled");
+    a.handle(Ev::CtrlD, t + Duration::from_secs(1));
+    assert!(path.exists(), "the cancelled arm cannot fire: this ctrl+d only re-arms");
+}
+
+#[test]
+fn esc_in_an_overlay_closes_only_the_overlay() {
+    let sb = sandbox("esc-help");
+    let (roots, _) = fixture(&sb);
+    let mut a = app(&sb, roots);
+    a.handle(Ev::Char('?'), Instant::now());
+    assert_eq!(a.mode(), Mode::Help);
+    a.handle(Ev::Esc, Instant::now());
+    assert_eq!(a.mode(), Mode::Browse);
+    assert!(!a.should_quit());
+}
+
 /// A second session in the same folder, so the list has two rows.
 fn two_sessions(sb: &PathBuf) -> (Roots, PathBuf, PathBuf) {
     let (roots, first) = fixture(sb);

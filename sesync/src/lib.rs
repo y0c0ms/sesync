@@ -39,6 +39,7 @@ pub mod remote;
 pub mod remote_http;
 pub mod session_cols;
 pub mod theme;
+pub mod title_worker;
 pub mod tui;
 pub mod ui;
 

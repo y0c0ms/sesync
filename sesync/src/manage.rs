@@ -85,25 +85,118 @@ pub fn validate_title(title: &str) -> Result<String, String> {
 
 /// Titles are read from file contents, and the TUI re-lists every few seconds. The cache
 /// keeps an unchanged file (same size and mtime) from being read again; a changed one is
-/// re-read, so a rename made in the harness shows up without a restart.
+/// re-read, so a rename made in the harness shows up without a restart. The TUI saves it
+/// (`save`, `load`) so the next start reads only the files that changed since.
 #[derive(Default)]
 pub struct TitleCache {
     entries: HashMap<String, (u64, u128, String)>,
+    dirty: bool,
+}
+
+/// One title read from a conversation, with the stamp the file had when it was read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TitleRead {
+    pub key: String,
+    pub len: u64,
+    pub ns: u128,
+    pub title: String,
+}
+
+/// The stamp a title is cached under: everything the harness reads the title from.
+fn title_stamp(path: &str, fmt: &str) -> Option<(u64, u128)> {
+    let p = Path::new(path);
+    harness::get(fmt).map_or_else(|| harness::stat(p), |h| h.title_stamp(p))
+}
+
+/// Read one conversation's title as the list shows it ("untitled" when the harness finds none).
+/// None when the conversation is gone. This opens the file; the TUI calls it off its own thread.
+pub fn read_title(path: &str, fmt: &str) -> Option<TitleRead> {
+    let (len, ns) = title_stamp(path, fmt)?;
+    let title = harness::get(fmt).map(|h| h.title(Path::new(path))).filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "untitled".into());
+    Some(TitleRead { key: path.to_string(), len, ns, title })
 }
 
 impl TitleCache {
     fn title(&mut self, path: &str, fmt: &str) -> String {
-        let h = harness::get(fmt);
-        let stamp = h.map_or_else(|| harness::stat(Path::new(path)), |h| h.title_stamp(Path::new(path)));
-        if let Some((len, ns, title)) = self.entries.get(path) {
-            if stamp == Some((*len, *ns)) {
-                return title.clone();
+        if let Some(title) = self.known(path, fmt) {
+            return title;
+        }
+        match read_title(path, fmt) {
+            Some(read) => {
+                let title = read.title.clone();
+                self.put(read);
+                title
+            }
+            None => "untitled".into(),
+        }
+    }
+
+    /// The cached title when the file has not changed since it was read. Looks at the file's
+    /// size and change time only, never its contents.
+    fn known(&self, path: &str, fmt: &str) -> Option<String> {
+        let (len, ns, title) = self.entries.get(path)?;
+        (title_stamp(path, fmt) == Some((*len, *ns))).then(|| title.clone())
+    }
+
+    /// The last title read for this file, current or not.
+    fn last(&self, path: &str) -> Option<String> {
+        self.entries.get(path).map(|(_, _, t)| t.clone())
+    }
+
+    /// Keep a title read elsewhere (the TUI's title worker).
+    pub fn put(&mut self, read: TitleRead) {
+        self.entries.insert(read.key, (read.len, read.ns, read.title));
+        self.dirty = true;
+    }
+
+    /// Drop the files that are no longer listed, so the saved cache does not grow forever.
+    fn retain(&mut self, listed: &std::collections::HashSet<String>) {
+        let before = self.entries.len();
+        self.entries.retain(|k, _| listed.contains(k));
+        self.dirty |= self.entries.len() != before;
+    }
+
+    /// Whether there is something to save.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// The cache a previous run saved. A missing or unreadable file is an empty cache: every
+    /// title is read again, nothing is lost.
+    pub fn load(path: &Path) -> TitleCache {
+        let mut cache = TitleCache::default();
+        let Ok(text) = std::fs::read_to_string(path) else { return cache };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return cache };
+        if v.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return cache;
+        }
+        for (key, e) in v.get("titles").and_then(serde_json::Value::as_object).into_iter().flatten() {
+            let len = e.get("len").and_then(serde_json::Value::as_u64);
+            let ns = e.get("ns").and_then(serde_json::Value::as_str).and_then(|s| s.parse::<u128>().ok());
+            let title = e.get("title").and_then(serde_json::Value::as_str);
+            if let (Some(len), Some(ns), Some(title)) = (len, ns, title) {
+                cache.entries.insert(key.clone(), (len, ns, title.to_string()));
             }
         }
-        let Some((len, ns)) = stamp else { return "untitled".into() };
-        let title = h.map(|h| h.title(Path::new(path))).filter(|t| !t.is_empty()).unwrap_or_else(|| "untitled".into());
-        self.entries.insert(path.to_string(), (len, ns, title.clone()));
-        title
+        cache
+    }
+
+    /// Write the cache for the next run: a temporary file renamed into place, so a crash leaves
+    /// the old cache or the new one, never half of one.
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        let titles: serde_json::Map<String, serde_json::Value> = self.entries.iter()
+            .map(|(k, (len, ns, title))| (k.clone(), serde_json::json!({"len": len, "ns": ns.to_string(), "title": title})))
+            .collect();
+        let body = serde_json::json!({"version": 1, "titles": titles});
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&body)?)?;
+        std::fs::rename(&tmp, path)?;
+        self.dirty = false;
+        Ok(())
     }
 }
 
@@ -114,9 +207,27 @@ pub fn list_groups(roots: &Roots, state: &State) -> Vec<Group> {
     list_groups_cached(roots, state, &mut TitleCache::default())
 }
 
-/// The same list, reusing titles already read for unchanged files. The TUI holds one
-/// cache for its lifetime; callers that list once can use [`list_groups`].
+/// The same list, reusing titles already read for unchanged files. Callers that list once can
+/// use [`list_groups`]. Reads the title of every changed file before it returns.
 pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) -> Vec<Group> {
+    list_groups_with(roots, state, cache, None)
+}
+
+/// The same list without opening any conversation: a title comes from the cache when the file is
+/// unchanged, else the last title read, else the one the daemon recorded, else "untitled". The
+/// conversations whose title still has to be read come back as (key, harness), for a worker.
+pub fn list_groups_deferred(roots: &Roots, state: &State, cache: &mut TitleCache) -> (Vec<Group>, Vec<(String, String)>) {
+    let mut wanted = Vec::new();
+    let groups = list_groups_with(roots, state, cache, Some(&mut wanted));
+    (groups, wanted)
+}
+
+fn list_groups_with(
+    roots: &Roots,
+    state: &State,
+    cache: &mut TitleCache,
+    mut wanted: Option<&mut Vec<(String, String)>>,
+) -> Vec<Group> {
     let mut by_key: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
 
     // Files on disk, every file harness's conversations.
@@ -129,15 +240,26 @@ pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) 
     // A copy sesync keeps is shown under its source, never as a session of its own: a row for it
     // would let the user pick targets for a mirror, which makes it a source of its own copies.
     let recorded = state.mirror_paths();
+    let mut listed = std::collections::HashSet::new();
     for (key, fmt) in on_disk {
         if state.mirror_keys.contains(&key) || recorded.contains(&key) {
             continue;
         }
-        let title = cache.title(&key, fmt);
+        let title = match wanted.as_deref_mut() {
+            None => cache.title(&key, fmt),
+            Some(wanted) => cache.known(&key, fmt).unwrap_or_else(|| {
+                wanted.push((key.clone(), fmt.to_string()));
+                cache.last(&key)
+                    .or_else(|| state.sources.get(&key).map(|s| s.title.clone()).filter(|t| !t.is_empty()))
+                    .unwrap_or_else(|| "untitled".into())
+            }),
+        };
+        listed.insert(key.clone());
         let mut g = Group::file(fmt, key.clone(), &title);
         g.updated = crate::mirror::copy_mtime(fmt, Path::new(&key));
         by_key.insert(key.clone(), g);
     }
+    cache.retain(&listed);
 
     // A store harness's sessions are rows in its database, not files: each store is read once,
     // and a recorded session there is missing only when the store no longer lists it. A store that
