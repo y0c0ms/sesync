@@ -67,3 +67,8 @@ pub mod turns;
 
 // Phone bridge: `sesync bridge`, the WebSocket server the Orca app pairs with. Only that subcommand runs it.
 pub mod bridge;
+
+// Test-only: the shared staging helper for fake CLIs (the same file the integration tests include).
+#[cfg(all(test, unix))]
+#[path = "../tests/support/fake_cli.rs"]
+pub(crate) mod fake_cli;

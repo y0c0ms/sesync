@@ -11,6 +11,10 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+#[path = "support/fake_cli.rs"]
+mod fake_cli;
+
 fn sandbox(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("hs-edge-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
@@ -20,7 +24,6 @@ fn sandbox(name: &str) -> PathBuf {
 
 #[test]
 fn a_database_with_no_session_table_gives_no_sessions_and_does_not_crash() {
-    let _exec = exec_guard();
     let sb = sandbox("noschema");
     let db = sb.join("opencode.db");
     Connection::open(&db).unwrap().execute_batch("create table other (x integer);").unwrap();
@@ -29,7 +32,6 @@ fn a_database_with_no_session_table_gives_no_sessions_and_does_not_crash() {
 
 #[test]
 fn a_prompt_row_with_broken_json_is_skipped_and_the_next_prompt_is_used() {
-    let _exec = exec_guard();
     let sb = sandbox("badjson");
     let db = sb.join("opencode.db");
     let c = Connection::open(&db).unwrap();
@@ -48,14 +50,12 @@ fn a_prompt_row_with_broken_json_is_skipped_and_the_next_prompt_is_used() {
 #[cfg(unix)]
 #[test]
 fn a_converter_that_writes_no_file_is_an_error_and_leaves_no_mirror() {
-    let _exec = exec_guard();
     let sb = sandbox("nofile");
     let src = sb.join("src.jsonl");
     fs::write(&src, "{\"type\":\"session\",\"version\":3,\"id\":\"aaaaaaaa-1111-2222-3333-444444444444\",\"timestamp\":\"2026-10-01T10:00:00.000Z\",\"cwd\":\"/tmp\"}\n").unwrap();
     // A converter that exits 0 but prints no output path.
     let fake = sb.join("silent-sesync_conv");
-    fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
-    stage_exec(&fake);
+    fake_cli::stage(&fake, "#!/bin/sh\nexit 0\n");
     let store = sb.join("pi-agent");
     let pi = sesync::harness::get("pi").expect("pi is a harness");
     let r = pi.install(&Location { root: store.clone(), cli: None }, &Tools { home: &sb, sesync_conv: &fake }, &src, "id-x", "t");
@@ -68,7 +68,6 @@ fn a_converter_that_writes_no_file_is_an_error_and_leaves_no_mirror() {
 
 #[test]
 fn a_lock_command_that_cannot_run_skips_the_work_fail_closed() {
-    let _exec = exec_guard();
     // The lock tool is installed but cannot run. A write without the claim could race a
     // live turn, so the work must not run; the reason is reported instead.
     let sb = sandbox("failclosed");
@@ -78,22 +77,4 @@ fn a_lock_command_that_cannot_run_skips_the_work_fail_closed() {
     let out = with_claim(&fake, Some(&sb), "conv", "daemon", 1, "/src", || ran = true);
     assert!(!ran, "the work must not run when the lock tool cannot claim");
     assert!(matches!(&out, ClaimOutcome::Failed(e) if e.starts_with("cannot run lock tool")), "got {out:?}");
-}
-
-/// Make a fake CLI executable. Callers hold exec_guard(), so no fork races the write.
-#[cfg(unix)]
-#[allow(dead_code)]
-fn stage_exec(p: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-/// Writing an executable while another test thread forks can make that exec fail with
-/// "Text file busy" (ETXTBSY): the forked child briefly inherits the open write handle.
-/// Every test in this file that writes a fake CLI or runs one holds this lock, so no
-/// fork happens while a script is open for writing.
-#[allow(dead_code)]
-fn exec_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

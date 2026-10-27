@@ -7,6 +7,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+#[path = "support/fake_cli.rs"]
+mod fake_cli;
+
 const BIN: &str = env!("CARGO_BIN_EXE_sesync");
 
 fn sesync_conv() -> PathBuf {
@@ -234,9 +238,7 @@ fn an_opencode_session_mirrors_into_the_chosen_harness() {
     // The fake CLI answers `export ses_live` with a real export payload; no harness CLI runs.
     let json = r#"{"info":{"id":"ses_live","directory":"/tmp/proj","title":"OC Mirror Title","time":{"created":1,"updated":1}},"messages":[{"info":{"id":"m1","role":"user","sessionID":"ses_live","time":{"created":1}},"parts":[{"id":"p1","type":"text","text":"opencode mirror text","messageID":"m1","sessionID":"ses_live"}]}]}"#;
     let fake = sb.join("fake-opencode");
-    fs::write(&fake, format!("#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\n")).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    fake_cli::stage(&fake, &format!("#!/bin/sh\ncat <<'EOF'\n{json}\nEOF\n"));
     fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
 
     let run = |max_age: &str| {

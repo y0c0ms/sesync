@@ -211,7 +211,9 @@ module and nothing else:
    (a large transcript, a database). `harness/journal.rs` has the JSONL helpers.
 2. Declare it in `harness/mod.rs` and list it in `ALL` (the picker's order).
 3. Test its own reads and writes under `sesync/tests/` with a fake CLI and the real converter;
-   never the real CLI.
+   never the real CLI. Stage the fake with `fake_cli::stage` (`sesync/tests/support/fake_cli.rs`), never by
+   writing a script and `chmod`-ing it: a test that execs a file it just wrote races every forking test
+   thread into ETXTBSY ("Text file busy").
 
 The scan, turn-taking, mirror writes and cleanup, the team push, and the TUI's list, picker,
 titles, renames, icons and preview all come from the registry.

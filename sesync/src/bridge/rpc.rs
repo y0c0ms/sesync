@@ -761,9 +761,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sesync-rpc-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = dir.join("sesync-lock");
-        std::fs::write(&tool, "#!/bin/sh\ncase \"$1\" in claim) echo 'claude 4242'; exit 2;; esac\nexit 1\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_cli::stage(&tool, "#!/bin/sh\ncase \"$1\" in claim) echo 'claude 4242'; exit 2;; esac\nexit 1\n");
         let mut c = ctx(Arc::new(Fixed(vec![c_])), h.clone());
         c.locks = LockTools { sesync_lock: tool, lock_dir: dir.clone() };
         let (conn, _rx) = conn();

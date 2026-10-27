@@ -129,9 +129,7 @@ mod tests {
             "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  claim) if [ -n '{holder_line}' ]; then echo '{holder_line}'; exit 2; fi; echo \"phone $4\"; exit 0;;\n  release) exit 0;;\nesac\nexit 1\n",
             log = log.display(),
         );
-        std::fs::write(&bin, script).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_cli::stage(&bin, &script);
         bin
     }
 

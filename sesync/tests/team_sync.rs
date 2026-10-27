@@ -12,6 +12,9 @@ use sesync_team::signed_records::{seal_record, sequence_of};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+#[path = "support/fake_cli.rs"]
+mod fake_cli;
 
 /// The canonical bytes for a `fmt` session, built the way the team pass builds them: `conv` is the
 /// converter, `cli` the harness's own command when the test provides one.
@@ -317,9 +320,7 @@ cat <<'JSON'
 JSON
 "#.to_string()
     };
-    std::fs::write(&path, body).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake_cli::stage(&path, &body);
     path
 }
 

@@ -11,6 +11,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+#[path = "support/fake_cli.rs"]
+mod fake_cli;
+
 const BIN: &str = env!("CARGO_BIN_EXE_sesync");
 const OMP_ID: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 
@@ -407,10 +411,8 @@ fn busy_converter(sb: &Path) -> PathBuf {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let p = sb.join("busy-conv.sh");
-        fs::write(&p, "#!/bin/sh\necho 'sesync_conv: title written to annotations' >&2\nexit 2\n").unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        fake_cli::stage(&p, "#!/bin/sh\necho 'sesync_conv: title written to annotations' >&2\nexit 2\n");
         p
     }
 }
