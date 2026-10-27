@@ -802,3 +802,84 @@ fn the_daemon_says_once_that_a_join_waits_and_starts_syncing_once_approved() {
     assert!(stderr.contains("team pull [personal]: 0 shown"), "the approved team is pulled in the same step: {stderr}");
     assert!(trust_of(&team_join::load(&credential_path(&cfg, "personal")).unwrap()).is_some(), "the list is stored");
 }
+
+// ----- a member list change ---------------------------------------------------------------------
+
+/// One team pass of a member's daemon (`team_pass::run`, as the daemon calls it), with `text` as the
+/// content of every session it shares, last written long before `now`.
+fn daemon_pass(cfg: &Path, state: &mut State, now: f64, text: &[u8]) -> sesync::team_sync::TeamPass {
+    let mut passes = sesync::team_pass::run(cfg, state, now, |_| Ok(text.to_vec()), |_| Some(0.0))
+        .expect("the team pass runs");
+    assert_eq!(passes.len(), 1, "one team");
+    passes.remove(0)
+}
+
+fn texts(out: &sesync::team_pull_verified::PullOutcome) -> Vec<(String, Vec<u8>)> {
+    out.shown.iter().map(|r| (r.conversation.clone(), r.text.clone())).collect()
+}
+
+#[test]
+fn a_shared_session_stays_readable_for_every_member_after_one_is_added() {
+    let srv = TeamServer::start(T0);
+    let admin = sandbox("rs-admin");
+    let (acfg, bcfg, ccfg) = (sandbox("rs-alice"), sandbox("rs-bob"), sandbox("rs-carol"));
+    srv.create(&admin, "personal", &["alice", "bob", "carol"]);
+    srv.admit(&admin, &acfg, "personal", "alice", "laptop");
+    srv.set_now(T0 + 60);
+    srv.admit(&admin, &bcfg, "personal", "bob", "bob-box");
+
+    let mut alice = State::default();
+    alice.share("conv-1", "personal");
+    assert_eq!(daemon_pass(&acfg, &mut alice, 1000.0, b"alice's turn").pushed, vec!["conv-1".to_string()]);
+    assert_eq!(texts(&pull(&srv, &bcfg, "personal")), vec![("conv-1".to_string(), b"alice's turn".to_vec())]);
+
+    // A new member moves the list. Readers on the new list refuse the record sealed under the old
+    // one, and the new member was not one of its recipients.
+    srv.set_now(T0 + 120);
+    srv.admit(&admin, &ccfg, "personal", "carol", "carol-pc");
+    let before = pull(&srv, &bcfg, "personal");
+    assert!(before.shown.is_empty() && before.dropped == 1, "the old-list record is refused until it is re-sealed");
+
+    // The author's next pass seals the unchanged content again under the current list.
+    let pass = daemon_pass(&acfg, &mut alice, 2000.0, b"alice's turn");
+    assert_eq!(pass.resealed, vec!["conv-1".to_string()]);
+    assert!(pass.pushed.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    for cfg in [&bcfg, &ccfg, &acfg] {
+        assert_eq!(texts(&pull(&srv, cfg, "personal")), vec![("conv-1".to_string(), b"alice's turn".to_vec())],
+            "every member reads it again, the one just added too");
+    }
+
+    // Once per list change: the next pass has nothing to do.
+    let again = daemon_pass(&acfg, &mut alice, 3000.0, b"alice's turn");
+    assert!(again.resealed.is_empty() && again.pushed.is_empty(), "{again:?}");
+    assert_eq!(again.skipped_unchanged, vec!["conv-1".to_string()]);
+}
+
+#[test]
+fn a_member_never_reseals_a_conversation_someone_else_wrote_last() {
+    let srv = TeamServer::start(T0);
+    let admin = sandbox("rs2-admin");
+    let (acfg, bcfg, ccfg) = (sandbox("rs2-alice"), sandbox("rs2-bob"), sandbox("rs2-carol"));
+    srv.create(&admin, "personal", &["alice", "bob", "carol"]);
+    srv.admit(&admin, &acfg, "personal", "alice", "laptop");
+    srv.set_now(T0 + 60);
+    srv.admit(&admin, &bcfg, "personal", "bob", "bob-box");
+
+    // Both share the conversation; Bob wrote the newest version.
+    let (mut alice, mut bob) = (State::default(), State::default());
+    alice.share("conv-1", "personal");
+    bob.share("conv-1", "personal");
+    daemon_pass(&acfg, &mut alice, 1000.0, b"older, from alice");
+    daemon_pass(&bcfg, &mut bob, 1100.0, b"newer, from bob");
+
+    srv.set_now(T0 + 120);
+    srv.admit(&admin, &ccfg, "personal", "carol", "carol-pc");
+
+    // Alice's copy is unchanged since her push, but the stored record is Bob's: sending hers would
+    // replace his newer content.
+    let pass = daemon_pass(&acfg, &mut alice, 2000.0, b"older, from alice");
+    assert!(pass.resealed.is_empty() && pass.pushed.is_empty(), "{pass:?}");
+    // Bob re-seals his own, and that is what everyone reads.
+    assert_eq!(daemon_pass(&bcfg, &mut bob, 2000.0, b"newer, from bob").resealed, vec!["conv-1".to_string()]);
+    assert_eq!(texts(&pull(&srv, &ccfg, "personal")), vec![("conv-1".to_string(), b"newer, from bob".to_vec())]);
+}

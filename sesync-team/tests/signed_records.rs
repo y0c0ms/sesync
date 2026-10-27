@@ -3,7 +3,7 @@
 //! conversation the reader expects, the author is listed, the list version is not older than the
 //! reader's, the signature verifies, and the sequence is not below the reader's floor.
 use sesync_team::membership::{Device, MemberList, Verifier};
-use sesync_team::signed_records::{open_record, seal_record, Binding, Opened, RecordError};
+use sesync_team::signed_records::{authorship, open_record, seal_record, Authorship, Binding, Opened, RecordError};
 
 fn setup() -> (Device, Device, Device) {
     (Device::generate(), Device::generate(), Device::generate()) // admin, writer, reader
@@ -196,4 +196,36 @@ fn a_record_round_trips_through_seal_and_open_with_its_metadata() {
     let got = open_record(&v, &expect("personal", "ses_rt"), &rec).unwrap();
     assert_eq!(got.content, Vec::<u8>::new(), "empty content is allowed");
     assert_eq!((got.sequence, got.list_version), (9, 4));
+}
+
+// ----- authorship: is the stored record still mine? ---------------------------------------------
+
+#[test]
+fn authorship_names_the_writer_of_a_record_sealed_under_any_list() {
+    // No member list is consulted: a writer can recognise its own record even after the list it
+    // sealed under has been replaced.
+    let (_admin, writer, _reader) = setup();
+    let rec = seal_record(&writer, 3, 7, "personal", "ses_a", b"text").unwrap();
+    assert_eq!(authorship(&expect("personal", "ses_a"), &rec),
+        Ok(Authorship { author: writer.public_key().to_vec(), list_version: 3, sequence: 7 }));
+}
+
+#[test]
+fn a_header_naming_another_author_proves_nothing() {
+    // A server rewriting the author field to make a machine believe a record is its own: the
+    // signature no longer matches the author the header names.
+    let (_admin, writer, me) = setup();
+    let mut rec = seal_record(&writer, 1, 4, "personal", "ses_a", b"text").unwrap();
+    rec[3..3 + 32].copy_from_slice(&me.public_key());
+    assert_eq!(authorship(&expect("personal", "ses_a"), &rec), Err(RecordError::BadSignature));
+}
+
+#[test]
+fn authorship_refuses_a_replay_below_the_floor_and_another_conversation() {
+    let (_admin, writer, _reader) = setup();
+    let old = seal_record(&writer, 1, 5, "personal", "ses_a", b"old text").unwrap();
+    let floor = Binding { space: "personal".into(), conversation: "ses_a".into(), min_sequence: 6 };
+    assert_eq!(authorship(&floor, &old), Err(RecordError::Rollback { have: 6, got: 5 }),
+        "an older record of mine, replayed, is not taken as the stored one");
+    assert_eq!(authorship(&expect("personal", "ses_b"), &old), Err(RecordError::WrongConversation));
 }
