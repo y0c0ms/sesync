@@ -1,0 +1,68 @@
+//! Whether a program runs under a shell, read from the operating system's process list. herdr on
+//! Windows reports only a pane's shell (`pane process-info` gives the shell and its pid, never the
+//! program inside), so "Open in herdr" asks Windows itself whether that shell is idle.
+
+/// Processes that do not count as a program running in a pane: shells (Git Bash's `bash.exe`
+/// launcher starts a second `bash.exe`), console hosts, and the helpers a prompt runs for a moment
+/// (the git branch in the prompt).
+const NOT_A_PROGRAM: [&str; 10] = [
+    "bash.exe", "sh.exe", "cmd.exe", "pwsh.exe", "powershell.exe", "conhost.exe", "openconsole.exe",
+    "git.exe", "starship.exe", "oh-my-posh.exe",
+];
+
+/// Whether a process other than a shell, a console host or a prompt helper runs anywhere below
+/// `pid`. None when the process list cannot be read, or off Windows (not needed there).
+pub fn program_running_under(pid: u32) -> Option<bool> {
+    let procs = processes()?;
+    Some(runs_a_program(&procs, pid))
+}
+
+/// The decision on a process list of (pid, parent pid, executable name).
+pub fn runs_a_program(procs: &[(u32, u32, String)], root: u32) -> bool {
+    let mut frontier = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid, name) in procs {
+            if *ppid != parent || !seen.insert(*pid) {
+                continue;
+            }
+            if !NOT_A_PROGRAM.contains(&name.to_ascii_lowercase().as_str()) {
+                return true;
+            }
+            frontier.push(*pid);
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn processes() -> Option<Vec<(u32, u32, String)>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot handle is closed on every path; the entry is a plain struct sized as the
+    // API requires.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut entry) != 0;
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            out.push((entry.th32ProcessID, entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..len])));
+            more = Process32NextW(snap, &mut entry) != 0;
+        }
+        CloseHandle(snap);
+        Some(out)
+    }
+}
+
+#[cfg(not(windows))]
+fn processes() -> Option<Vec<(u32, u32, String)>> {
+    None
+}

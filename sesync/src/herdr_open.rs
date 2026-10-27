@@ -165,6 +165,12 @@ impl Herdr {
             .collect())
     }
 
+    /// The pid of a pane's shell, when herdr reports it.
+    pub fn shell_pid(&self, pane_id: &str) -> Result<Option<u32>, String> {
+        let v = self.call(&["pane", "process-info", "--pane", pane_id])?;
+        Ok(v["result"]["process_info"]["shell_pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()))
+    }
+
     /// Open a tab in `cwd` without switching to it. Returns the tab's id and its root pane's id.
     pub fn create_tab(&self, cwd: &Path, label: &str) -> Result<(String, String), String> {
         let cwd = cwd.display().to_string();
@@ -441,6 +447,9 @@ pub fn find_open_pane<'a>(panes: &'a [PaneProcs], ident: &str, tag: &str) -> Opt
 pub enum Opened {
     /// A pane already runs this session: its tab is focused and nothing starts.
     Focused { tab_id: String },
+    /// The tab sesync opened for this session was idle (after a herdr restart, say): the resume
+    /// command was typed into it again.
+    Resumed { tab_id: String },
     /// A new tab runs the resume command.
     Created { tab_id: String },
 }
@@ -450,6 +459,7 @@ impl Opened {
     pub fn message(&self, plan: &Plan) -> String {
         match self {
             Opened::Focused { .. } => format!("'{}' is already open in herdr; focused its tab", plan.label),
+            Opened::Resumed { .. } => format!("resumed '{}' in its herdr tab", plan.label),
             Opened::Created { .. } if plan.cwd_fallback => format!(
                 "opened '{}' in a new herdr tab, in {} (the session's own directory is unknown or gone)",
                 plan.label,
@@ -460,54 +470,88 @@ impl Opened {
     }
 }
 
-/// Whether herdr's process info shows the programs running inside a pane's shell. On Linux and
-/// macOS it reports the pane's foreground process group (omp, claude, ...); on Windows only the
-/// pane's own process, the shell, so a session cannot be recognised by its command line there.
-pub fn panes_show_programs() -> bool {
-    !cfg!(windows)
+/// How [`open`] tells whether a pane runs the session.
+pub enum Detect<'a> {
+    /// herdr's process info shows the programs running in a pane's shell (Linux, macOS).
+    Programs,
+    /// herdr shows only the shell (Windows): a pane runs something when this says a program runs
+    /// below its shell's pid (`proc_tree::program_running_under`); None when it cannot tell.
+    ShellOnly(&'a dyn Fn(u32) -> Option<bool>),
+}
+
+impl Detect<'static> {
+    /// This platform's way.
+    pub fn platform() -> Detect<'static> {
+        if cfg!(windows) { Detect::ShellOnly(&crate::proc_tree::program_running_under) } else { Detect::Programs }
+    }
 }
 
 /// Focus the tab already running the session, or open a tab that resumes it. Any failure before a
 /// tab exists changes nothing; a failure to start the command closes the tab it made.
 ///
 /// Every herdr call is a process of its own (about half a second on Windows), so only what can
-/// answer is asked: the tab list for the tab sesync labelled with the session's tag, and, where
-/// herdr shows a pane's programs (`panes_show_programs`), the processes of the panes in that tab
-/// or in the session's project directory only. The new tab is focused after its command is typed,
-/// so keys pressed meanwhile never reach its shell.
-pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, panes_show_programs: bool) -> Result<Opened, String> {
+/// answer is asked: the tab list for the tab sesync labelled with the session's tag, then the
+/// processes of the panes that can be the session (`Detect`). Where herdr shows programs, those are
+/// the tagged tab's panes and the panes in the session's project directory; where it shows only the
+/// shell, the tagged tab's panes, and an idle one gets the command again instead of a second tab.
+/// A new tab is focused after its command is typed, so keys pressed meanwhile never reach its shell.
+pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Result<Opened, String> {
     let tab_labels = herdr
         .tab_labels()
         .map_err(|e| format!("herdr is not reachable ({e}); open sesync from a herdr popup while herdr runs"))?;
     let suffix = tag_suffix(&plan.tag);
     let tagged = tab_labels.iter().find(|(_, label)| !suffix.is_empty() && label.ends_with(&suffix)).map(|(tab, _)| tab.clone());
-    let running = if panes_show_programs {
-        let panes = herdr.panes().map_err(|e| format!("could not read herdr's panes ({e})"))?;
-        let mut procs = Vec::new();
-        for pane in panes {
-            let in_tagged_tab = tagged.as_deref() == Some(pane.tab_id.as_str());
-            let in_project = pane.cwd.as_deref().is_some_and(|cwd| Path::new(cwd) == plan.cwd);
-            if !in_tagged_tab && !in_project {
-                continue;
-            }
-            // Fails closed: a pane whose processes cannot be read might be the session, so no
-            // second copy is started.
-            let argvs = herdr
-                .foreground_argvs(&pane.pane_id)
-                .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
-            let tab_label = tab_labels.iter().find(|(tab, _)| *tab == pane.tab_id).map(|(_, label)| label.clone()).unwrap_or_default();
-            procs.push(PaneProcs { pane_id: pane.pane_id, tab_id: pane.tab_id, tab_label, argvs });
-        }
-        find_open_pane(&procs, plan.ident(), &plan.tag).map(|pane| pane.tab_id.clone())
-    } else {
-        // Only the shell is visible: the tab sesync opened for this session is the session.
-        tagged
-    };
-    if let Some(tab_id) = running {
-        herdr.focus_tab(&tab_id)?;
-        return Ok(Opened::Focused { tab_id });
-    }
     let command = shell_line(&plan.argv, shell)?;
+    match detect {
+        Detect::Programs => {
+            let panes = herdr.panes().map_err(|e| format!("could not read herdr's panes ({e})"))?;
+            let mut procs = Vec::new();
+            for pane in panes {
+                let in_tagged_tab = tagged.as_deref() == Some(pane.tab_id.as_str());
+                let in_project = pane.cwd.as_deref().is_some_and(|cwd| Path::new(cwd) == plan.cwd);
+                if !in_tagged_tab && !in_project {
+                    continue;
+                }
+                // Fails closed: a pane whose processes cannot be read might be the session, so no
+                // second copy is started.
+                let argvs = herdr
+                    .foreground_argvs(&pane.pane_id)
+                    .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
+                let tab_label = tab_labels.iter().find(|(tab, _)| *tab == pane.tab_id).map(|(_, label)| label.clone()).unwrap_or_default();
+                procs.push(PaneProcs { pane_id: pane.pane_id, tab_id: pane.tab_id, tab_label, argvs });
+            }
+            if let Some(pane) = find_open_pane(&procs, plan.ident(), &plan.tag) {
+                herdr.focus_tab(&pane.tab_id)?;
+                return Ok(Opened::Focused { tab_id: pane.tab_id.clone() });
+            }
+        }
+        Detect::ShellOnly(program_running_under) => {
+            if let Some(tab_id) = tagged {
+                let panes = herdr.panes().map_err(|e| format!("could not read herdr's panes ({e})"))?;
+                let mut idle = None;
+                for pane in panes.into_iter().filter(|p| p.tab_id == tab_id) {
+                    let pid = herdr
+                        .shell_pid(&pane.pane_id)
+                        .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
+                    // Fails closed: unknown means it might be the session running.
+                    match pid.and_then(program_running_under) {
+                        Some(false) => idle = idle.or(Some(pane.pane_id)),
+                        _ => {
+                            herdr.focus_tab(&tab_id)?;
+                            return Ok(Opened::Focused { tab_id });
+                        }
+                    }
+                }
+                if let Some(pane_id) = idle {
+                    herdr
+                        .run_in_pane(&pane_id, &command)
+                        .map_err(|e| format!("could not start the resume command in herdr: {e}"))?;
+                    herdr.focus_tab(&tab_id)?;
+                    return Ok(Opened::Resumed { tab_id });
+                }
+            }
+        }
+    }
     let (tab_id, pane_id) = herdr.create_tab(&plan.cwd, &plan.label)?;
     if let Err(e) = herdr.run_in_pane(&pane_id, &command) {
         let _ = herdr.close_tab(&tab_id);
