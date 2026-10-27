@@ -92,7 +92,7 @@ fn a_verified_record_is_returned_for_display() {
     let src = Fake { records: vec![("ses_1".into(), rec)] };
     let out = pull_verified(&src, &reader, Some(&t), &no_floor());
     assert_eq!(out.shown.len(), 1);
-    assert_eq!(out.shown[0], PulledRecord { conversation: "ses_1".into(), text: b"the text".to_vec() });
+    assert_eq!(out.shown[0], PulledRecord { conversation: "ses_1".into(), text: b"the text".to_vec(), mine: false });
     assert_eq!(out.dropped, 0);
     assert_eq!(out.rolled_back, 0);
     assert_eq!(out.accepted.get("ses_1"), Some(&1), "the accepted sequence is reported");
@@ -256,7 +256,23 @@ fn a_conversation_with_no_floor_is_still_fetched_even_when_others_are_skipped() 
     let out = pull_verified(&src, &reader, Some(&t), &floors);
     assert_eq!(out.unchanged, 1, "ses_a has a floor at its advertised sequence: skipped");
     assert_eq!(src.fetches.get(), 1, "only ses_b, which has no floor, was fetched");
-    assert_eq!(out.shown, vec![PulledRecord { conversation: "ses_b".into(), text: b"b".to_vec() }]);
+    assert_eq!(out.shown, vec![PulledRecord { conversation: "ses_b".into(), text: b"b".to_vec(), mine: false }]);
+    for d in [&w, &r] { let _ = std::fs::remove_dir_all(d); }
+}
+
+#[test]
+fn a_record_this_device_wrote_is_marked_as_its_own() {
+    let w = dir("minew"); let r = dir("miner");
+    let admin = Device::generate();
+    let other = load_or_create(&w).unwrap();
+    let me = load_or_create(&r).unwrap();
+    let t = trust(&admin, &[&other, &me]);
+    let mine = seal_for_devices(&me, &t, "personal", "ses_mine", 1, b"m").unwrap();
+    let theirs = seal_for_devices(&other, &t, "personal", "ses_theirs", 1, b"t").unwrap();
+    let src = Fake { records: vec![("ses_mine".into(), mine), ("ses_theirs".into(), theirs)] };
+    let out = pull_verified(&src, &me, Some(&t), &no_floor());
+    let own: Vec<(&str, bool)> = out.shown.iter().map(|r| (r.conversation.as_str(), r.mine)).collect();
+    assert_eq!(own, vec![("ses_mine", true), ("ses_theirs", false)], "authorship comes from the record's signature");
     for d in [&w, &r] { let _ = std::fs::remove_dir_all(d); }
 }
 

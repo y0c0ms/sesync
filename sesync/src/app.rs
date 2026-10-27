@@ -254,6 +254,8 @@ pub struct App {
     /// Every verified copy the last pull returned, by team. `team` is built from these (the
     /// newest copy of each conversation), and leaving a team removes only that team's copies.
     team_copies: Vec<crate::team_watch::TeamCopy>,
+    /// Conversations whose shown copy this device wrote.
+    team_mine: std::collections::HashSet<String>,
     /// Cursor into `team`, kept separate from the session cursor.
     team_index: usize,
     /// Ids imported in this run, in order. Recorded so the result can be shown.
@@ -367,6 +369,32 @@ pub struct TranscriptView {
 /// How many lines a transcript shows before the head is cut.
 pub const TRANSCRIPT_MAX_LINES: usize = 4000;
 
+/// How long a team pull stays current for the Team tab: opening the tab after that pulls again.
+pub const TEAM_LIST_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One row of the Team list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamRow {
+    pub title: String,
+    /// The conversation id's first 8 characters, enough to tell rows apart.
+    pub short_id: String,
+    /// "this machine" when this device wrote the copy shown, else "teammate".
+    pub from: &'static str,
+    /// How long ago the copy's newest turn happened ("5m ago"), or "-".
+    pub updated: String,
+    /// A session of this conversation is on this machine (written here, or imported).
+    pub here: bool,
+}
+
+/// A session this machine shares, as the Team tab lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedRow {
+    pub title: String,
+    pub harness: String,
+    /// Per team: on the team (pushed when), waiting for the daemon, or changed since its push.
+    pub state: String,
+}
+
 impl App {
     /// Lists the sessions and reads every title before it returns. The CLI and tests use this;
     /// the TUI uses [`App::new_deferred`].
@@ -399,6 +427,7 @@ impl App {
             defer_titles, title_wanted, title_asked: Default::default(),
             team: Vec::new(),
             team_copies: Vec::new(),
+            team_mine: Default::default(),
             team_index: 0,
             imported: Vec::new(),
             space: None,
@@ -571,6 +600,7 @@ impl App {
     /// only; nothing is written by this, and leaving a team does not remove these rows.
     pub fn set_team_sessions(&mut self, sessions: Vec<(String, Vec<u8>)>) {
         self.team_copies.clear();
+        self.team_mine.clear();
         self.show_team_rows(sessions);
     }
 
@@ -618,6 +648,7 @@ impl App {
     /// copy of each conversation), and how many records the app refused.
     pub fn set_pull_result(&mut self, copies: Vec<crate::team_watch::TeamCopy>, refused: usize) {
         let rows = crate::team_watch::newest_of(&copies);
+        self.team_mine = copies.iter().filter(|c| c.mine).map(|c| c.conversation.clone()).collect();
         self.team_copies = copies;
         self.show_team_rows(rows);
         let shown = self.team.len();
@@ -1210,16 +1241,50 @@ impl App {
         self.team_configured = yes;
     }
 
-    /// The team list as the view shows it: one label per pulled session, titled and with a short
-    /// conversation id. The full id is still what actions use; the row only has to be recognizable.
-    pub fn team_rows(&self) -> Vec<String> {
+    /// The team list: one row per pulled conversation, newest copy of each.
+    pub fn team_rows(&self) -> Vec<TeamRow> {
+        let now = unix_now();
+        let here: std::collections::HashSet<String> = self.groups.iter().map(|g| self.state.team_id_of(&g.key)).collect();
         self.team.iter().map(|(id, bytes)| {
             let text = String::from_utf8_lossy(bytes);
             let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
             let (title, found) = crate::harness::journal::omp_title_from_lines(&lines);
             let title = if found && !title.trim().is_empty() { title } else { "untitled".to_string() };
-            let short: String = id.chars().take(8).collect();
-            format!("{title} · {short}…")
+            // The newest turn's time: records are appended in order, so the last stamped line.
+            let newest = lines.iter().rev()
+                .filter(|l| l.contains("\"timestamp\""))
+                .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()
+                    .and_then(|v| v["timestamp"].as_str().and_then(crate::prompts::parse_rfc3339)));
+            let mine = self.team_mine.contains(id);
+            TeamRow {
+                title,
+                short_id: id.chars().take(8).collect(),
+                from: if mine { "this machine" } else { "teammate" },
+                updated: newest.map_or_else(|| "-".to_string(), |t| crate::session_cols::relative(now, t)),
+                here: mine || here.contains(id),
+            }
+        }).collect()
+    }
+
+    /// The sessions this machine shares, with where each one is: pushed, waiting for the daemon, or
+    /// changed since its last push. Newest first, as the session list.
+    pub fn shared_from_here(&self) -> Vec<SharedRow> {
+        let now = unix_now();
+        self.groups.iter().filter_map(|g| {
+            let id = self.state.team_id_of(&g.key);
+            let teams = self.state.shares_of(&id);
+            if teams.is_empty() {
+                return None;
+            }
+            let changed = self.state.sources.get(&g.key).map_or(0.0, |s| s.last_seen_change);
+            let state = teams.iter().map(|space| {
+                match self.state.team_pushed_at(space, &id).filter(|t| *t > 0.0) {
+                    None => format!("{space}: waiting for the daemon to push it"),
+                    Some(at) if changed > at => format!("{space}: changed since its push {}; pushed again once quiet", crate::session_cols::relative(now, at)),
+                    Some(at) => format!("{space}: on the team, pushed {}", crate::session_cols::relative(now, at)),
+                }
+            }).collect::<Vec<_>>().join(" · ");
+            Some(SharedRow { title: g.title.clone(), harness: g.fmt.clone(), state })
         }).collect()
     }
 
@@ -1299,6 +1364,11 @@ impl App {
     pub fn absorb_daemon_state(&mut self, disk: &State) {
         self.state.mirror_keys = disk.mirror_keys.clone();
         self.state.subagents = disk.subagents.clone();
+        // A push the daemon just made shows on the Team tab without a ctrl+r.
+        let pushed = |s: &State| s.team.values().map(|t| t.pushed_at).fold(0.0, f64::max);
+        if pushed(disk) > pushed(&self.state) {
+            self.request_team_refresh();
+        }
         self.state.team = disk.team.clone();
         self.state.team_seen = disk.team_seen.clone();
         for (key, dsrc) in &disk.sources {
@@ -1748,6 +1818,24 @@ impl App {
             View::Team => View::Sessions,
         };
         self.prefs_dirty = true;
+        // Opening the Team tab shows what the team holds now, not what this run saw a while ago.
+        if self.view == View::Team && self.team_configured && self.team_pull_is_stale(Instant::now()) {
+            self.refresh_requested = true;
+        }
+    }
+
+    /// Whether the Team list should be pulled again before it is looked at: never pulled this run,
+    /// or pulled more than [`TEAM_LIST_FRESH`] ago.
+    fn team_pull_is_stale(&self, now: Instant) -> bool {
+        self.last_pull.map_or(true, |(at, _, _)| now.saturating_duration_since(at) > TEAM_LIST_FRESH)
+    }
+
+    /// Ask for a team pull at the next frame (the TUI does it at start, so the Team tab is never
+    /// empty only because nothing was pulled yet). Only with a team configured.
+    pub fn request_team_refresh(&mut self) {
+        if self.team_configured {
+            self.refresh_requested = true;
+        }
     }
 
     /// Restore last-run taste before the first draw. An unknown theme name falls back to
