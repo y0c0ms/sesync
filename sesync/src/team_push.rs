@@ -19,6 +19,11 @@ pub trait TeamRemote {
     fn put(&self, space: &str, conversation: &str, version: u64, bytes: &[u8]) -> Result<(), PushError>;
     /// Give the lease back. Called even when the write failed.
     fn release(&self, space: &str, conversation: &str) -> Result<(), PushError>;
+    /// The signed record the server stores for the conversation, unopened, or None when it stores
+    /// none. A remote that cannot read records back reports none, so it never triggers a re-seal.
+    fn stored(&self, _space: &str, _conversation: &str) -> Result<Option<Vec<u8>>, PushError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +112,22 @@ impl TeamRemote for HttpTeam {
         self.post("/lease/release", serde_json::json!({
             "space": space, "conversation": conversation, "machine": self.machine}))?;
         Ok(())
+    }
+
+    fn stored(&self, space: &str, conversation: &str) -> Result<Option<Vec<u8>>, PushError> {
+        let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)).build();
+        let url = format!("{}/record/sealed/read", self.base.trim_end_matches('/'));
+        let body = serde_json::json!({"space": space, "conversation": conversation, "machine": self.machine});
+        match agent.post(&url).set("Authorization", &format!("Bearer {}", self.token)).send_json(body) {
+            Ok(resp) => {
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|_| PushError::Unreachable)?;
+                Ok(Some(buf))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(ureq::Error::Status(code, _)) => Err(PushError::Refused(format!("server refused ({code})"))),
+            Err(_) => Err(PushError::Unreachable),
+        }
     }
 }
 

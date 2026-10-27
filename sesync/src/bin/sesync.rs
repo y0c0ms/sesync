@@ -761,7 +761,7 @@ fn main() {
                     Ok(passes) => {
                         for pass in &passes {
                             eprintln!("sesync: {}", sesync::team_pass::summary(pass));
-                            activity |= !pass.pushed.is_empty();
+                            activity |= !pass.pushed.is_empty() || !pass.resealed.is_empty();
                         }
                     }
                     Err(sesync::team_pass::NotRun::NoTeam) => {}

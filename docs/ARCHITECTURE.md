@@ -594,6 +594,19 @@ approval, so "a lower version" was measured against that one. A writer whose lis
 server's will have its record refused: it must refresh before sealing. This is deliberate, so a
 device cannot seal under a list that already revoked someone.
 
+A list change re-seals unchanged records. Readers refuse a record sealed under a list older than
+theirs (`RecordError::StaleList`), and a device added to the list was never a recipient of the
+records sealed before it, so after any approve, revoke or removal every stored record is unreadable
+until it is sealed again. Content pushes alone would leave a quiet conversation hidden for good. So
+each push step also asks, once per conversation and list version (`TeamPush::list`), whether an
+unchanged shared conversation needs it (`team_sync::needs_reseal`): it reads the stored record back
+and re-seals the same content under the current list only when the record's own signature proves
+this machine wrote it (`signed_records::authorship`, which needs no list and also refuses a sequence
+below this machine's floor, so a forged header or a replayed older record of its own cannot trigger
+it) and it is sealed under an older list. A record written last by someone else is left alone, so an
+older copy never replaces newer content; that author re-seals it, and until that machine runs again
+its records stay unreadable. The daemon logs `N re-sealed under the current member list`.
+
 Admission. The team code is a shared secret, so the server never admits on it: a code holder can
 ask to join and re-authenticate a key the admin already listed, nothing more. A new key waits as a
 request until the admin's CLI signs it into the next list; a listed machine's key cannot be
@@ -663,7 +676,7 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 | `subagents` | parent session → subagent transcript paths |
 | `deleted` | user-owned, written by the TUI: source key → when the user deleted it. Every load and merge (daemon and TUI) forgets each such session that is gone (`State::forget_deleted`): the record goes and its copies are released, so it is never listed as missing and the daemon does not bring it back. Kept for a day, which any running daemon outlasts |
 | `shares` | user-owned, written by the TUI: conversation id → the teams it is shared into; merged per conversation (see "The user's choices merge per key"). A file written before teams were per session carries a `marked` list instead, folded into `shares` once the machine's teams are known |
-| `team` | per session: `{hash, pushed_at}` of the last successful push |
+| `team` | per session: `{hash, pushed_at, list}` of the last successful push; `list` is the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once) |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
 
 A missing state file is empty state; a corrupt one is an error (silently dropping it would

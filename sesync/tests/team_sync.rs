@@ -64,7 +64,7 @@ fn an_unmarked_session_is_never_pushed() {
     state.sources.insert("/s/a.jsonl".into(), sesync::state::Source::new("omp", "/s/a.jsonl"));
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Ok(b"secret".to_vec()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()));
+        |_| Ok(b"secret".to_vec()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()), None);
     assert!(remote.writes.borrow().is_empty(), "nothing is sent for an unmarked session");
     assert!(pass.pushed.is_empty());
 }
@@ -75,7 +75,7 @@ fn a_marked_quiet_session_is_pushed_once_and_recorded() {
     state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Ok(b"journal bytes".to_vec()), |_| Some(800.0), |_, _, b| Ok(b.to_vec()));
+        |_| Ok(b"journal bytes".to_vec()), |_| Some(800.0), |_, _, b| Ok(b.to_vec()), None);
     assert_eq!(pass.pushed, vec!["sess-1".to_string()]);
     assert_eq!(remote.writes.borrow().len(), 1);
     assert!(state.team_hash("personal", "sess-1").is_some(), "the push is recorded");
@@ -87,8 +87,8 @@ fn an_unchanged_session_is_not_pushed_again() {
     state.share("sess-1", "personal");
     let remote = Recording::default();
     let content = |_: &str| Ok(b"same content".to_vec());
-    push_due(&mut state, &remote, "personal", 1000.0, 120.0, content, |_| Some(800.0), |_, _, b| Ok(b.to_vec()));
-    let second = push_due(&mut state, &remote, "personal", 2000.0, 120.0, content, |_| Some(800.0), |_, _, b| Ok(b.to_vec()));
+    push_due(&mut state, &remote, "personal", 1000.0, 120.0, content, |_| Some(800.0), |_, _, b| Ok(b.to_vec()), None);
+    let second = push_due(&mut state, &remote, "personal", 2000.0, 120.0, content, |_| Some(800.0), |_, _, b| Ok(b.to_vec()), None);
     assert_eq!(remote.writes.borrow().len(), 1, "a quiet tick does not re-upload");
     assert_eq!(second.skipped_unchanged, vec!["sess-1".to_string()]);
 }
@@ -99,7 +99,7 @@ fn a_session_still_being_written_waits_for_the_quiet_period() {
     state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Ok(b"x".to_vec()), |_| Some(990.0), |_, _, b| Ok(b.to_vec()));
+        |_| Ok(b"x".to_vec()), |_| Some(990.0), |_, _, b| Ok(b.to_vec()), None);
     assert!(remote.writes.borrow().is_empty(), "not quiet yet");
     assert!(pass.pushed.is_empty());
 }
@@ -111,7 +111,7 @@ fn a_failed_push_is_reported_and_the_others_still_go() {
     state.share("good", "personal");
     let remote = Recording { fail: true, ..Default::default() };
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Ok(b"x".to_vec()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()));
+        |_| Ok(b"x".to_vec()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()), None);
     assert_eq!(pass.failed.len(), 2, "each failure is named");
     assert!(state.team_hash("team-a", "bad").is_none(), "a failed push records nothing");
 }
@@ -122,7 +122,7 @@ fn a_session_whose_content_cannot_be_built_is_reported_not_sent() {
     state.share("sess-1", "personal");
     let remote = Recording::default();
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Err("converter failed".into()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()));
+        |_| Err("converter failed".into()), |_| Some(0.0), |_, _, b| Ok(b.to_vec()), None);
     assert!(remote.writes.borrow().is_empty());
     assert_eq!(pass.failed[0].1, "converter failed");
 }
@@ -183,8 +183,8 @@ fn a_randomized_seal_does_not_make_an_unchanged_session_look_changed() {
         Ok(out)
     };
     let content = |_: &str| Ok(b"same plaintext".to_vec());
-    let first = push_due(&mut state, &remote, "personal", 1000.0, 120.0, content, |_| Some(800.0), seal);
-    let second = push_due(&mut state, &remote, "personal", 2000.0, 120.0, content, |_| Some(800.0), seal);
+    let first = push_due(&mut state, &remote, "personal", 1000.0, 120.0, content, |_| Some(800.0), seal, None);
+    let second = push_due(&mut state, &remote, "personal", 2000.0, 120.0, content, |_| Some(800.0), seal, None);
     assert_eq!(first.pushed, vec!["sess-1".to_string()]);
     assert_eq!(second.skipped_unchanged, vec!["sess-1".to_string()], "same plaintext is not re-sent");
     assert_eq!(remote.writes.borrow().len(), 1);
@@ -197,7 +197,7 @@ fn what_is_pushed_is_the_sealed_output_not_the_plaintext() {
     let remote = Recording::default();
     push_due(&mut state, &remote, "personal", 1000.0, 120.0,
         |_| Ok(b"plain journal".to_vec()), |_| Some(0.0),
-        |_, _, b| { let mut v = b"SEALED:".to_vec(); v.extend_from_slice(b); Ok(v) });
+        |_, _, b| { let mut v = b"SEALED:".to_vec(); v.extend_from_slice(b); Ok(v) }, None);
     let sent = remote.writes.borrow()[0].1.clone();
     assert!(sent.starts_with(b"SEALED:"), "the remote receives sealed bytes only");
 }
@@ -228,7 +228,7 @@ fn the_seal_is_given_the_session_and_the_version_its_lease_was_granted() {
     };
     state.share("sess-9", "personal");
     let pass = push_due(&mut state, &remote, "personal", 1000.0, 120.0,
-        |_| Ok(b"plain".to_vec()), |_| Some(0.0), seal);
+        |_| Ok(b"plain".to_vec()), |_| Some(0.0), seal, None);
     assert_eq!(pass.pushed, vec!["sess-9".to_string()]);
     assert_eq!(*seen.borrow(), vec![("sess-9".to_string(), 7, b"plain".to_vec())]);
     assert_eq!(*remote.writes.borrow(), vec![("sess-9".to_string(), 7, b"sess-9@7".to_vec())],

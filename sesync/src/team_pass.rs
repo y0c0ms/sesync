@@ -7,7 +7,7 @@ use crate::sealed::seal_for_devices;
 use crate::state::State;
 use crate::team_join;
 use crate::team_push::HttpTeam;
-use crate::team_sync::{push_due, TeamPass, DEFAULT_TEAM_QUIET_SECS};
+use crate::team_sync::{push_due, ResealCheck, TeamPass, DEFAULT_TEAM_QUIET_SECS};
 use crate::team_watch::fetch_and_verify;
 use std::path::Path;
 
@@ -60,12 +60,17 @@ pub fn run(
         let Ok(writer) = load_or_create(config_dir) else { continue };
         let remote = HttpTeam { base: base.clone(), token: cred.token.clone(), machine: cred.machine.clone() };
         let quiet = team_quiet_secs();
+        // After a list change, this machine's unchanged records are sealed again under the list it
+        // now holds, so members who hold that list (and any member just added) can open them.
+        let reseal = trust.version().ok()
+            .map(|list| ResealCheck { list, author: writer.public_signing().to_vec() });
         let seal = |session: &str, version: u64, plain: &[u8]| -> Result<Vec<u8>, String> {
             seal_for_devices(&writer, &trust, &space, session, version, plain)
                 .map_err(|e| format!("cannot seal: {e:?}"))
         };
         let mut content = |id: &str| canon.get(id, |id| content_of(id));
-        passes.push(push_due(state, &remote, &space, now, quiet, content, &mut last_change_of, seal));
+        passes.push(push_due(state, &remote, &space, now, quiet, content, &mut last_change_of, seal,
+                             reseal.as_ref()));
     }
     if passes.is_empty() { return Err(NotRun::NoTeam); }
     Ok(passes)
@@ -94,6 +99,9 @@ impl CanonCache {
 pub fn summary(pass: &TeamPass) -> String {
     let mut s = format!("team push: {} pushed, {} unchanged, {} failed",
         pass.pushed.len(), pass.skipped_unchanged.len(), pass.failed.len());
+    if !pass.resealed.is_empty() {
+        s.push_str(&format!(", {} re-sealed under the current member list", pass.resealed.len()));
+    }
     for (id, why) in &pass.failed {
         s.push_str(&format!("; {id}: {why}"));
     }
