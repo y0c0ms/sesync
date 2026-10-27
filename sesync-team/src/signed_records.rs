@@ -134,10 +134,19 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Check a record against the reader's list and the expected binding, and return its content with
-/// its sequence. Checks run in this order: format, parse, space, conversation, list version, author,
-/// signature, sequence floor.
-pub fn open_record(verifier: &Verifier, expect: &Binding, rec: &[u8]) -> Result<Opened, RecordError> {
+/// A record's fields, split at their offsets. Nothing in it has been checked yet.
+struct Parsed<'a> {
+    author: &'a [u8],
+    list_version: u64,
+    sequence: u64,
+    space: String,
+    conversation: String,
+    sig_at: usize,
+    sig: &'a [u8],
+    content: &'a [u8],
+}
+
+fn parse(rec: &[u8]) -> Result<Parsed<'_>, RecordError> {
     if rec.len() < MAGIC.len() || &rec[..MAGIC.len()] != MAGIC {
         return Err(RecordError::UnsupportedFormat);
     }
@@ -149,27 +158,63 @@ pub fn open_record(verifier: &Verifier, expect: &Binding, rec: &[u8]) -> Result<
     let conversation = cur.text()?;
     let sig_at = cur.at;
     let sig = cur.take(SIG_LEN)?;
-    let content = &rec[cur.at..];
+    Ok(Parsed { author, list_version, sequence, space, conversation, sig_at, sig, content: &rec[cur.at..] })
+}
 
-    if space != expect.space {
+/// Check a record against the reader's list and the expected binding, and return its content with
+/// its sequence. Checks run in this order: format, parse, space, conversation, list version, author,
+/// signature, sequence floor.
+pub fn open_record(verifier: &Verifier, expect: &Binding, rec: &[u8]) -> Result<Opened, RecordError> {
+    let p = parse(rec)?;
+    if p.space != expect.space {
         return Err(RecordError::WrongSpace);
     }
-    if conversation != expect.conversation {
+    if p.conversation != expect.conversation {
         return Err(RecordError::WrongConversation);
     }
 
     let (have, listed) = verifier.current_view().ok_or(RecordError::UnknownAuthor)?;
-    if list_version < have {
-        return Err(RecordError::StaleList { have, got: list_version });
+    if p.list_version < have {
+        return Err(RecordError::StaleList { have, got: p.list_version });
     }
-    if !listed.iter().any(|e| e.len() >= AUTHOR_LEN && &e[..AUTHOR_LEN] == author) {
+    if !listed.iter().any(|e| e.len() >= AUTHOR_LEN && &e[..AUTHOR_LEN] == p.author) {
         return Err(RecordError::UnknownAuthor);
     }
-    if !Device::verify(author, &signed_part(rec, sig_at), sig) {
+    if !Device::verify(p.author, &signed_part(rec, p.sig_at), p.sig) {
         return Err(RecordError::BadSignature);
     }
-    if sequence < expect.min_sequence {
-        return Err(RecordError::Rollback { have: expect.min_sequence, got: sequence });
+    if p.sequence < expect.min_sequence {
+        return Err(RecordError::Rollback { have: expect.min_sequence, got: p.sequence });
     }
-    Ok(Opened { content: content.to_vec(), sequence, list_version })
+    Ok(Opened { content: p.content.to_vec(), sequence: p.sequence, list_version: p.list_version })
+}
+
+/// Who sealed a record, under which list version and at which sequence, proven by the record's own
+/// signature. For a writer asking whether the record a server stores is still its own, which needs
+/// no member list: the record may be sealed under a list this writer no longer holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authorship {
+    pub author: Vec<u8>,
+    pub list_version: u64,
+    pub sequence: u64,
+}
+
+/// Check a record's binding, its signature against the author it names, and its sequence floor,
+/// but not its list: a valid signature proves who wrote it, not that its author is still a member.
+/// Never use this to accept a record's content; `open_record` is the only check that does that.
+pub fn authorship(expect: &Binding, rec: &[u8]) -> Result<Authorship, RecordError> {
+    let p = parse(rec)?;
+    if p.space != expect.space {
+        return Err(RecordError::WrongSpace);
+    }
+    if p.conversation != expect.conversation {
+        return Err(RecordError::WrongConversation);
+    }
+    if !Device::verify(p.author, &signed_part(rec, p.sig_at), p.sig) {
+        return Err(RecordError::BadSignature);
+    }
+    if p.sequence < expect.min_sequence {
+        return Err(RecordError::Rollback { have: expect.min_sequence, got: p.sequence });
+    }
+    Ok(Authorship { author: p.author.to_vec(), list_version: p.list_version, sequence: p.sequence })
 }
