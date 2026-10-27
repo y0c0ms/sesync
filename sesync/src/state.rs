@@ -32,6 +32,10 @@ pub struct Mirror {
 pub struct TeamPush {
     pub hash: String,
     pub pushed_at: f64,
+    /// The member-list version this machine last sealed the conversation under, or last confirmed
+    /// it has nothing to re-seal at (the stored record is someone else's, or already current).
+    /// 0 when never recorded: a push made before this existed, which is then checked once.
+    pub list: u64,
 }
 
 /// The outcome of the daemon's last attempts to write one mirror target of a session.
@@ -228,9 +232,22 @@ impl State {
         self.team.get(&team_key(space, conversation)).map(|t| t.hash.clone())
     }
 
-    /// Record a successful push: the content hash sent and when.
+    /// Record a successful push: the content hash sent and when. The list version is kept; the
+    /// caller sets it with `set_team_list` once it knows which list the push was sealed under.
     pub fn record_team_push(&mut self, space: &str, conversation: &str, hash: &str, at: f64) {
-        self.team.insert(team_key(space, conversation), TeamPush { hash: hash.to_string(), pushed_at: at });
+        let e = self.team.entry(team_key(space, conversation)).or_default();
+        e.hash = hash.to_string();
+        e.pushed_at = at;
+    }
+
+    /// The member-list version last recorded for this team's copy of the conversation (0 = none).
+    pub fn team_list(&self, space: &str, conversation: &str) -> u64 {
+        self.team.get(&team_key(space, conversation)).map(|t| t.list).unwrap_or(0)
+    }
+
+    /// Record the member-list version this team's copy of the conversation is settled at.
+    pub fn set_team_list(&mut self, space: &str, conversation: &str, list: u64) {
+        self.team.entry(team_key(space, conversation)).or_default().list = list;
     }
 
     /// When the last successful push for this team happened, if any.
@@ -522,6 +539,7 @@ impl State {
                 st.team.insert(id.clone(), TeamPush {
                     hash: v.get("hash").and_then(Value::as_str).unwrap_or("").to_string(),
                     pushed_at: v.get("pushed_at").and_then(Value::as_f64).unwrap_or(0.0),
+                    list: v.get("list").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
         }
@@ -717,7 +735,7 @@ impl State {
             "subagents": self.subagents,
             "shares": self.shares.iter().map(|(c, spaces)| (c.clone(), serde_json::json!(spaces.iter().collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
             "deleted": self.deleted,
-            "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at}))).collect::<serde_json::Map<_, _>>(),
+            "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at, "list": v.list}))).collect::<serde_json::Map<_, _>>(),
             "team_seen": self.team_seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
         });
         let tmp = path.with_extension("tmp");

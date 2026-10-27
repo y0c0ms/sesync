@@ -3,6 +3,25 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-27: a list change no longer hides every shared conversation
+
+- **Why.** Found when the work PC joined HomelabTeam (list v3 -> v4): from then on every pull, on
+  every machine, dropped the two conversations shared before the join, the authors' own included.
+  Readers refuse a record sealed under an older list (`StaleList`), the new member was never a
+  recipient, and a push only went out when the content changed. Every approve, revoke or removal did
+  the same.
+- **Now.** The push step re-seals, under the current list, each unchanged shared conversation whose
+  stored record is this machine's own and sealed under an older list (`team_sync::needs_reseal`),
+  once per conversation and list version (`TeamPush::list`, kept in the state file). "Own" is proven
+  by the record's signature (`signed_records::authorship`, new in sesync-team), with the floor this
+  machine accepted as the lowest sequence, so a forged header or a replayed older record cannot make
+  a machine republish. A record someone else wrote last is left for them, so an older copy never
+  replaces newer content. The daemon logs `N re-sealed under the current member list` and counts it
+  as activity for the poll interval.
+- **Not fixed.** A machine that is off keeps its records unreadable until it runs again; nobody else
+  can re-seal them (only the author signs its records).
+- **Suites** (Windows, sandboxed): `sesync` 603 passed, `sesync-team` 199 passed, 0 failed.
+
 ## 2026-10-21: team exits, refusals that say so, and files filed where the harness lists them
 
 Found by running a team end to end on this machine (an in-memory team server, five sandboxed
