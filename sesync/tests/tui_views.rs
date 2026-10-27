@@ -301,17 +301,6 @@ fn the_team_header_says_when_nothing_was_pulled_yet() {
 }
 
 #[test]
-fn team_rows_show_a_short_id_next_to_the_title() {
-    let sb = sandbox("short-id");
-    let mut a = app(&sb);
-    a.set_team_sessions(vec![team_session(TEAM_ID, "Deploy runbook")]);
-    let rows = a.team_rows();
-    assert_eq!(rows, vec!["Deploy runbook · 11111111…".to_string()],
-        "the row carries the full title and just enough id to tell sessions apart");
-    let _ = fs::remove_dir_all(&sb);
-}
-
-#[test]
 fn question_mark_opens_the_help_for_the_current_tab() {
     let sb = sandbox("help-sessions");
     write_session(&sb, SID_A, "one");

@@ -67,6 +67,7 @@ fn copy(space: &str, conversation: &str, seq: u64, title: &str) -> TeamCopy {
         conversation: conversation.into(),
         seq,
         text: format!("{{\"type\":\"session\",\"id\":\"{conversation}\",\"title\":\"{title}\"}}\n").into_bytes(),
+        mine: false,
     }
 }
 
@@ -115,9 +116,9 @@ fn leaving_a_revoked_team_removes_its_credential_its_shares_and_only_its_pulled_
     assert!(a.take_user_dirty(), "the shares are saved");
     let rows = a.team_rows();
     assert_eq!(rows.len(), 2, "only the conversation no other team holds leaves the list: {rows:?}");
-    assert!(rows.iter().any(|r| r.starts_with("both teams, as the other team holds it")),
+    assert!(rows.iter().any(|r| r.title == "both teams, as the other team holds it"),
         "a conversation the other team holds stays, as that team's copy: {rows:?}");
-    assert!(rows.iter().any(|r| r.starts_with("only the other team")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.title == "only the other team"), "{rows:?}");
 }
 
 #[test]

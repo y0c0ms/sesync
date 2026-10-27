@@ -40,6 +40,8 @@ pub trait RecordSource {
 pub struct PulledRecord {
     pub conversation: String,
     pub text: Vec<u8>,
+    /// Written by this device: its signature is this device's key (`signed_records::authorship`).
+    pub mine: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,7 +123,9 @@ fn pull_with(source: &dyn RecordSource, reader: &DeviceFile, trust: Option<&Trus
             Ok(opened) => {
                 let best = out.accepted.entry(conv.clone()).or_insert(0);
                 *best = (*best).max(opened.sequence);
-                out.shown.push(PulledRecord { conversation: conv, text: opened.content });
+                let mine = sesync_team::signed_records::authorship(&expect, &record)
+                    .is_ok_and(|a| a.author == reader.public_signing());
+                out.shown.push(PulledRecord { conversation: conv, text: opened.content, mine });
             }
             Err(SealError::Rollback { .. }) => {
                 out.dropped += 1;
