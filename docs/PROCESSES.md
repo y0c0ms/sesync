@@ -1,6 +1,6 @@
 # Agent Hub processes
 
-How each process in agent-hub works, and what happens in every case. Every diagram is Mermaid, so it renders on GitHub and Forgejo. The behaviour is as built on 2026-10-26: sesync `bridge-phase2` (`9088dcb`), `herdr-open` (`60478ef`), the app fork `orca-phone` `phase2`, and herdr 0.9.1. The text explains why; the diagrams show what.
+How each process in agent-hub works, and what happens in every case. Every diagram is Mermaid, so it renders on GitHub and Forgejo. The behaviour is as built on 2026-10-27: sesync `bridge-phase2` (`e4eb0b1`), `herdr-open` (`60478ef`), the app fork `orca-phone` `phase2` (`c726b00c`), and herdr 0.9.1. The text explains why; the diagrams show what.
 
 | # | Process | Runs where |
 |---|---|---|
@@ -490,11 +490,18 @@ sequenceDiagram
 
 ## 16. Notifications
 
+The watcher follows herdr's status events rather than sampling. A sample every 250 ms could miss a turn that starts and ends between two samples; the live run had no finished frame for one. The pane list is still read every second, to follow panes that open or close.
+
 ```mermaid
 flowchart TD
-  A(["watcher: every 2 s read herdr agent statuses"]) --> B{"first time this pane is seen?"}
+  A(["pass, every 1 s: read the panes, so panes that open or close are followed"]) --> B{"first time this pane is seen?"}
   B -- yes --> B1["record state, raise nothing"]
-  B -- no --> C{"transition"}
+  B -- no --> C{"transition from the last state"}
+  B1 --> S["subscribe to pane.agent_status_changed for the listed panes"]
+  S --> W(["herdr pushes a status change for a listed pane"])
+  W --> U["that pane takes the new state, then is checked as in a pass"]
+  U --> C
+  W -- "pass due, or stream ended" --> A
   C -- "working → idle / done" --> F["event: finished (agentState 'done')<br/>body = conversation title"]
   C -- "anything → blocked (not already blocked)" --> N["event: needs input (agentState 'blocked')"]
   C -- "other" --> Z["nothing"]
@@ -525,7 +532,7 @@ sequenceDiagram
     alt fails
       BR->>BR: keep the last good snapshot
     else ok
-      BR->>BR: map: 5-hour window → session bar, 7-day untiered → weekly bar<br/>Anthropic → claude, OpenAI Codex → codex
+      BR->>BR: map: 5-hour window → session bar, 7-day untiered → weekly bar<br/>Anthropic → claude, OpenAI Codex → codex<br/>one login per provider is also the system default (claude, codex bars)
       opt changed since last
         BR-->>App: accounts.subscribe frame
       end
