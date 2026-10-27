@@ -3,6 +3,36 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-27: the TUI opens without reading every conversation, and Esc closes it
+
+- **Why.** On the work PC the herdr popup (ctrl+alt+s, `sesync --tui`) stayed blank for seconds and
+  Esc did nothing. Measured with `SESYNC_TRACE` (new milestones: loading drawn, harnesses detected,
+  preview worker started, app built, team and prefs loaded, drawn): `App::new` took 2.2 to 4.1 s,
+  all of it reading the titles of 132 journals (about 880 MB of omp and Claude files) before the
+  first frame. The preview already read only the highlighted session; the titles did not.
+- **Titles off the startup path** (`manage::list_groups_deferred`, `title_worker::Worker`,
+  `manage::TitleCache::{load, save}`, `App::new_deferred`). Listing reads folder entries, sizes
+  and change times only. A row shows the title the previous run saved (`titles.json` beside
+  `state.json`, valid while size and change time match), else the last title read, else the
+  daemon's record, else "untitled"; the worker reads the rest, rows on screen first, and the cache
+  is saved when it is idle and on quit. `App::new` (CLI, tests) still reads titles on the spot.
+  ARCHITECTURE "What the TUI reads, and when" has the sequence.
+- **Cheaper title reads** (`journal::read_title_text`, `omp_title_from_lines`,
+  `claude_title_from_lines`). The tail walk prepended each 64 KiB chunk to the text read so far,
+  re-copying up to 8 MiB at every step; chunks are now joined once. Both rules skip, before
+  parsing, every line that cannot hold a record they still need. Same results.
+- **Loading screen.** "Reading sessions…" is drawn before the list is built.
+- **Esc.** In the lists Esc now clears a kept filter, else quits; on an armed delete it only
+  cancels the delete; in a dialog or overlay it closes that, as before. The `?` help lists
+  `q / esc`; the footer keeps `q quit` (a longer hint pushed "quit" off a 100-column screen).
+- **Tests.** `tests/title_worker.rs` (the deferred list opens no conversation and asks for rows in
+  the order shown, once; the daemon's name stands in; a saved cache names unchanged files and only
+  changed ones are read; an unreadable cache is an empty one; the worker answers in order),
+  `tests/app.rs` (four Esc cases), `tests/title_long_journals.rs` (names of 7 to 12 MiB realistic
+  journals: header, deep rename, first prompt, Claude tool results never a prompt; a mutant
+  prefilter fails it), `tests/tui_pty.rs` draws the loading line before the list and quits on q
+  and on a lone Esc byte in a real pty (POSIX).
+
 ## 2026-10-27: a list change no longer hides every shared conversation
 
 - **Why.** Found when the work PC joined HomelabTeam (list v3 -> v4): from then on every pull, on

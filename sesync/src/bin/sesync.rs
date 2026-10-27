@@ -1071,23 +1071,42 @@ fn run_tui(
         }
     };
     tr("tui start", &mut trace);
+    // Something on screen at once: listing reads every session's title, which takes a while on a
+    // slow disk or with large journals, and a herdr popup would otherwise stay blank meanwhile.
+    term.draw(|f| {
+        let area = f.area();
+        let row = ratatui::layout::Rect::new(area.x, area.y + area.height / 2, area.width, 1.min(area.height));
+        f.render_widget(
+            ratatui::widgets::Paragraph::new("Reading sessions…").alignment(ratatui::layout::Alignment::Center),
+            row,
+        );
+    })?;
+    tr("loading drawn", &mut trace);
     // Only harnesses installed on this machine are offered as mirror targets; each harness says
     // what installed means for it (its folder exists, or its command can be run).
     let installed: Vec<String> = harness::ALL.iter()
         .filter(|h| h.present(roots.locations.of(h.id())))
         .map(|h| h.id().to_string())
         .collect();
+    tr("harnesses detected", &mut trace);
     // The daemon's file is merged in while the TUI runs; retired harnesses are released from it
     // with the same locations the TUI was started with.
     let locations = roots.locations.clone();
     // The details pane previews the highlighted session; a worker reads its last turns, so the
     // list never waits on a large transcript or a conversion.
     let preview = sesync::preview::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
+    tr("preview worker started", &mut trace);
     // The Team tab and "Refresh team" exist before the first pull; without configuration they
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
         .map(|t| t.space.clone()).collect();
-    let mut app = App::new(roots, state, lock_dir, sesync_lock);
+    // Titles: the list is drawn from the titles a previous run saved (and the daemon's), and a
+    // worker reads the rest, rows on screen first. Opening never waits on every session file.
+    let titles_file = state_file.with_file_name("titles.json");
+    let title_worker = sesync::title_worker::Worker::start();
+    let mut app = App::new_deferred(roots, state, lock_dir, sesync_lock,
+        sesync::manage::TitleCache::load(&titles_file));
+    tr("app built", &mut trace);
     app.migrate_legacy_team_state(&teams);
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
@@ -1105,6 +1124,7 @@ fn run_tui(
     // Restore last-run taste (theme, tab) from this user's configuration directory.
     let prefs = sesync::app::prefs::load(&config_dir);
     app.restore_prefs(prefs.theme, prefs.view);
+    tr("team and prefs loaded", &mut trace);
 
     // The state file is read back only when it changed since the last look: the daemon
     // rewrites it on every pass, and a keystroke must not pay for a reload that shows
@@ -1119,6 +1139,15 @@ fn run_tui(
         jobs.tick(&mut app, &config_dir);
         // A pull that finished while the terminal sat idle is applied now, not at the next key.
         collect_pull(&mut app, &mut pending_pull, &config_dir);
+        // Titles still to read go to their worker; the ones it read since are shown, and saved
+        // once it has nothing left to read.
+        title_worker.request(app.take_title_requests());
+        app.apply_titles(title_worker.take());
+        if title_worker.idle() && app.title_cache().is_dirty() {
+            if let Err(e) = app.title_cache().save(&titles_file) {
+                tr(&format!("title cache not saved: {e}"), &mut trace);
+            }
+        }
         // A newly highlighted session goes to the worker; whatever it has read since is shown.
         if let Some((fmt, key)) = app.preview_wanted() {
             if app.preview().key != key {
@@ -1130,6 +1159,7 @@ fn run_tui(
             app.apply_preview(loaded);
         }
         term.draw(|f| sesync::ui::draw(f, &app))?;
+        tr("drawn", &mut trace);
         if !event::poll(Duration::from_millis(200))? {
             tr("poll timeout", &mut trace);
             // A running daemon writes mirrors and floors into the same file; take them in
@@ -1220,6 +1250,11 @@ fn run_tui(
         }
         if app.should_quit() {
             tr("quit", &mut trace);
+            // Titles read before quitting are kept, even when the worker had more to read.
+            app.apply_titles(title_worker.take());
+            if app.title_cache().is_dirty() {
+                let _ = app.title_cache().save(&titles_file);
+            }
             return Ok(());
         }
     }

@@ -48,7 +48,9 @@ pub fn read_title_text(path: &Path) -> Option<String> {
     // inside the harness leaves only a `title_change` (the slot lags until it saves), and in a
     // long journal that record sits far from both ends: one 64 KiB window missed it, the caller
     // fell back to the stale slot, and a rename could be silently overwritten by the name shown.
-    let mut tail = String::new();
+    // Chunks are collected newest first and joined once: prepending each one to a growing string
+    // copied the whole tail again for every 64 KiB read.
+    let mut chunks: Vec<String> = Vec::new();
     let mut end = len;
     let mut scanned: u64 = 0;
     loop {
@@ -66,7 +68,7 @@ pub fn read_title_text(path: &Path) -> Option<String> {
             }
         }
         let found = carries_a_title(&chunk);
-        tail = format!("{chunk}{tail}");
+        chunks.push(chunk);
         scanned += span;
         if found || start == 0 || scanned >= TITLE_TAIL_MAX {
             break;
@@ -74,7 +76,9 @@ pub fn read_title_text(path: &Path) -> Option<String> {
         end = start;
     }
     let mut text = String::from_utf8_lossy(&head).into_owned();
-    text.push_str(&tail);
+    for chunk in chunks.iter().rev() {
+        text.push_str(chunk);
+    }
     Some(text)
 }
 
@@ -111,6 +115,14 @@ pub fn omp_title_from_lines(lines: &[&str]) -> (String, bool) {
     let (mut header, mut slot, mut fallback) = (String::new(), String::new(), String::new());
     let mut slot_at = 0.0;
     for line in lines {
+        // Parsing is most of the cost on long journals. A line can only matter if it spells one of
+        // the record types below ("session", "session_info", "title", "title_change") or, while
+        // no fallback is chosen, a user role.
+        if !(line.contains("\"session") || line.contains("\"title")
+            || (fallback.is_empty() && line.contains("\"user\"")))
+        {
+            continue;
+        }
         let Ok(rec) = serde_json::from_str::<Value>(line) else { continue };
         let kind = rec.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
