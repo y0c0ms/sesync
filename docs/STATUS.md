@@ -3,6 +3,22 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-27: Team tab shows what this machine shares, and pulls without ctrl+r
+
+- **Seen.** On the work PC a session marked for the team did not show on the Team tab ("Team
+  (0)") until a ctrl+r, and then only after the daemon had pushed it, up to a minute later; the
+  rows said only a title and an id.
+- **Daemon.** The team step runs on the next tick when the set of shared sessions changes,
+  instead of after the backed-off interval (up to `SESYNC_TEAM_POLL_MAX`).
+- **TUI.** "Shared from this machine": each shared session per team, waiting / on the team (pushed
+  when) / changed since its push (`App::shared_from_here`). "On the team": columns TITLE, FROM
+  ("this machine" from the record's own signature, `PulledRecord::mine`; else "teammate"),
+  UPDATED (newest turn in the copy), HERE (already a session on this machine, else "i imports
+  it") (`App::team_rows` now returns `TeamRow`). Pulls without a key: at start, on opening the tab
+  when the last pull is over 30 s old, and when the daemon records a newer push.
+- **Tests.** `tests/team_tab.rs` (row fields; waiting -> on the team -> changed, the pull asked for
+  after a push and not after a change; the tab pulls only when stale and only with a team),
+  `tests/team_pull_verified.rs` (a record signed by this device is its own).
 ## 2026-10-27: the TUI opens without reading every conversation, and Esc closes it
 
 - **Why.** On the work PC the herdr popup (ctrl+alt+s, `sesync --tui`) stayed blank for seconds and

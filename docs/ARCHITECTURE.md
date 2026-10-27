@@ -636,6 +636,35 @@ signed list names. A write also needs the record signed by a device the current 
    line and on the team's card, and the pull never reads as an empty team. "Leave a team"
    (`team_actions::leave`) removes the credential, which is the only way out of a declined join:
    the server answers a declined key as it answers a pending one.
+8. The TUI's Team tab has two parts. "Shared from this machine" lists the sessions shared here,
+   per team: waiting for the daemon (never pushed), on the team (pushed when), or changed since
+   its push. "On the team" lists the pulled copies: title and short id, who wrote the copy shown
+   ("this machine" when the record's signature is this device's key, `PulledRecord::mine`, else
+   "teammate"; member names stay admin-only), when its newest turn happened, and whether the
+   conversation is already a session here. The TUI pulls without a ctrl+r: at start, on opening
+   the tab when its last pull is over 30 s old (`TEAM_LIST_FRESH`), and when the daemon's state
+   shows a push newer than any it had (`App::absorb_daemon_state`). The daemon runs its team step
+   on the next tick, not after the backed-off interval, when the set of shared sessions changes.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant T as TUI
+    participant F as state.json
+    participant D as daemon
+    participant S as Team server
+    U->>T: m on a session (share it)
+    T->>F: save the share
+    T->>U: Shared from this machine: waiting for the daemon
+    D->>F: next local pass reads the share
+    D->>D: shares changed: team step now, backoff reset
+    D->>S: push (once the session is quiet)
+    D->>F: record the push
+    T->>F: reads the daemon's state (about once a second)
+    T->>U: on the team, pushed just now
+    T->>S: pull, because a newer push appeared
+    T->>U: On the team: the copy, from this machine
+```
 
 ## Trust model
 
