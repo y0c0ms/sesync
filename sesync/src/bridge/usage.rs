@@ -341,7 +341,6 @@ fn map_usage(usage: &Value, now: u64) -> Result<Value, String> {
     }))
 }
 
-
 /// The system-default usage for a provider with exactly one login: that login's rate limits. None otherwise.
 fn single_default(inactive: &[Value]) -> Value {
     match inactive {
@@ -349,6 +348,7 @@ fn single_default(inactive: &[Value]) -> Value {
         _ => Value::Null,
     }
 }
+
 #[derive(Default)]
 struct Lane {
     accounts: Vec<Value>,

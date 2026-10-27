@@ -366,15 +366,17 @@ fn watch(ctx: &Ctx, every: Duration) {
             }
             match events.next(wait) {
                 Ok(Some((pane_id, status))) => {
-                    if let Some(running) = panes.iter_mut().find(|r| r.pane.pane_id == pane_id) {
-                        running.pane.agent_status = status;
+                    if apply_status(&mut panes, &pane_id, &status) {
                         emit_raised(ctx, memory.observe(&panes, &conversations));
                     }
                 }
                 // A pane that opened after this list is picked up when the list is next read.
                 Ok(None) => break,
-                // The stream ended: read the panes again and subscribe again.
-                Err(_) => break,
+                // The stream ended: pause a pass, then read the panes and subscribe again. A dead stream is never spun on.
+                Err(_) => {
+                    thread::sleep(every);
+                    break;
+                }
             }
         }
     }
@@ -383,6 +385,17 @@ fn watch(ctx: &Ctx, every: Duration) {
 fn emit_raised(ctx: &Ctx, raised: Vec<Raised<'_>>) {
     for r in raised {
         ctx.notify.emit(r.kind, r.conversation, &r.terminal_id, terminals::now_ms());
+    }
+}
+
+/// Apply one herdr status change to the pane it names. False when no listed pane has that id.
+fn apply_status(panes: &mut [Running], pane_id: &str, status: &str) -> bool {
+    match panes.iter_mut().find(|r| r.pane.pane_id == pane_id) {
+        Some(running) => {
+            running.pane.agent_status = status.to_string();
+            true
+        }
+        None => false,
     }
 }
 
@@ -478,6 +491,20 @@ mod tests {
         memory.observe(&[pane("term_x", "working")], &convs);
         assert!(memory.observe(&[pane("term_x", "blocked")], &convs).is_empty());
         assert_eq!(memory.last.get("term_x").map(String::as_str), Some("blocked"));
+    }
+
+    #[test]
+    fn a_status_event_moves_its_pane_and_raises_the_transition() {
+        let convs = [conversation("t", "s1")];
+        let mut memory = Watch::default();
+        let mut panes = vec![running_conversation("term_a", "working", "s1"), pane("term_b", "working")];
+        assert!(memory.observe(&panes, &convs).is_empty());
+        assert!(apply_status(&mut panes, "p-term_a", "idle"));
+        let raised = memory.observe(&panes, &convs);
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].kind, FINISHED);
+        assert_eq!(raised[0].terminal_id, "term_a");
+        assert!(!apply_status(&mut panes, "p-gone", "idle"), "an id no listed pane has is ignored");
     }
 
     fn hub_with_three() -> Hub {

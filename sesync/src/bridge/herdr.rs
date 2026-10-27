@@ -347,4 +347,71 @@ mod tests {
         assert_eq!(parse_read(&json!({"read": {"text": "hello\r\n"}})).unwrap(), "hello\r\n");
         assert!(parse_read(&json!({"read": {}})).is_err());
     }
+
+    /// A fake herdr for one subscription. It answers `ack`, writes each chunk after a short pause, and
+    /// holds the connection until the returned sender is dropped.
+    #[cfg(unix)]
+    fn fake_events_server(name: &str, ack: &'static str, chunks: Vec<&'static str>) -> (PathBuf, std::sync::mpsc::Sender<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("sesync-herdr-events-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(conn.try_clone().unwrap()).read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(request["method"], "events.subscribe");
+            conn.write_all(ack.as_bytes()).unwrap();
+            for chunk in chunks {
+                std::thread::sleep(Duration::from_millis(100));
+                conn.write_all(chunk.as_bytes()).unwrap();
+            }
+            let _ = held.recv();
+        });
+        (path, release)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_events_follow_each_status_change_and_skip_other_events() {
+        let (path, release) = fake_events_server(
+            "changes",
+            "{\"id\":\"sesync-events\",\"result\":{\"type\":\"subscription_started\"}}\n",
+            vec![
+                "{\"event\":\"pane.output_matched\",\"data\":{}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"working\"}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"idle\"",
+                "}}\n",
+            ],
+        );
+        let mut events = StatusEvents::open(&path, &["w1:p1".to_string()]).unwrap();
+        let wait = Duration::from_secs(2);
+        assert_eq!(events.next(wait).unwrap(), Some(("w1:p1".to_string(), "working".to_string())));
+        assert_eq!(
+            events.next(wait).unwrap(),
+            Some(("w1:p1".to_string(), "idle".to_string())),
+            "a line split across writes is joined"
+        );
+        assert_eq!(events.next(Duration::from_millis(100)).unwrap(), None, "no change within the wait");
+        drop(release);
+        assert!(events.next(wait).is_err(), "a closed stream is an error the watcher reopens on");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_subscription_says_why() {
+        let (path, release) = fake_events_server(
+            "refused",
+            "{\"id\":\"sesync-events\",\"error\":{\"code\":\"pane_not_found\",\"message\":\"no such pane\"}}\n",
+            Vec::new(),
+        );
+        match StatusEvents::open(&path, &["w9:p9".to_string()]) {
+            Ok(_) => panic!("a refused subscription must not open"),
+            Err(e) => assert!(e.contains("no such pane"), "{e}"),
+        }
+        drop(release);
+    }
 }
