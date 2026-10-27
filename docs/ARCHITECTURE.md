@@ -191,6 +191,27 @@ sequenceDiagram
     B->>B: unseal, show it, import into harness Y on request
 ```
 
+After a list change (approve, revoke, removal), a record sealed under the older list is refused by
+every reader, and a new member was never one of its recipients. Its author re-seals it:
+
+```mermaid
+sequenceDiagram
+    participant A as Device A (wrote record n)
+    participant S as Team server
+    participant N as Device N (added in v+1)
+    Note over A,N: the admin publishes list v+1
+    N->>S: pull
+    S-->>N: record n, sealed under v
+    N->>N: refused: sealed under an older list, not shown
+    A->>S: next pass: fetch list v+1, read its stored record back
+    A->>A: the record's own signature proves A wrote it, sealed under v, sequence at or above the floor
+    A->>S: push record n+1: the same content sealed under v+1, once per list version
+    N->>S: pull
+    S-->>N: record n+1
+    N->>N: unseal and show it
+    Note over A,S: a record someone else wrote last is left to that author; a device that is off re-seals when it runs again
+```
+
 ### Team membership and revocation
 
 This is the contract for who is in a team. It changes in the same change as the code that
@@ -209,6 +230,10 @@ implements it (AGENTS.md rule).
 - **The roster stays inside the team.** Member and machine names, pending requests and
   fingerprints are admin-only. A listed device fetches only the signed key list it needs to seal
   and verify. A pending or revoked device gets no list, no conversation ids and no records.
+- **A list change reaches what was already shared.** Readers refuse a record sealed under an
+  older list, so after every new version each device re-seals its own unchanged shared records
+  under it, once per version. A device re-seals only records whose signature proves it wrote
+  them; nobody re-seals another device's record.
 
 ```mermaid
 stateDiagram-v2
@@ -248,6 +273,7 @@ sequenceDiagram
     N->>S: fetch the roster
     S-->>N: signed list v+1
     N->>N: verify with the pinned admin key, start syncing
+    Note over S,N: members re-seal their own shared records under v+1 on their next pass, so N can read what was shared before it joined
 ```
 
 ```mermaid
@@ -264,6 +290,7 @@ sequenceDiagram
     M->>S: fetch the roster
     S-->>M: signed list v+1
     M->>M: seal new records only to v+1, refuse records signed by removed keys
+    M->>S: re-seal their own unchanged shared records under v+1, once
     R->>S: join again with the team code, same key
     S-->>R: refused: this device was removed
     R->>S: join again with a new key
