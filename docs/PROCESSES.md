@@ -1,6 +1,6 @@
 # Agent Hub processes
 
-How each process in agent-hub works, and what happens in every case. Every diagram is Mermaid, so it renders on GitHub and Forgejo. The behaviour is as built on 2026-10-27: sesync `bridge-phase2` (`e4eb0b1`), `herdr-open` (`60478ef`), the app fork `orca-phone` `phase2` (`c726b00c`), and herdr 0.9.1. The text explains why; the diagrams show what.
+How each process in agent-hub works, and what happens in every case. Every diagram is Mermaid, so it renders on GitHub and Forgejo. The behaviour is as built on 2026-10-27: sesync `bridge-phase2` (`e4eb0b1`), `herdr-open` (`60478ef`), the app fork `orca-phone` `phase2` (`18a7462e`), and herdr 0.9.1. The text explains why; the diagrams show what.
 
 | # | Process | Runs where |
 |---|---|---|
