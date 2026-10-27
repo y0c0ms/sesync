@@ -53,17 +53,19 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
     let session = base.join("session file.jsonl");
     fs::write(&session, "").unwrap();
 
-    let label = herdr_open::tab_label("smoke", "live");
+    let tag = herdr_open::session_tag(&session.display().to_string());
+    let label = herdr_open::tab_label("smoke", "live", &tag);
     let plan = Plan {
         argv: vec!["tail".into(), "-f".into(), session.display().to_string()],
         cwd: project.clone(),
         cwd_fallback: false,
         label: label.clone(),
+        tag,
     };
     let herdr = Herdr::from_env(Box::new(Process));
     let tabs_before = tab_labels().len();
 
-    let opened = herdr_open::open(&herdr, &plan).expect("the first open creates a tab");
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).expect("the first open creates a tab");
     let Opened::Created { tab_id } = opened.clone() else {
         panic!("the first open should create a tab, got {opened:?}");
     };
@@ -95,7 +97,7 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
     }
 
     // A second open finds the running pane and focuses its tab; no tab is added.
-    let again = herdr_open::open(&herdr, &plan).expect("the second open focuses");
+    let again = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).expect("the second open focuses");
     assert_eq!(again, Opened::Focused { tab_id: tab_id.clone() });
     let focused = herdr_json(&["tab", "list"])["result"]["tabs"].as_array().unwrap().iter()
         .find(|t| t["tab_id"] == tab_id.as_str())

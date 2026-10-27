@@ -58,6 +58,7 @@ fn herdr_with_panes(panes: Vec<(&str, &str, Vec<Vec<&str>>)>) -> (Herdr, Calls) 
                 let procs: Vec<_> = argvs.iter().map(|argv| json!({"argv": argv, "cmdline": argv.join(" ")})).collect();
                 Ok(json!({"result": {"process_info": {"foreground_processes": procs}}}).to_string())
             }
+            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
             ["pane", "run", ..] | ["tab", "focus", ..] | ["tab", "close", ..] => Ok(json!({"result": {}}).to_string()),
             other => Err(format!("unexpected herdr call {other:?}")),
@@ -112,7 +113,7 @@ fn omp_resumes_by_its_session_file_in_the_project_directory() {
     assert_eq!(plan.argv, words(&["omp", "--resume", path.to_str().unwrap()]));
     assert_eq!(plan.cwd, cwd);
     assert!(!plan.cwd_fallback);
-    assert_eq!(plan.label, "omp: Old");
+    assert_eq!(plan.label, format!("omp: Old · {}", plan.tag));
 }
 
 #[test]
@@ -122,7 +123,7 @@ fn a_path_with_spaces_and_quotes_reaches_the_shell_as_one_argument() {
     let cwd = project_dir(&sb);
     let path = omp_session(&roots, &cwd);
     let plan = plan_for(&roots, "omp", path.to_str().unwrap(), "Old").unwrap();
-    let line = herdr_open::shell_line(&plan.argv).unwrap();
+    let line = herdr_open::shell_line(&plan.argv, herdr_open::PaneShell::Posix).unwrap();
     assert_eq!(line, format!("omp --resume '{}'", path.display()));
     assert!(path.to_str().unwrap().contains("with space"), "the sandbox path has a space");
 
@@ -134,8 +135,46 @@ fn a_path_with_spaces_and_quotes_reaches_the_shell_as_one_argument() {
 #[test]
 fn an_argument_with_a_line_break_is_refused_before_anything_is_typed() {
     let argv = words(&["omp", "--resume", "/tmp/a\nb"]);
-    let err = herdr_open::shell_line(&argv).unwrap_err();
+    let err = herdr_open::shell_line(&argv, herdr_open::PaneShell::Posix).unwrap_err();
     assert!(err.contains("control character"), "{err}");
+}
+
+#[test]
+fn powershell_quotes_each_argument_and_calls_the_program_with_an_ampersand() {
+    let argv = words(&["C:\\Program Files\\omp\\omp.exe", "--resume", "C:\\Users\\y0c0ms\\it's [5]\\x & y%z.jsonl"]);
+    let line = herdr_open::shell_line(&argv, herdr_open::PaneShell::PowerShell).unwrap();
+    assert_eq!(line, "& 'C:\\Program Files\\omp\\omp.exe' '--resume' 'C:\\Users\\y0c0ms\\it''s [5]\\x & y%z.jsonl'");
+    assert_eq!(herdr_open::powershell_quote("é 日本"), "'é 日本'");
+    assert_eq!(herdr_open::powershell_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'", "typographic quotes are doubled");
+    assert_eq!(herdr_open::powershell_quote("$(x) `y` \"z\""), "'$(x) `y` \"z\"'", "PowerShell reads nothing else inside single quotes");
+}
+
+#[test]
+fn cmd_quotes_spaces_and_escapes_operators_and_percent() {
+    assert_eq!(herdr_open::cmd_quote("C:\\omp\\omp.exe").unwrap(), "C:\\omp\\omp.exe");
+    assert_eq!(herdr_open::cmd_quote("C:\\a b\\c.jsonl").unwrap(), "\"C:\\a b\\c.jsonl\"");
+    assert_eq!(herdr_open::cmd_quote("a&b%c").unwrap(), "\"a\"^&\"b\"^%\"c\"");
+    assert_eq!(herdr_open::cmd_quote("x \\").unwrap(), "\"x \\\\\"", "trailing backslash doubled");
+    assert!(herdr_open::cmd_quote("say \"hi\"").unwrap_err().contains("double quote"));
+    let argv = words(&["C:\\Program Files\\omp.exe", "--resume", "C:\\a b\\x.jsonl"]);
+    assert_eq!(
+        herdr_open::shell_line(&argv, herdr_open::PaneShell::Cmd).unwrap(),
+        "\"C:\\Program Files\\omp.exe\" --resume \"C:\\a b\\x.jsonl\""
+    );
+}
+
+#[test]
+fn the_pane_shell_comes_from_the_terminal_table_then_the_environment_then_the_platform() {
+    let config = "[ui]\ndefault_shell = \"C:\\\\nope.exe\"\n[terminal]\n# default_shell = \"nope\"\ndefault_shell = \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" # the shell\n";
+    assert_eq!(herdr_open::configured_shell(config).as_deref(), Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"));
+    assert_eq!(herdr_open::configured_shell("[terminal]\nshell_mode = \"auto\"\n"), None);
+    assert_eq!(herdr_open::configured_shell("[terminal]\ndefault_shell = \"\"\n"), None);
+    assert_eq!(herdr_open::PaneShell::from_exe("C:\\Windows\\System32\\cmd.exe"), herdr_open::PaneShell::Cmd);
+    assert_eq!(herdr_open::PaneShell::from_exe("/usr/bin/fish"), herdr_open::PaneShell::Posix);
+    assert_eq!(herdr_open::PaneShell::resolve(None, Some("/bin/zsh"), false), herdr_open::PaneShell::Posix);
+    assert_eq!(herdr_open::PaneShell::resolve(None, Some("/bin/zsh"), true), herdr_open::PaneShell::PowerShell, "Windows ignores $SHELL");
+    assert_eq!(herdr_open::PaneShell::resolve(Some("cmd"), None, true), herdr_open::PaneShell::Cmd);
+    assert_eq!(herdr_open::PaneShell::resolve(None, None, false), herdr_open::PaneShell::Posix);
 }
 
 #[test]
@@ -222,11 +261,22 @@ fn antigravity_and_unknown_harnesses_are_refused_with_a_reason() {
 
 #[test]
 fn tab_label_is_one_short_line() {
-    assert_eq!(herdr_open::tab_label("omp", "Fix\n  the\tbug"), "omp: Fix the bug");
-    assert_eq!(herdr_open::tab_label("omp", "   "), "omp session");
-    let long = herdr_open::tab_label("claude", &"x".repeat(200));
+    assert_eq!(herdr_open::tab_label("omp", "Fix\n  the\tbug", ""), "omp: Fix the bug");
+    assert_eq!(herdr_open::tab_label("omp", "   ", ""), "omp session");
+    let long = herdr_open::tab_label("claude", &"x".repeat(200), "");
     assert_eq!(long.chars().count(), 40);
     assert!(long.ends_with('…'));
+}
+
+#[test]
+fn the_tag_stays_in_a_long_tab_label_and_is_stable() {
+    let tag = herdr_open::session_tag("/home/u/x.jsonl");
+    assert_eq!(tag.len(), 8);
+    assert_eq!(herdr_open::session_tag("/home/u/x.jsonl"), tag);
+    assert_ne!(herdr_open::session_tag("/home/u/y.jsonl"), tag);
+    let label = herdr_open::tab_label("omp", &"x".repeat(200), &tag);
+    assert_eq!(label.chars().count(), 40);
+    assert!(label.ends_with(&format!(" · {tag}")), "{label}");
 }
 
 // ----- which pane is the session ------------------------------------------------------------------
@@ -235,6 +285,7 @@ fn pane(pane_id: &str, tab_id: &str, argvs: &[&[&str]]) -> PaneProcs {
     PaneProcs {
         pane_id: pane_id.into(),
         tab_id: tab_id.into(),
+        tab_label: String::new(),
         argvs: argvs.iter().map(|a| words(a)).collect(),
     }
 }
@@ -243,35 +294,57 @@ fn pane(pane_id: &str, tab_id: &str, argvs: &[&[&str]]) -> PaneProcs {
 fn a_pane_whose_process_was_given_the_session_is_the_match() {
     let path = "/home/u/.omp/agent/sessions/-tmp/x.jsonl";
     let panes = [pane("w2:p1", "w2:t1", &[&["/bin/bash"]]), pane("w2:p4", "w2:t4", &[&["omp", "--resume", path]])];
-    let hit = herdr_open::find_open_pane(&panes, path).expect("the omp pane matches");
+    let hit = herdr_open::find_open_pane(&panes, path, "").expect("the omp pane matches");
     assert_eq!(hit.tab_id, "w2:t4");
 }
 
 #[test]
 fn claude_and_opencode_match_by_their_id_flag() {
     let claude = [pane("w2:p2", "w2:t2", &[&["claude", "--resume", CLAUDE_ID]])];
-    assert_eq!(herdr_open::find_open_pane(&claude, CLAUDE_ID).map(|p| p.tab_id.as_str()), Some("w2:t2"));
+    assert_eq!(herdr_open::find_open_pane(&claude, CLAUDE_ID, "").map(|p| p.tab_id.as_str()), Some("w2:t2"));
     let opencode = [pane("w2:p3", "w2:t3", &[&["opencode", "--session", "ses_abc"]])];
-    assert_eq!(herdr_open::find_open_pane(&opencode, "ses_abc").map(|p| p.tab_id.as_str()), Some("w2:t3"));
+    assert_eq!(herdr_open::find_open_pane(&opencode, "ses_abc", "").map(|p| p.tab_id.as_str()), Some("w2:t3"));
 }
 
 #[test]
 fn a_bare_picker_is_not_this_session() {
     let panes = [pane("w2:p4", "w2:t4", &[&["omp", "--resume"]])];
-    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl").is_none());
+    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", "").is_none());
 }
 
 #[test]
 fn another_session_is_not_this_session() {
     let panes = [pane("w2:p4", "w2:t4", &[&["omp", "--resume", "/home/u/other.jsonl"]])];
-    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl").is_none());
+    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", "").is_none());
 }
 
 #[test]
 fn a_program_that_only_mentions_the_file_is_not_this_session() {
     let panes = [pane("w2:p5", "w2:t5", &[&["less", "/home/u/x.jsonl"]])];
-    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl").is_none());
-    assert!(herdr_open::find_open_pane(&panes, "").is_none(), "an empty identifier matches nothing");
+    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", "").is_none());
+    assert!(herdr_open::find_open_pane(&panes, "", "").is_none(), "an empty identifier matches nothing");
+}
+
+#[test]
+fn a_tab_labelled_with_the_session_tag_is_the_session_when_no_argv_is_reported() {
+    let tag = herdr_open::session_tag("/home/u/x.jsonl");
+    let mut tagged = pane("w2:p6", "w2:t6", &[]);
+    tagged.tab_label = herdr_open::tab_label("omp", "Old", &tag);
+    let panes = [tagged];
+    let hit = herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", &tag).expect("the tagged tab matches");
+    assert_eq!(hit.tab_id, "w2:t6");
+    assert!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", "00000000").is_none(), "another tag matches nothing");
+}
+
+#[test]
+fn argv_matching_comes_first_and_a_tag_never_matches_a_pane_running_something_else() {
+    let tag = herdr_open::session_tag("/home/u/x.jsonl");
+    let mut busy = pane("w2:p7", "w2:t7", &[&["less", "x"]]);
+    busy.tab_label = herdr_open::tab_label("omp", "Old", &tag);
+    assert!(herdr_open::find_open_pane(&[busy.clone()], "/home/u/x.jsonl", &tag).is_none());
+    let matched = pane("w2:p8", "w2:t8", &[&["omp", "--resume", "/home/u/x.jsonl"]]);
+    let panes = [busy, matched];
+    assert_eq!(herdr_open::find_open_pane(&panes, "/home/u/x.jsonl", &tag).map(|p| p.tab_id.as_str()), Some("w2:t8"));
 }
 
 // ----- focus or create ----------------------------------------------------------------------------
@@ -294,7 +367,7 @@ fn a_session_already_running_is_focused_and_nothing_starts() {
         ("w2:p1", "w2:t1", vec![vec!["/bin/bash"]]),
         ("w2:p4", "w2:t4", vec![argv]),
     ]);
-    let opened = herdr_open::open(&herdr, &plan).unwrap();
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap();
     assert_eq!(opened, Opened::Focused { tab_id: "w2:t4".into() });
     let calls = calls.borrow();
     assert!(calls.contains(&words(&["herdr-bin", "tab", "focus", "w2:t4"])), "{calls:?}");
@@ -307,12 +380,12 @@ fn a_session_not_running_gets_a_tab_in_its_directory_that_resumes_it() {
     let sb = sandbox("create");
     let (_roots, plan) = omp_plan(&sb);
     let (herdr, calls) = herdr_with_panes(vec![("w2:p1", "w2:t1", vec![vec!["/bin/bash"]])]);
-    let opened = herdr_open::open(&herdr, &plan).unwrap();
+    let opened = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap();
     assert_eq!(opened, Opened::Created { tab_id: "w9:t9".into() });
     let calls = calls.borrow();
     let create = words(&[
         "herdr-bin", "tab", "create", "--cwd", plan.cwd.to_str().unwrap(),
-        "--label", "omp: Old", "--focus", "--workspace", "w3",
+        "--label", plan.label.as_str(), "--focus", "--workspace", "w3",
     ]);
     assert!(calls.contains(&create), "{calls:?}");
     let command = format!("omp --resume {}", plan.ident());
@@ -328,10 +401,11 @@ fn a_pane_whose_processes_cannot_be_read_stops_the_open_before_anything_starts()
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match words.as_slice() {
             ["pane", "list"] => Ok(json!({"result": {"panes": [{"pane_id": "w2:p1", "tab_id": "w2:t1"}]}}).to_string()),
+            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             _ => Err("pane closed".to_string()),
         }
     });
-    let err = herdr_open::open(&herdr, &plan).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
     assert!(err.contains("could not read the processes of pane w2:p1"), "{err}");
     assert!(!calls.borrow().iter().any(|c| c.contains(&"create".to_string())), "fails closed, no second copy");
 }
@@ -341,7 +415,7 @@ fn herdr_not_running_is_said_and_nothing_else_is_tried() {
     let sb = sandbox("no-herdr");
     let (_roots, plan) = omp_plan(&sb);
     let (herdr, calls) = fake_herdr(|_| Err("cannot run herdr-bin: No such file or directory".to_string()));
-    let err = herdr_open::open(&herdr, &plan).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
     assert!(err.starts_with("herdr is not reachable"), "{err}");
     assert_eq!(calls.borrow().len(), 1, "only the pane list was asked");
 }
@@ -354,13 +428,14 @@ fn a_tab_is_closed_again_when_its_command_cannot_be_typed() {
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match words.as_slice() {
             ["pane", "list"] => Ok(json!({"result": {"panes": []}}).to_string()),
+            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
             ["pane", "run", ..] => Err("pane gone".to_string()),
             ["tab", "close", ..] => Ok(json!({"result": {}}).to_string()),
             other => Err(format!("unexpected {other:?}")),
         }
     });
-    let err = herdr_open::open(&herdr, &plan).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
     assert!(err.contains("could not start the resume command"), "{err}");
     assert!(calls.borrow().contains(&words(&["herdr-bin", "tab", "close", "w9:t9"])));
 }
@@ -373,10 +448,11 @@ fn a_herdr_error_message_is_passed_on_as_herdrs_words() {
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match words.as_slice() {
             ["pane", "list"] => Ok(json!({"result": {"panes": []}}).to_string()),
+            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             _ => Ok(json!({"error": {"code": "workspace_not_found", "message": "workspace w3 not found"}}).to_string()),
         }
     });
-    let err = herdr_open::open(&herdr, &plan).unwrap_err();
+    let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap_err();
     assert_eq!(err, "workspace w3 not found");
 }
 
@@ -436,11 +512,12 @@ fn a_run_that_answers_nothing_is_a_success() {
         let argv_words: Vec<&str> = args.iter().map(String::as_str).collect();
         match argv_words.as_slice() {
             ["pane", "list"] => Ok(json!({"result": {"panes": []}}).to_string()),
+            ["tab", "list"] => Ok(json!({"result": {"tabs": []}}).to_string()),
             ["tab", "create", ..] => Ok(json!({"result": {"tab": {"tab_id": "w9:t9"}, "root_pane": {"pane_id": "w9:p9"}}}).to_string()),
             ["pane", "run", ..] => Ok(String::new()),
             other => Err(format!("unexpected {other:?}")),
         }
     });
-    assert_eq!(herdr_open::open(&herdr, &plan).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
+    assert_eq!(herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
     assert!(calls.borrow().iter().any(|c| c.get(1..3) == Some(&["pane".to_string(), "run".to_string()][..])));
 }
