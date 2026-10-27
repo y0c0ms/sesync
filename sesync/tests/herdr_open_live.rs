@@ -144,7 +144,9 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
 
         // The program ends (as after a herdr restart, when the tab comes back at its prompt): the
         // next open types the command into the same tab instead of opening another.
-        herdr_json(&["pane", "send-keys", &pane.pane_id, "ctrl+c"]);
+        let bin = std::env::var("HERDR_BIN_PATH").ok().filter(|b| !b.is_empty()).unwrap_or_else(|| "herdr".to_string());
+        let keys: Vec<String> = ["pane", "send-keys", pane.pane_id.as_str(), "ctrl+c"].iter().map(|a| a.to_string()).collect();
+        Process.run(&bin, &keys).expect("the interrupt is sent");
         let deadline = Instant::now() + Duration::from_secs(10);
         let still_running = || herdr.shell_pid(&pane.pane_id).unwrap().and_then(sesync::proc_tree::program_running_under) == Some(true);
         while still_running() {
