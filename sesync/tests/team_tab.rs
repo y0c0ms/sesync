@@ -11,6 +11,7 @@ use std::time::Instant;
 
 const LOCAL: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 const REMOTE: &str = "bbbbbbbb-1111-2222-3333-444444444444";
+const GONE: &str = "cccccccc-1111-2222-3333-444444444444";
 
 fn sandbox(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("sesync-teamtab-{}-{name}", std::process::id()));
@@ -54,6 +55,7 @@ fn a_row_says_who_wrote_it_when_it_last_moved_and_whether_it_is_here() {
     a.set_pull_result(vec![
         copy(LOCAL, "Local one", Some("2020-01-01T00:00:00Z"), true),
         copy(REMOTE, "From a teammate", None, false),
+        copy(GONE, "Written here, deleted since", None, true),
     ], 0);
     let rows = a.team_rows();
     let local = rows.iter().find(|r| r.title == "Local one").unwrap();
@@ -61,6 +63,8 @@ fn a_row_says_who_wrote_it_when_it_last_moved_and_whether_it_is_here() {
     assert!(local.updated.ends_with("ago"), "the newest turn's time: {}", local.updated);
     let remote = rows.iter().find(|r| r.title == "From a teammate").unwrap();
     assert_eq!((remote.from, remote.here, remote.updated.as_str()), ("teammate", false, "-"));
+    let gone = rows.iter().find(|r| r.title == "Written here, deleted since").unwrap();
+    assert_eq!((gone.from, gone.here), ("this machine", false), "a deleted session is no longer here");
     let _ = fs::remove_dir_all(&sb);
 }
 
