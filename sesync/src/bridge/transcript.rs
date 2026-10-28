@@ -1,10 +1,12 @@
 //! The phone's chat view of a conversation: `nativeChat.readSession` (one page of the live window) and
 //! `nativeChat.subscribe` (that window, kept current).
 //!
-//! The source is the parent session's journal (`Conversation::key`). Only harnesses whose file already is
-//! the canonical journal are read here (`Harness::native_journal`: omp and Pi). Claude, OpenCode and
-//! Antigravity are converted by `sesync-conv` or their own CLI, which the bridge does not run, so their
-//! chats are refused with `unavailable`.
+//! The source is the parent session's journal (`Conversation::key`). omp and Pi journals are the file itself
+//! (`Harness::native_journal`). Every other harness is converted to the canonical journal by its own converter
+//! (`sesync-conv from-claude`; OpenCode's export through `sesync-conv from-opencode`), and the chat reads the
+//! converted copy. Copies live under the bridge's state directory, one per source state (see
+//! `converted_journal`), so a read converts only when the source changed. A harness whose source cannot be
+//! stamped is refused with `unavailable`.
 //!
 //! The window is the live one: the active branch cut at the last compaction, as `sesync-conv` reads it
 //! (`Journal::live_records`). Rows are decoded the way the desktop host decodes omp
@@ -16,18 +18,19 @@
 //! Shapes follow `~/projects/agent-hub-notes/native-host-contract.md` ("App wire requirements for phase 2",
 //! items 2-4), `mobile/src/session/use-mobile-native-chat-session.ts` and `src/shared/native-chat-types.ts`.
 
-use super::catalog::Conversation;
+use super::catalog::{self, Catalog, Conversation};
 use super::rpc::{Ctx, Failure};
 use super::stream::{self, Conn, Sink};
 use crate::harness::{self, journal::record_time};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Rows per read when the phone names no `limit`: the desktop host's mobile default.
 const DEFAULT_WINDOW: u64 = 40;
@@ -40,8 +43,10 @@ const TOOL_CAP: usize = 4_000;
 const CLIP_MARK: &str = "\n… (truncated)";
 /// The line a reply the agent aborted shows (`NATIVE_CHAT_INTERRUPTED_STATUS_TEXT`).
 const INTERRUPTED: &str = "Conversation interrupted";
-/// How often a subscribed journal's size and mtime are checked.
+/// How often a subscribed chat's source is checked.
 const POLL: Duration = Duration::from_secs(1);
+/// The longest a converted copy waits for its source to hold still before it is rebuilt anyway.
+const MAX_STALE: Duration = Duration::from_secs(5);
 
 /// The phone's `sessionId` for a conversation: the parent session's identifier.
 pub fn session_id(conv: &Conversation) -> String {
@@ -56,7 +61,8 @@ pub fn read_session(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
         Err((code, message)) if code == "worktree_not_found" => return Ok(json!({ "error": message })),
         Err(failure) => return Err(failure),
     };
-    let path = journal_of(&conversation)?;
+    let stamp = stamp_of(ctx.catalog.as_ref(), &conversation);
+    let path = journal_for(ctx.catalog.as_ref(), &ctx.dir, &conversation, stamp.as_deref()).map_err(|m| ("unavailable", m))?;
     page(&path, page_limit(params), params["beforeOffset"].as_u64())
         .map(page_json)
         .map_err(|m| ("unavailable", m))
@@ -74,9 +80,11 @@ pub fn subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Result<(
             return Ok(());
         }
     };
-    let path = match journal_of(&conversation) {
+    // Stamp before reading, so a write that lands during the read is caught by the next poll.
+    let stamp = stamp_of(ctx.catalog.as_ref(), &conversation);
+    let path = match journal_for(ctx.catalog.as_ref(), &ctx.dir, &conversation, stamp.as_deref()) {
         Ok(path) => path,
-        Err((_, message)) => {
+        Err(message) => {
             conn.sink.json(&stream::streamed(id, json!({ "type": "error", "message": message })));
             return Ok(());
         }
@@ -88,18 +96,22 @@ pub fn subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Result<(
     };
     let limit = page_limit(params);
     let pending_ok = params["capabilities"]["transcriptPending"].as_u64() == Some(1);
-    // Stamp before reading, so a write that lands during the read is caught by the next poll.
-    let stamp = harness::stat(&path);
     let (first, shown, failed) = first_frame(&path, limit, pending_ok);
     let stop = conn.register(key, id.clone());
     let _ = conn.sink.json(&stream::streamed(id, first));
+    let native = native_journal(&conversation);
     let feed = Feed {
         sink: conn.sink.clone(),
         request_id: id.clone(),
-        path,
+        catalog: Arc::clone(&ctx.catalog),
+        dir: ctx.dir.clone(),
+        conversation,
+        native,
         limit,
         stop,
         stamp,
+        pending: None,
+        converted_at: Instant::now(),
         shown,
         failed,
     };
@@ -132,16 +144,70 @@ fn session_param(params: &Value) -> Result<&str, Failure> {
         .ok_or_else(|| ("bad_request", "sessionId is required".to_string()))
 }
 
-/// The journal a conversation is read from: its parent's file, for a harness whose file already is the
-/// canonical journal. Other harnesses are converted by `sesync-conv` or a CLI, which this bridge does not run.
-fn journal_of(conv: &Conversation) -> Result<PathBuf, Failure> {
-    if harness::get(&conv.harness).is_some_and(|h| h.native_journal()) {
-        Ok(PathBuf::from(&conv.key))
-    } else {
-        Err((
-            "unavailable",
-            format!("{} chats are not read in-process: their canonical journal comes from sesync-conv", conv.harness),
-        ))
+/// Whether a conversation's parent file is already the canonical journal (omp and Pi).
+fn native_journal(conv: &Conversation) -> bool {
+    harness::get(&conv.harness).is_some_and(|h| h.native_journal())
+}
+
+/// The stamp of a conversation's source as it stands: for omp and Pi, the file's size and change time; for
+/// every other harness, what the catalog reads (`Catalog::source_stamp`). None when the source is gone.
+fn stamp_of(catalog: &dyn Catalog, conv: &Conversation) -> Option<String> {
+    if native_journal(conv) {
+        return harness::stat(Path::new(&conv.key)).map(|(len, nanos)| format!("{len}:{nanos}"));
+    }
+    catalog.source_stamp(conv)
+}
+
+/// The journal a chat reads for the source as `stamp` describes it: the parent's own file for omp and Pi,
+/// else the converted copy of that source state.
+fn journal_for(catalog: &dyn Catalog, dir: &Path, conv: &Conversation, stamp: Option<&str>) -> Result<PathBuf, String> {
+    if native_journal(conv) {
+        return Ok(PathBuf::from(&conv.key));
+    }
+    let stamp = stamp.ok_or_else(|| format!("{} chats cannot be read: their source is not available", conv.harness))?;
+    converted_journal(catalog, dir, conv, stamp)
+}
+
+/// Serialises the converters the bridge runs: each takes seconds on a long session, and two at once would only
+/// compete for the same disk and CPU.
+static CONVERTING: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The converted journal of a conversation for the source state `stamp`, kept under `<dir>/transcripts/`. A copy
+/// made from that state is reused; otherwise the converter runs and its copy replaces the older copies of the
+/// conversation. The copy is renamed into place, so a reader never sees half of one, and it is owner-only.
+fn converted_journal(catalog: &dyn Catalog, dir: &Path, conv: &Conversation, stamp: &str) -> Result<PathBuf, String> {
+    let _converting = CONVERTING.lock();
+    let transcripts = dir.join("transcripts");
+    let stem = catalog::conversation_id(&conv.harness, &conv.key);
+    let digest: String = Sha256::digest(stamp.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let file = transcripts.join(format!("{stem}-{digest}.jsonl"));
+    if file.is_file() {
+        return Ok(file);
+    }
+    super::ensure_owner_dir(&transcripts)?;
+    let scratch = transcripts.join(format!("{stem}.scratch"));
+    let _ = fs::remove_dir_all(&scratch);
+    super::ensure_owner_dir(&scratch)?;
+    let placed = catalog
+        .canonical_journal(conv, &scratch)
+        .and_then(|journal| fs::rename(&journal, &file).map_err(|e| format!("cannot place the {} journal: {e}", conv.harness)))
+        .and_then(|()| super::restrict(&file, 0o600));
+    let _ = fs::remove_dir_all(&scratch);
+    placed?;
+    remove_older_copies(&transcripts, &stem, &file);
+    Ok(file)
+}
+
+/// Removes the copies of one conversation that were made from other source states.
+fn remove_older_copies(transcripts: &Path, stem: &str, keep: &Path) {
+    let Ok(entries) = fs::read_dir(transcripts) else { return };
+    let prefix = format!("{stem}-");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let copy = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".jsonl"));
+        if copy && path != keep {
+            let _ = fs::remove_file(&path);
+        }
     }
 }
 
@@ -195,9 +261,8 @@ fn first_frame(path: &Path, limit: usize, pending_ok: bool) -> (Value, Vec<Value
     }
 }
 
-/// Whether a journal's stamp (size, mtime) moved since the last read. A journal that appears or vanishes
-/// moves it too.
-pub fn stamp_changed(last: Option<(u64, u128)>, now: Option<(u64, u128)>) -> bool {
+/// Whether a source's stamp moved since the last read. A source that appears or vanishes moves it too.
+pub fn stamp_changed(last: &Option<String>, now: &Option<String>) -> bool {
     last != now
 }
 
@@ -223,15 +288,24 @@ fn row_id(row: &Value) -> Option<&str> {
     row.get("id")?.as_str()
 }
 
-/// A subscribed journal: sends the frames that take the client's window from one state to the next.
+/// A subscribed chat: sends the frames that take the client's window from one state of its source to the next.
 struct Feed {
     sink: Sink,
     request_id: Value,
-    path: PathBuf,
+    catalog: Arc<dyn Catalog>,
+    /// The bridge's state directory, where converted copies are kept.
+    dir: PathBuf,
+    conversation: Conversation,
+    /// Whether the parent file is read as it is (omp, Pi), so a change is applied on the next poll.
+    native: bool,
     limit: usize,
     stop: Arc<AtomicBool>,
-    /// The journal's stamp when the rows the client holds were read.
-    stamp: Option<(u64, u128)>,
+    /// The source's stamp when the rows the client holds were read.
+    stamp: Option<String>,
+    /// The stamp the last poll saw, while a change is still settling (see `run_feed`).
+    pending: Option<String>,
+    /// When the window was last rebuilt from the source.
+    converted_at: Instant,
     /// The rows the client holds.
     shown: Vec<Value>,
     /// Whether the last read failed, so the client holds no window to extend.
@@ -244,12 +318,22 @@ fn run_feed(mut f: Feed) {
         if f.stop.load(Ordering::Relaxed) {
             break;
         }
-        let now = harness::stat(&f.path);
-        if !stamp_changed(f.stamp, now) {
+        let now = stamp_of(f.catalog.as_ref(), &f.conversation);
+        if !stamp_changed(&f.stamp, &now) {
+            f.pending = None;
             continue;
         }
-        f.stamp = now;
-        let frame = match page(&f.path, f.limit, None) {
+        // A converted copy is rebuilt once its source has held still for a poll, so a source written in bursts is
+        // converted once per burst; a source that never holds still is rebuilt every `MAX_STALE` regardless.
+        let settled = f.pending == now;
+        f.pending = now.clone();
+        if !f.native && !settled && f.converted_at.elapsed() < MAX_STALE {
+            continue;
+        }
+        f.stamp = now.clone();
+        f.converted_at = Instant::now();
+        let path = journal_for(f.catalog.as_ref(), &f.dir, &f.conversation, now.as_deref());
+        let frame = match path.and_then(|path| page(&path, f.limit, None)) {
             Ok(p) => {
                 let frame = if f.failed {
                     Some(json!({ "type": "replacement", "messages": p.rows.clone(), "hasMore": p.has_more, "beforeOffset": p.before }))
@@ -708,13 +792,14 @@ mod tests {
     }
 
     #[test]
-    fn a_journal_is_checked_by_size_and_mtime() {
-        assert!(!stamp_changed(None, None));
-        assert!(stamp_changed(None, Some((10, 5))));
-        assert!(!stamp_changed(Some((10, 5)), Some((10, 5))));
-        assert!(stamp_changed(Some((10, 5)), Some((11, 5))));
-        assert!(stamp_changed(Some((10, 5)), Some((10, 6))));
-        assert!(stamp_changed(Some((10, 5)), None));
+    fn a_source_is_checked_by_its_stamp() {
+        let s = |v: &str| Some(v.to_string());
+        assert!(!stamp_changed(&None, &None));
+        assert!(stamp_changed(&None, &s("10:5")));
+        assert!(!stamp_changed(&s("10:5"), &s("10:5")));
+        assert!(stamp_changed(&s("10:5"), &s("11:5")));
+        assert!(stamp_changed(&s("10:5"), &s("10:6")));
+        assert!(stamp_changed(&s("10:5"), &None));
     }
 
     #[test]
@@ -756,10 +841,62 @@ mod tests {
     }
 
     #[test]
-    fn only_a_canonical_journal_is_read_in_process() {
-        assert_eq!(journal_of(&conv("omp", "/x.jsonl", &[])).unwrap(), PathBuf::from("/x.jsonl"));
-        assert_eq!(journal_of(&conv("pi", "/x.jsonl", &[])).unwrap(), PathBuf::from("/x.jsonl"));
-        assert_eq!(journal_of(&conv("claude", "/x.jsonl", &[])).unwrap_err().0, "unavailable");
+    fn omp_and_pi_journals_are_read_as_they_are() {
+        let catalog = crate::bridge::testkit::Fixed(vec![]);
+        let dir = std::env::temp_dir();
+        assert_eq!(journal_for(&catalog, &dir, &conv("omp", "/x.jsonl", &[]), None).unwrap(), PathBuf::from("/x.jsonl"));
+        assert_eq!(journal_for(&catalog, &dir, &conv("pi", "/x.jsonl", &[]), None).unwrap(), PathBuf::from("/x.jsonl"));
+    }
+
+    /// A catalog whose converter writes `text` into the scratch directory and counts its runs.
+    struct Converter {
+        stamp: parking_lot::Mutex<String>,
+        text: parking_lot::Mutex<String>,
+        runs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Catalog for Converter {
+        fn conversations(&self) -> Result<Vec<Conversation>, String> {
+            Ok(Vec::new())
+        }
+        fn source_stamp(&self, _conv: &Conversation) -> Option<String> {
+            Some(self.stamp.lock().clone())
+        }
+        fn canonical_journal(&self, _conv: &Conversation, scratch: &Path) -> Result<PathBuf, String> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(scratch).unwrap();
+            let out = scratch.join("canonical.jsonl");
+            std::fs::write(&out, self.text.lock().as_bytes()).unwrap();
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn a_converted_journal_is_reused_for_its_source_state_and_replaced_when_the_source_moves() {
+        let dir = std::env::temp_dir().join(format!("sesync-transcript-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = Converter {
+            stamp: parking_lot::Mutex::new("1:1".into()),
+            text: parking_lot::Mutex::new("{\"type\":\"session\"}\n".into()),
+            runs: Default::default(),
+        };
+        let claude = conv("claude", "/src/0d42.jsonl", &[]);
+        let first = journal_for(&catalog, &dir, &claude, Some("1:1")).unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "{\"type\":\"session\"}\n");
+        assert_eq!(journal_for(&catalog, &dir, &claude, Some("1:1")).unwrap(), first, "the same state is reused");
+        assert_eq!(catalog.runs.load(Ordering::SeqCst), 1, "the converter ran once for that state");
+
+        *catalog.text.lock() = "{\"type\":\"session\",\"more\":true}\n".into();
+        let second = journal_for(&catalog, &dir, &claude, Some("2:2")).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(catalog.runs.load(Ordering::SeqCst), 2, "a moved source converts again");
+        assert!(!first.exists(), "the copy of the older state is removed");
+        assert!(second.is_file());
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&second).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a converted copy is owner-only");
+        assert!(journal_for(&catalog, &dir, &claude, None).is_err(), "a source that is gone cannot be read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

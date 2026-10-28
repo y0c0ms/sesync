@@ -1215,3 +1215,289 @@ async fn the_phase_two_stubs_answer_the_shapes_the_app_reads() {
     let send = phone.rpc_params(&token, "x", "agentSession.send", json!({})).await;
     assert_eq!(send["error"]["code"], "method_not_found", "the terminal-backed app never calls it: {send}");
 }
+
+// ----- Claude and OpenCode chats: their journals are converted by sesync-conv ------------------
+
+const CLAUDE_SESSION: &str = "0d42eb7d-c935-538f-a4bb-5f8602b7e466";
+const OPENCODE_SESSION: &str = "ses_ec3ed9f85ffe9BWEPMWmZNHxrh";
+const OPENCODE_SCHEMA: &str = "create table session (id text primary key, parent_id text, directory text not null, title text not null, time_created integer not null, time_updated integer not null, time_archived integer);
+create table message (id text primary key, session_id text not null, time_created integer not null, time_updated integer not null, data text not null);
+create table part (id text primary key, message_id text not null, session_id text not null, time_created integer not null, time_updated integer not null, data text not null);";
+
+/// The release `sesync-conv` the bridge converts transcripts with, as the other tests use it.
+fn sesync_conv_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sesync-conv/target/release/sesync-conv")
+}
+
+/// A Claude transcript: one record per turn, each child of the one before, under the session id.
+fn claude_transcript_text(turns: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut parent = Value::Null;
+    for (i, (role, text)) in turns.iter().enumerate() {
+        let uuid = format!("aaaaaaaa-0000-4000-8000-{i:012}");
+        let content = if *role == "user" { json!(text) } else { json!([{ "type": "text", "text": text }]) };
+        let record = json!({
+            "type": role,
+            "uuid": uuid.clone(),
+            "parentUuid": parent,
+            "sessionId": CLAUDE_SESSION,
+            "cwd": "/work/proj-c",
+            "timestamp": format!("2026-10-27T10:00:{:02}.000Z", i * 5),
+            "message": { "role": role, "content": content },
+        });
+        out.push_str(&format!("{record}\n"));
+        parent = json!(uuid);
+    }
+    out
+}
+
+/// What `opencode export` prints for the OpenCode session: its info, then its messages with one text part each.
+fn opencode_export_text(turns: &[(&str, &str)]) -> String {
+    let messages: Vec<Value> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, (role, text))| {
+            json!({
+                "info": { "id": format!("msg_{i}"), "sessionID": OPENCODE_SESSION, "role": role, "time": { "created": 1100 + 100 * i as i64 } },
+                "parts": [{ "id": format!("prt_{i}"), "sessionID": OPENCODE_SESSION, "messageID": format!("msg_{i}"), "type": "text", "text": text }],
+            })
+        })
+        .collect();
+    json!({
+        "info": { "id": OPENCODE_SESSION, "directory": "/work/proj-o", "title": "ProjO", "time": { "created": 1000, "updated": 2000 } },
+        "messages": messages,
+    })
+    .to_string()
+}
+
+/// A sandbox with one Claude session in `/work/proj-c` and one OpenCode session in `/work/proj-o`, in the
+/// stores the bridge reads. OpenCode's CLI is a script that prints the export the test writes.
+struct ChatFixture {
+    sb: PathBuf,
+    roots: Roots,
+    claude_transcript: PathBuf,
+    opencode_export: PathBuf,
+    opencode_db: PathBuf,
+}
+
+#[cfg(unix)]
+fn chat_fixture(name: &str) -> ChatFixture {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = sandbox(name);
+    let mut roots = Roots::under(&sb, sesync_conv_bin());
+    let claude_dir = roots.locations.sessions_dir("claude").join("-work-proj-c");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let claude_transcript = claude_dir.join(format!("{CLAUDE_SESSION}.jsonl"));
+    std::fs::write(&claude_transcript, claude_transcript_text(&[("user", "hello claude"), ("assistant", "hi from claude")])).unwrap();
+
+    let opencode_db = roots.locations.of("opencode").root.clone();
+    std::fs::create_dir_all(opencode_db.parent().unwrap()).unwrap();
+    let con = rusqlite::Connection::open(&opencode_db).unwrap();
+    con.execute_batch(OPENCODE_SCHEMA).unwrap();
+    con.execute(
+        "insert into session (id, directory, title, time_created, time_updated) values (?1, '/work/proj-o', 'ProjO', 1000, 2000)",
+        [OPENCODE_SESSION],
+    )
+    .unwrap();
+    drop(con);
+    let opencode_export = sb.join("opencode-export.json");
+    std::fs::write(&opencode_export, opencode_export_text(&[("user", "hello opencode"), ("assistant", "hi from opencode")])).unwrap();
+    let cli = sb.join("opencode-bin");
+    std::fs::write(&cli, format!("#!/bin/sh\ncat '{}'\n", opencode_export.display())).unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    roots.locations.set("opencode", sesync::harness::Location { root: opencode_db.clone(), cli: Some(cli) });
+    // A store's sessions are listed from the state the daemon keeps for them, not from the store alone.
+    let state = json!({ "sources": { OPENCODE_SESSION: { "fmt": "opencode", "key": OPENCODE_SESSION, "title": "ProjO", "last_seen_change": 2.0, "mirrors": {} } } });
+    std::fs::write(sb.join("state.json"), state.to_string()).unwrap();
+    ChatFixture { sb, roots, claude_transcript, opencode_export, opencode_db }
+}
+
+/// Herdr's answers for the two panes the fixture runs, as herdr lists them live: a Claude pane whose
+/// foreground process is `claude --resume <id>`, and an OpenCode pane running `opencode --session <id>`.
+#[cfg(unix)]
+fn chat_panes(method: &str, params: &Value) -> Value {
+    let pane = |pane_id: &str, terminal: &str, tab: &str, agent: &str, cwd: &str, title: &str| {
+        json!({
+            "pane_id": pane_id, "terminal_id": terminal, "tab_id": tab, "focused": false,
+            "agent": agent, "agent_status": "idle", "cwd": cwd, "foreground_cwd": cwd, "terminal_title": title,
+        })
+    };
+    match method {
+        "pane.list" => json!({ "type": "pane_list", "panes": [
+            pane("w3:pG", "term_claude", "w3:tG", "claude", "/work/proj-c", "✳ TestFromOPENCODE"),
+            pane("w3:pF", "term_opencode", "w3:tF", "opencode", "/work/proj-o", "OC | ProjO"),
+        ] }),
+        "pane.process_info" => {
+            let argv = if params["pane_id"] == "w3:pG" {
+                json!(["claude", "--resume", CLAUDE_SESSION])
+            } else {
+                json!(["/snap/opencode/287/bin/opencode", "--session", OPENCODE_SESSION])
+            };
+            json!({ "type": "pane_process_info", "process_info": { "shell_pid": 1, "foreground_processes": [{ "argv": argv }] } })
+        }
+        "pane.read" => json!({ "type": "pane_read", "read": { "text": "", "pane_id": params["pane_id"] } }),
+        _ => json!({ "type": "ok" }),
+    }
+}
+
+type Calls = Arc<parking_lot::Mutex<Vec<(String, Value)>>>;
+
+/// A herdr socket in the sandbox: each call's result is `answer(method, params)`, and every call is recorded.
+/// Serves until the test process exits.
+#[cfg(unix)]
+fn fake_herdr(socket: &Path, answer: fn(&str, &Value) -> Value) -> Calls {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let calls: Calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let listener = UnixListener::bind(socket).unwrap();
+    let recorded = Arc::clone(&calls);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let recorded = Arc::clone(&recorded);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let read = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                if read.unwrap_or(0) == 0 {
+                    return;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let method = request["method"].as_str().unwrap_or("").to_string();
+                let params = request["params"].clone();
+                let result = answer(&method, &params);
+                recorded.lock().push((method, params));
+                let _ = writeln!(stream, "{}", json!({ "id": request["id"], "result": result }));
+            });
+        }
+    });
+    calls
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claude_and_an_opencode_session_open_on_the_phone_with_their_transcripts() {
+    let fx = chat_fixture("chats-open");
+    let _herdr_calls = fake_herdr(&fx.sb.join("herdr.sock"), chat_panes);
+    let catalog = StateCatalog { roots: fx.roots, state_file: fx.sb.join("state.json") };
+    let listed = catalog.conversations().unwrap();
+    let claude = listed.iter().find(|c| c.harness == "claude").expect("the Claude session is listed").worktree_id();
+    let opencode = listed.iter().find(|c| c.harness == "opencode").expect("the OpenCode session is listed").worktree_id();
+    let herdr: Arc<dyn Herdr> = Arc::new(herdr::Socket::new(fx.sb.join("herdr.sock")));
+    let b = start_with(fx.sb.join("bridge"), Arc::new(catalog), herdr, LOOPBACK).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 9).await;
+    phone.auth(&token).await;
+
+    for (worktree, agent, session) in [(&claude, "claude", CLAUDE_SESSION), (&opencode, "opencode", OPENCODE_SESSION)] {
+        let tabs = phone.rpc_params(&token, "tabs", "session.tabs.list", json!({ "worktree": format!("id:{worktree}") })).await;
+        assert_eq!(tabs["ok"], true, "{agent} tabs: {tabs}");
+        assert_eq!(tabs["result"]["tabs"][0]["agentStatus"]["providerSession"]["id"], session, "{agent} tab: {tabs}");
+        let page = phone.rpc_params(&token, "page", "nativeChat.readSession", json!({ "agent": agent, "sessionId": session, "limit": 50 })).await;
+        assert_eq!(page["ok"], true, "{agent} transcript: {page}");
+        assert!(page["result"]["messages"].to_string().contains(&format!("hi from {agent}")), "{agent} transcript: {page}");
+    }
+}
+
+/// A `sesync-lock` that grants every claim, as when no other agent holds the conversation.
+#[cfg(unix)]
+fn granting_sesync_lock(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("sesync-lock");
+    std::fs::write(&bin, "#!/bin/sh\ncase \"$1\" in\n  claim) echo \"phone $4\"; exit 0;;\n  release) exit 0;;\nesac\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// The next frame for request `id` that contains `text`, within twelve seconds.
+async fn frame_with(phone: &mut Phone, id: &str, text: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        if let Some(frame) = phone.frame_within(Duration::from_secs(4)).await {
+            if frame["id"] == id && frame.to_string().contains(text) {
+                return frame;
+            }
+        }
+    }
+    panic!("no frame with {text:?} on {id}");
+}
+
+fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane() {
+    let fx = chat_fixture("chats-live");
+    let lock = granting_sesync_lock(&fx.sb);
+    let herdr_calls = fake_herdr(&fx.sb.join("herdr.sock"), chat_panes);
+    let catalog = StateCatalog { roots: fx.roots, state_file: fx.sb.join("state.json") };
+    let herdr: Arc<dyn Herdr> = Arc::new(herdr::Socket::new(fx.sb.join("herdr.sock")));
+    let bridge_dir = fx.sb.join("bridge");
+    let ctx = Ctx {
+        catalog: Arc::new(catalog),
+        herdr,
+        host: Host { machine_name: "test-box".into(), platform: "linux" },
+        locks: LockTools { sesync_lock: lock, lock_dir: fx.sb.join("locks") },
+        turns: Turns::default(),
+        dir: bridge_dir.clone(),
+        notify: notify::Hub::new(None),
+        usage: usage::Store::default(),
+        uploads: uploads::Store::default(),
+        launch: start::Launch::default(),
+    };
+    let b = start_ctx(bridge_dir, ctx).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 9).await;
+    phone.auth(&token).await;
+
+    // Claude: the chat opens on its live window, and a turn appended to the transcript arrives.
+    phone.request(&token, "claude-chat", "nativeChat.subscribe", json!({ "agent": "claude", "sessionId": CLAUDE_SESSION, "subscriptionId": "chat-claude", "limit": 50 })).await;
+    let opened = phone.reply_to("claude-chat").await;
+    assert!(opened.to_string().contains("hi from claude"), "{opened}");
+    let turn = json!({
+        "type": "assistant",
+        "uuid": "aaaaaaaa-0000-4000-8000-00000000000f",
+        "parentUuid": "aaaaaaaa-0000-4000-8000-000000000001",
+        "sessionId": CLAUDE_SESSION,
+        "cwd": "/work/proj-c",
+        "timestamp": "2026-10-27T10:01:00.000Z",
+        "message": { "role": "assistant", "content": [{ "type": "text", "text": "a live reply from claude" }] },
+    });
+    append_line(&fx.claude_transcript, &turn.to_string());
+    frame_with(&mut phone, "claude-chat", "a live reply from claude").await;
+
+    // OpenCode: the chat opens on its export, and a turn stored in its database and export arrives.
+    phone.request(&token, "opencode-chat", "nativeChat.subscribe", json!({ "agent": "opencode", "sessionId": OPENCODE_SESSION, "subscriptionId": "chat-opencode", "limit": 50 })).await;
+    let opened = phone.reply_to("opencode-chat").await;
+    assert!(opened.to_string().contains("hi from opencode"), "{opened}");
+    let con = rusqlite::Connection::open(&fx.opencode_db).unwrap();
+    con.execute("insert into message (id, session_id, time_created, time_updated, data) values ('msg_2', ?1, 1300, 1300, '{}')", [OPENCODE_SESSION]).unwrap();
+    con.execute(
+        "insert into part (id, message_id, session_id, time_created, time_updated, data) values ('prt_2', 'msg_2', ?1, 1300, 1300, '{}')",
+        [OPENCODE_SESSION],
+    )
+    .unwrap();
+    drop(con);
+    std::fs::write(
+        &fx.opencode_export,
+        opencode_export_text(&[("user", "hello opencode"), ("assistant", "hi from opencode"), ("assistant", "a live reply from opencode")]),
+    )
+    .unwrap();
+    frame_with(&mut phone, "opencode-chat", "a live reply from opencode").await;
+
+    // A prompt goes into the pane of the chat it was typed in.
+    let claude_send = phone.rpc_params(&token, "send-c", "terminal.send", json!({ "terminal": "term_claude", "text": "continue", "enter": true })).await;
+    assert_eq!(claude_send["ok"], true, "{claude_send}");
+    let opencode_send = phone.rpc_params(&token, "send-o", "terminal.send", json!({ "terminal": "term_opencode", "text": "continue", "enter": true })).await;
+    assert_eq!(opencode_send["ok"], true, "{opencode_send}");
+    let calls = herdr_calls.lock().clone();
+    for pane in ["w3:pG", "w3:pF"] {
+        assert!(
+            calls.iter().any(|(m, p)| m == "agent.prompt" && p["target"] == pane && p["text"] == "continue"),
+            "{pane} received the prompt: {calls:?}"
+        );
+    }
+}

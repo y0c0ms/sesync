@@ -98,6 +98,18 @@ pub trait Catalog: Send + Sync {
     fn projects(&self) -> Result<Vec<Project>, String> {
         Ok(group_by_dir(self.conversations()?))
     }
+
+    /// A stamp that changes whenever the conversation's stored content does, read without converting it: a
+    /// file's size and change time, or a store's own counts for the session. None when the source cannot be read.
+    fn source_stamp(&self, _conv: &Conversation) -> Option<String> {
+        None
+    }
+
+    /// The conversation as a canonical journal, converted into `scratch` by its harness's converter. The file
+    /// it returns is the caller's to keep or remove.
+    fn canonical_journal(&self, conv: &Conversation, _scratch: &Path) -> Result<PathBuf, String> {
+        Err(format!("cannot convert a '{}' session here", conv.harness))
+    }
 }
 
 /// The real catalog: the saved sesync state plus the harness stores under `roots`.
@@ -132,6 +144,21 @@ impl Catalog for StateCatalog {
         }
         out.sort_by(|a, b| b.updated.total_cmp(&a.updated).then_with(|| a.key.cmp(&b.key)));
         Ok(out)
+    }
+
+    fn source_stamp(&self, conv: &Conversation) -> Option<String> {
+        let h = harness::get(&conv.harness)?;
+        match h.kind() {
+            Kind::Files => harness::stat(Path::new(&conv.key)).map(|(len, nanos)| format!("{len}:{nanos}")),
+            Kind::Store => h.fingerprint(self.roots.locations.of(&conv.harness), &conv.key),
+        }
+    }
+
+    fn canonical_journal(&self, conv: &Conversation, scratch: &Path) -> Result<PathBuf, String> {
+        let h = harness::get(&conv.harness).ok_or_else(|| format!("no converter for a '{}' session", conv.harness))?;
+        let tools = harness::Tools { home: &self.roots.home, sesync_conv: &self.roots.sesync_conv };
+        h.to_journal(self.roots.locations.of(&conv.harness), &tools, &conv.key, scratch)?
+            .ok_or_else(|| format!("a '{}' session is already a canonical journal", conv.harness))
     }
 }
 

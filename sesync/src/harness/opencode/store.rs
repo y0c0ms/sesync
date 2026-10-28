@@ -216,20 +216,22 @@ pub fn write_probe(db: &Path) -> Result<(), String> {
 }
 
 /// Export a session with the opencode CLI and convert it to an omp-format journal
-/// with `sesync-conv from-opencode`, under `scratch`. The export is kept as-is because
+/// with `sesync-conv from-opencode`, under `scratch`. The export runs in `dir` (the session's own
+/// project, when known): the CLI finds a session only from there. The export is kept as-is because
 /// the CLI can print a banner before the JSON; the converter skips anything before
 /// the first '{'. A failed export or conversion is an error.
 pub fn export_and_convert(
     opencode: &Path,
     sesync_conv: &Path,
     session_id: &str,
+    dir: Option<&str>,
     scratch: &Path,
 ) -> Result<std::path::PathBuf, String> {
     use std::process::Command;
     std::fs::create_dir_all(scratch).map_err(|e| e.to_string())?;
     let export_file = scratch.join(format!("{session_id}.export.json"));
     let journal = scratch.join(format!("{session_id}.journal.jsonl"));
-    export(opencode, session_id, None, &export_file)?;
+    export(opencode, session_id, dir, &export_file)?;
 
     let conv = Command::new(sesync_conv)
         .args(["from-opencode"])

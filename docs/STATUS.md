@@ -3,6 +3,14 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: phone sessions: Claude and OpenCode chats open (branch sesync-release)
+
+- **Why.** Opening a Claude or OpenCode session on the phone failed with "claude chats are not read in-process; their canonical journal comes from sesync-conv". The tabs listed; only `nativeChat.readSession` and `nativeChat.subscribe` refused.
+- **Root cause.** `transcript::journal_of` read only omp and Pi journals. Reproduced over the encrypted link with fixture sessions: `session.tabs.list` answered the tab, and `nativeChat.readSession` answered `unavailable` with that text. Behind it, `OpenCode::to_journal` ran `opencode export` in the bridge's working directory, where the CLI does not find a session. The daemon's `Harness::export` already runs it in the session's project.
+- **What changed.** Claude and OpenCode chats are converted by the existing converters (`sesync-conv from-claude`; OpenCode's export run from the session's directory, then `from-opencode`) through `Catalog::canonical_journal`. Each conversion is kept under `<bridge state dir>/transcripts/`, owner-only, named by the conversation and a digest of the source's stamp (`Catalog::source_stamp`: a file's size and change time, or the store's counts for the session). A read converts only when the stamp moved. A subscription rebuilds once the stamp has held still for a poll, or every five seconds while it keeps moving; conversions run one at a time. omp and Pi are read as before.
+- **Tests.** `tests/bridge.rs`: Claude and OpenCode fixtures over the encrypted link: tabs, the transcript, a turn appended to the Claude file and a row added to the OpenCode store arriving on subscribe, and `terminal.send` reaching each pane as `agent.prompt`. `tests/opencode_export.rs`: the export runs from the project directory. `transcript.rs`: omp and Pi are read as they are; a converted copy is reused per source state, replaced when the state moves, owner-only; a gone source is an error. Bridge unit tests 230 (218 before); bridge integration 19.
+- **Not verified.** A real phone, and real Claude or OpenCode panes. The OpenCode export was exercised through a fake CLI that answers only from the session's directory, not the real OpenCode. Claude Code approval cards are still unrecognised.
+
 ## 2026-10-28: phone sessions: a picker-started pane finds its conversation (branch sesync-release)
 
 - **Why.** The first phone test showed "no tab on this session" for a session started without "Open in herdr": an `omp --resume` picker in herdr pane `w3:p1`. The bridge matched a pane only by a session id in its foreground argv, or by a pane it opened itself.

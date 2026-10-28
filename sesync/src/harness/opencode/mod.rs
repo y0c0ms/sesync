@@ -41,9 +41,10 @@ impl Harness for OpenCode {
     fn newest_prompt(&self, loc: &Location, key: &str) -> Option<f64> {
         store::newest_prompt(&loc.root, key)
     }
-    /// Exported with its CLI and converted; the export is removed once converted.
+    /// Exported with its CLI from the session's project directory, and converted; the export is removed once converted.
     fn to_journal(&self, loc: &Location, tools: &Tools, key: &str, scratch: &Path) -> Result<Option<PathBuf>, String> {
-        store::export_and_convert(&Self::cli(loc), tools.sesync_conv, key, scratch).map(Some)
+        let dir = store::session_directory(&loc.root, key);
+        store::export_and_convert(&Self::cli(loc), tools.sesync_conv, key, dir.as_deref(), scratch).map(Some)
     }
     /// A session id in the shape OpenCode mints.
     fn mirror_id(&self, stable: &str) -> String {
