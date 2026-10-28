@@ -3,6 +3,7 @@
 
 use super::confine::{self, IMAGE_CAP, TEXT_CAP};
 use super::rpc::{self, Ctx, Failure};
+use super::uploads;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -110,20 +111,44 @@ pub fn read(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     }))
 }
 
-/// `files.readPreview {worktree, relativePath}`: an image as base64.
+/// `files.readPreview {worktree, relativePath}`: an image as base64. An absolute `relativePath` names a staged phone
+/// upload instead, served from the uploads root only (see `read_upload_preview`).
 pub fn read_preview(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
-    let root = rpc::project_root(ctx, params)?;
     let relative = relative_param(params);
+    if Path::new(relative).is_absolute() {
+        return read_upload_preview(params, ctx);
+    }
+    let root = rpc::project_root(ctx, params)?;
     let clean = confine::lexical(relative)?;
     let mime = image_mime(&clean).ok_or_else(|| refuse("binary_file"))?;
     let path = confine::existing(&root, &clean)?;
-    if regular_file(&path)? > IMAGE_CAP {
+    preview_reply(params, mime, &path)
+}
+
+/// An image the bridge staged from a phone upload, named by its absolute path. Only a file directly inside
+/// `<bridge dir>/uploads/<conversation>/` is served: the path is canonicalised first, so a `..` or a symlink that
+/// leaves the uploads root is refused, and a file nested deeper is not an upload.
+fn read_upload_preview(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
+    let root = std::fs::canonicalize(uploads::staging_root(&ctx.dir))
+        .map_err(|_| ("not_found", "file not found".to_string()))?;
+    let path = std::fs::canonicalize(relative_param(params))
+        .map_err(|_| ("not_found", "file not found".to_string()))?;
+    let inside = path.strip_prefix(&root).map_err(|_| confine::invalid())?;
+    if inside.components().count() != 2 {
+        return Err(confine::invalid());
+    }
+    let mime = image_mime(&path).ok_or_else(|| refuse("binary_file"))?;
+    preview_reply(params, mime, &path)
+}
+
+fn preview_reply(params: &Value, mime: &'static str, path: &Path) -> Result<Value, Failure> {
+    if regular_file(path)? > IMAGE_CAP {
         return Err(refuse("file_too_large"));
     }
-    let bytes = std::fs::read(&path).map_err(|_| unreadable())?;
+    let bytes = std::fs::read(path).map_err(|_| unreadable())?;
     Ok(json!({
         "worktree": params["worktree"],
-        "relativePath": relative,
+        "relativePath": relative_param(params),
         "content": base64::engine::general_purpose::STANDARD.encode(bytes),
         "isBinary": true,
         "isImage": true,
@@ -557,6 +582,76 @@ mod tests {
         let (ctx, root, wt) = project("preview-big");
         put(&root, "huge.png", &vec![0u8; IMAGE_CAP as usize + 1]);
         assert_eq!(code(read_preview(&at(&wt, "huge.png"), &ctx)), "file_too_large");
+    }
+
+    /// A context with no conversations and a state directory: staged uploads live under `<state>/uploads/`.
+    fn staged(name: &str) -> (Ctx, PathBuf) {
+        let state = fs::canonicalize(sandbox(name)).unwrap();
+        (ctx_with(vec![], &state), state)
+    }
+
+    fn upload_at(path: &Path) -> Value {
+        json!({"worktree": "id:none", "relativePath": path.to_str().unwrap()})
+    }
+
+    #[test]
+    fn read_preview_serves_a_staged_upload_by_its_absolute_path() {
+        let (ctx, state) = staged("preview-upload");
+        let png = b"\x89PNG\r\n\x1a\n-body-";
+        put(&state, "uploads/_unscoped/abc.png", png);
+        let result = read_preview(&upload_at(&state.join("uploads/_unscoped/abc.png")), &ctx).unwrap();
+        assert_eq!(result["mimeType"], "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(result["content"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, png);
+    }
+
+    #[test]
+    fn read_preview_refuses_an_absolute_path_that_leaves_the_uploads_root() {
+        let (ctx, state) = staged("preview-upload-escape");
+        put(&state, "secret.png", b"\x89PNG\r\n\x1a\n");
+        put(&state, "uploads/_unscoped/ok.png", b"\x89PNG\r\n\x1a\n");
+        for bad in [
+            state.join("secret.png"),
+            state.join("uploads/../secret.png"),
+            state.join("uploads/_unscoped/../../secret.png"),
+        ] {
+            assert_eq!(code(read_preview(&upload_at(&bad), &ctx)), "invalid_relative_path", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn read_preview_refuses_an_upload_symlink_out_of_the_root_and_a_nested_file() {
+        let (ctx, state) = staged("preview-upload-links");
+        put(&state, "secret.png", b"\x89PNG\r\n\x1a\n");
+        put(&state, "uploads/_unscoped/deep/nested.png", b"\x89PNG\r\n\x1a\n");
+        symlink(state.join("secret.png"), state.join("uploads/_unscoped/link.png")).unwrap();
+        let link = state.join("uploads/_unscoped/link.png");
+        let nested = state.join("uploads/_unscoped/deep/nested.png");
+        assert_eq!(code(read_preview(&upload_at(&link), &ctx)), "invalid_relative_path");
+        assert_eq!(code(read_preview(&upload_at(&nested), &ctx)), "invalid_relative_path");
+    }
+
+    #[test]
+    fn read_preview_refuses_a_partial_or_non_image_upload_and_a_missing_one() {
+        let (ctx, state) = staged("preview-upload-kinds");
+        put(&state, "uploads/_unscoped/abc.part", b"partial");
+        put(&state, "uploads/_unscoped/logo.svg", b"<svg/>");
+        let part = state.join("uploads/_unscoped/abc.part");
+        let svg = state.join("uploads/_unscoped/logo.svg");
+        assert_eq!(code(read_preview(&upload_at(&part), &ctx)), "binary_file");
+        assert_eq!(code(read_preview(&upload_at(&svg), &ctx)), "binary_file");
+        let missing = state.join("uploads/_unscoped/missing.png");
+        assert_eq!(code(read_preview(&upload_at(&missing), &ctx)), "not_found");
+    }
+
+    #[test]
+    fn read_preview_refuses_an_upload_over_the_cap() {
+        let (ctx, state) = staged("preview-upload-big");
+        put(&state, "uploads/_unscoped/huge.png", &vec![0u8; IMAGE_CAP as usize + 1]);
+        let huge = state.join("uploads/_unscoped/huge.png");
+        assert_eq!(code(read_preview(&upload_at(&huge), &ctx)), "file_too_large");
     }
 
     #[test]

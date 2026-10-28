@@ -333,11 +333,16 @@ fn prune(uploads: &mut HashMap<String, Upload>, now: Instant) {
 
 /// `<state_dir>/uploads/<conversation>/`, owner-only and created if missing.
 fn staging_dir(state_dir: &Path, params: &Value) -> Result<PathBuf, Failure> {
-    let root = state_dir.join("uploads");
+    let root = staging_root(state_dir);
     let dir = root.join(conversation_dir_name(params));
     ensure_owner_dir(&root).map_err(|m| unavailable(m))?;
     ensure_owner_dir(&dir).map_err(|m| unavailable(m))?;
     Ok(dir)
+}
+
+/// `<state_dir>/uploads`: the root every staged image sits under, one directory per conversation.
+pub fn staging_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("uploads")
 }
 
 /// The staging directory's name for the conversation a request names: its worktree id, with every

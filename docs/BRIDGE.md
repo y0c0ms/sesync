@@ -106,7 +106,7 @@ Served methods:
 | `accounts.subscribe` | Streams `{type:"ready", subscriptionId, snapshot}`, then `{type:"snapshot", snapshot}` on change. `accounts.unsubscribe` ends it. |
 | `files.readDir` `{worktree, relativePath?}` | A bare array `[{name, isDirectory, isSymlink}]`: one directory's entries, directories first. More than 5 000 entries is `directory_too_large`. |
 | `files.read` `{worktree, relativePath}` | `{worktree, relativePath, content, truncated, byteLength}`: a text file, cut to 1 MiB (`truncated` says so; `byteLength` is the full size). A binary file is `binary_file`. |
-| `files.readPreview` `{worktree, relativePath}` | `{worktree, relativePath, content (base64), isBinary:true, isImage:true, mimeType}` for png, jpg, jpeg, gif or webp up to 2 MiB. |
+| `files.readPreview` `{worktree, relativePath}` | `{worktree, relativePath, content (base64), isBinary:true, isImage:true, mimeType}` for png, jpg, jpeg, gif or webp up to 2 MiB. An absolute `relativePath` names a staged upload instead: a file directly inside `<bridge dir>/uploads/<conversation>/`, the path `clipboard.commitImageUpload` returned. The reply has the same shape. Any other absolute path, and any path that leaves the uploads root through `..` or a symlink, is `invalid_relative_path`. |
 | `files.resolveTerminalPath` `{worktree, pathText, cwd?}` | `{worktree, relativePath, absolutePath, exists, isDirectory, openTarget?}`: a path a pane printed, resolved inside the project. A file has `openTarget: {kind:"worktree-file", relativePath, absolutePath}`. |
 | `files.searchPaths` `{worktree, query?, limit?, excludePaths?}` | `{worktree, files:[{relativePath, basename, kind}], totalCount, truncated}`: project files whose path matches the query, `.gitignore` honoured. `limit` defaults to 16 and tops out at 200. |
 | `git.status` `{worktree, includeLineStats?}` | `{entries:[{path, status, area, oldPath?, conflictStatus?, conflictStatusSource?, added?, removed?}], branch?, head?, upstreamStatus?}`. `area` is `staged`, `unstaged` or `untracked`. |
@@ -240,7 +240,7 @@ deferred; the interop check below covers this path.
 
 ## Files and source control (read-only)
 
-The file explorer, file previews, terminal file links, the `@` file search and the Changes and Commits tabs read the conversation's project directory, the `dir` the conversation records. Every path the phone names is checked twice: lexically (no absolute path, no `..`, no NUL byte, no `.git` component), then again after symlinks are followed (a link that leaves the project, or points into `.git`, is `invalid_relative_path`). The check lives in `confine.rs`. `.git` is never listed or read, because its config can hold remote credentials.
+The file explorer, file previews, terminal file links, the `@` file search and the Changes and Commits tabs read the conversation's project directory, the `dir` the conversation records. Every path the phone names is checked twice: lexically (no absolute path, except a staged upload's, see Images; no `..`, no NUL byte, no `.git` component), then again after symlinks are followed (a link that leaves the project, or points into `.git`, is `invalid_relative_path`). The check lives in `confine.rs`. `.git` is never listed or read, because its config can hold remote credentials.
 
 Caps: a text file is read up to 1 MiB and marked `truncated` when cut; an image preview is at most 2 MiB; a directory lists at most 5 000 entries (more is `directory_too_large`, never a silent cut); `files.searchPaths` walks at most 50 000 entries and returns `limit` rows.
 
@@ -260,7 +260,7 @@ When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines a
 
 ## Images
 
-`clipboard.startImageUpload {expectedBase64Length}` returns `{uploadId}`. `appendImageUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` equals the bytes so far), at most 512 Ki base64 characters per chunk. The total is limited to 24 Mi base64 characters and 20 MB decoded. `commitImageUpload` returns the staged absolute path as a string, which the app inserts into the prompt as `@path`. omp expands that into an image input, so the model request carries an image part (fake-model counts these as `images`). `saveImageAsTempFile {contentBase64}` does the same in one call. The app's clipboard params carry no `worktree`, so uploads stage under `_unscoped`.
+`clipboard.startImageUpload {expectedBase64Length}` returns `{uploadId}`. `appendImageUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` equals the bytes so far), at most 512 Ki base64 characters per chunk. The total is limited to 24 Mi base64 characters and 20 MB decoded. `commitImageUpload` returns the staged absolute path as a string, which the app inserts into the prompt as `@path`. omp expands that into an image input, so the model request carries an image part (fake-model counts these as `images`). `saveImageAsTempFile {contentBase64}` does the same in one call. The app's clipboard params carry no `worktree`, so uploads stage under `_unscoped`. The chat shows a staged image again in its history by reading that absolute path with `files.readPreview`.
 
 ## New sessions
 
