@@ -246,12 +246,14 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// This machine's name as the phone shows it. The kernel's hostname, else the environment's.
+/// This machine's name as the phone shows it. The kernel's hostname, else the environment's
+/// (`HOSTNAME`, or `COMPUTERNAME` on Windows).
 fn machine_name() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("COMPUTERNAME").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "this machine".to_string())
 }
 

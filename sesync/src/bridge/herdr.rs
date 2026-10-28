@@ -1,6 +1,8 @@
-//! The herdr socket client. herdr serves one JSON request per line on a Unix socket and answers each
+//! The herdr socket client. herdr serves one JSON request per line on its API socket and answers each
 //! with one line: `{"id","result":{"type":…}}` or `{"id","error":{"code","message"}}`. Every call
 //! here opens its own connection, a few milliseconds locally, so a hung call stalls only itself.
+//! The socket is a Unix socket; on Windows herdr serves a named pipe instead, named after the same
+//! path (see `Conn`).
 //!
 //! The bridge codes against the [`Herdr`] trait, so tests answer with canned JSON and the real
 //! socket is used only in production and in the sandboxed integration test. Pane and read
@@ -9,17 +11,27 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long one herdr call may run. herdr answers in milliseconds; a call that hangs must not hold a
 /// phone's request open.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The socket herdr listens on when nothing overrides it: `$HERDR_SOCKET_PATH` (herdr sets it for its
-/// own panes), else `$HOME/.config/herdr/herdr.sock`.
+/// own panes), else `herdr/herdr.sock` in herdr's configuration directory: `$HOME/.config`, and on
+/// Windows `%XDG_CONFIG_HOME%` when set, else `%APPDATA%`, as herdr itself decides.
 pub fn default_socket() -> PathBuf {
     if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH").filter(|p| !p.is_empty()) {
         return PathBuf::from(path);
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|p| !p.is_empty())
+            .or_else(|| std::env::var_os("APPDATA").filter(|p| !p.is_empty()));
+        if let Some(base) = base {
+            return PathBuf::from(base).join("herdr").join("herdr.sock");
+        }
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     home.join(".config").join("herdr").join("herdr.sock")
@@ -48,7 +60,7 @@ pub trait StatusSource: Send {
     fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String>;
 }
 
-/// herdr over its Unix socket.
+/// herdr over its API socket.
 pub struct Socket {
     path: PathBuf,
 }
@@ -63,21 +75,138 @@ impl Socket {
     }
 }
 
-#[cfg(unix)]
+/// One connection to herdr's API. On Unix it is the socket file. On Windows herdr (through the
+/// `interprocess` crate) serves a named pipe called `\\.\pipe\` followed by the socket path, and the
+/// file at that path holds only a marker. A Windows pipe has no read timeout, so waiting for a line
+/// polls `PeekNamedPipe`, as herdr's own client does.
+struct Conn {
+    #[cfg(unix)]
+    stream: std::os::unix::net::UnixStream,
+    #[cfg(windows)]
+    pipe: std::fs::File,
+    /// Bytes read past the last whole line.
+    pending: Vec<u8>,
+}
+
+impl Conn {
+    fn open(path: &Path) -> Result<Conn, String> {
+        let unreachable = |e: std::io::Error| format!("herdr is not reachable at {} ({e})", path.display());
+        #[cfg(unix)]
+        {
+            let stream = std::os::unix::net::UnixStream::connect(path).map_err(unreachable)?;
+            stream.set_write_timeout(Some(CALL_TIMEOUT)).map_err(|e| e.to_string())?;
+            Ok(Conn { stream, pending: Vec::new() })
+        }
+        #[cfg(windows)]
+        {
+            let name = format!(r"\\.\pipe\{}", path.display());
+            let deadline = Instant::now() + CALL_TIMEOUT;
+            loop {
+                match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+                    Ok(pipe) => return Ok(Conn { pipe, pending: Vec::new() }),
+                    // ERROR_PIPE_BUSY: every instance is taken; herdr opens the next one as it accepts.
+                    Err(e) if e.raw_os_error() == Some(231) && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => return Err(unreachable(e)),
+                }
+            }
+        }
+    }
+
+    fn send(&mut self, request: &Value) -> std::io::Result<()> {
+        use std::io::Write;
+        let line = format!("{request}\n");
+        #[cfg(unix)]
+        let out = &mut self.stream;
+        #[cfg(windows)]
+        let out = &mut self.pipe;
+        out.write_all(line.as_bytes())
+    }
+
+    /// One whole line, or None when `wait` passes first; a partial line waits in `pending`. An
+    /// `UnexpectedEof` error means herdr closed the connection.
+    fn line(&mut self, wait: Duration) -> std::io::Result<Option<String>> {
+        let deadline = Instant::now() + wait;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=end).collect();
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            match self.read_some(&mut buf, left)? {
+                None => return Ok(None),
+                Some(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Some(n) => self.pending.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// Read what arrives within `wait`: the byte count (0 when herdr closed the connection), or None.
+    #[cfg(unix)]
+    fn read_some(&mut self, buf: &mut [u8], wait: Duration) -> std::io::Result<Option<usize>> {
+        use std::io::Read;
+        self.stream.set_read_timeout(Some(wait))?;
+        match self.stream.read(buf) {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(windows)]
+    fn read_some(&mut self, buf: &mut [u8], wait: Duration) -> std::io::Result<Option<usize>> {
+        use std::io::Read;
+        use std::os::windows::io::AsRawHandle;
+        let deadline = Instant::now() + wait;
+        loop {
+            let mut available: u32 = 0;
+            let ok = unsafe {
+                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                    self.pipe.as_raw_handle() as _,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let e = std::io::Error::last_os_error();
+                // ERROR_INVALID_HANDLE, ERROR_BROKEN_PIPE, ERROR_BAD_PIPE, ERROR_PIPE_NOT_CONNECTED.
+                return match e.raw_os_error() {
+                    Some(6 | 109 | 232 | 233) => Ok(Some(0)),
+                    _ => Err(e),
+                };
+            }
+            if available > 0 {
+                // At most what is waiting, so the read never blocks.
+                let n = buf.len().min(available as usize);
+                return self.pipe.read(&mut buf[..n]).map(Some);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 impl Herdr for Socket {
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(&self.path)
-            .map_err(|e| format!("herdr is not reachable at {} ({e})", self.path.display()))?;
-        stream.set_read_timeout(Some(CALL_TIMEOUT)).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(CALL_TIMEOUT)).map_err(|e| e.to_string())?;
+        let mut conn = Conn::open(&self.path)?;
         let request = json!({ "id": "sesync", "method": method, "params": params });
-        writeln!(stream, "{request}").map_err(|e| format!("herdr did not take {method} ({e})"))?;
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line)
-            .map_err(|e| format!("herdr did not answer {method} ({e})"))?;
-        reply(method, &line)
+        conn.send(&request).map_err(|e| format!("herdr did not take {method} ({e})"))?;
+        match conn.line(CALL_TIMEOUT) {
+            Ok(Some(line)) => reply(method, &line),
+            Ok(None) => Err(format!("herdr did not answer {method} within {} s", CALL_TIMEOUT.as_secs())),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => reply(method, ""),
+            Err(e) => Err(format!("herdr did not answer {method} ({e})")),
+        }
     }
 
     fn status_events(&self, pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
@@ -85,13 +214,6 @@ impl Herdr for Socket {
     }
 }
 
-#[cfg(not(unix))]
-impl Herdr for Socket {
-    fn call(&self, _method: &str, _params: Value) -> Result<Value, String> {
-        Err("herdr's socket API needs a Unix socket; this platform has none".into())
-    }
-}
-#[cfg(unix)]
 impl StatusSource for StatusEvents {
     fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
         StatusEvents::next(self, wait)
@@ -101,28 +223,21 @@ impl StatusSource for StatusEvents {
 /// A subscription to `pane.agent_status_changed` for a set of panes. herdr pushes one event line per
 /// change, in order, so no status between two reads is lost. Sampling cannot promise that: an agent
 /// turn can start and finish between two samples.
-#[cfg(unix)]
 pub struct StatusEvents {
-    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
-    pending: String,
+    conn: Conn,
 }
 
-#[cfg(unix)]
 impl StatusEvents {
     /// Subscribe to the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
     pub fn open(path: &Path, pane_ids: &[String]) -> Result<StatusEvents, String> {
-        use std::io::Write;
-        use std::os::unix::net::UnixStream;
-        let mut stream = UnixStream::connect(path)
-            .map_err(|e| format!("herdr is not reachable at {} ({e})", path.display()))?;
-        stream.set_write_timeout(Some(CALL_TIMEOUT)).map_err(|e| e.to_string())?;
+        let mut conn = Conn::open(path)?;
         let subscriptions: Vec<Value> = pane_ids
             .iter()
             .map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id }))
             .collect();
         let request = json!({ "id": "sesync-events", "method": "events.subscribe", "params": { "subscriptions": subscriptions } });
-        writeln!(stream, "{request}").map_err(|e| format!("herdr did not take the event subscription ({e})"))?;
-        let mut events = StatusEvents { reader: std::io::BufReader::new(stream), pending: String::new() };
+        conn.send(&request).map_err(|e| format!("herdr did not take the event subscription ({e})"))?;
+        let mut events = StatusEvents { conn };
         let ack = events.line(CALL_TIMEOUT)?.ok_or("herdr did not acknowledge the event subscription")?;
         let ack: Value = serde_json::from_str(ack.trim()).map_err(|e| format!("herdr's subscription reply: {e}"))?;
         if ack["result"]["type"] != "subscription_started" {
@@ -150,28 +265,12 @@ impl StatusEvents {
         }
     }
 
-    /// One whole line from the socket, or None when `wait` passes first. A partial line waits in `pending`.
+    /// One whole line from the socket, or None when `wait` passes first.
     fn line(&mut self, wait: Duration) -> Result<Option<String>, String> {
-        use std::io::BufRead;
-        self.reader.get_ref().set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
-        loop {
-            if let Some(end) = self.pending.find('\n') {
-                let rest = self.pending.split_off(end + 1);
-                let line = std::mem::replace(&mut self.pending, rest);
-                return Ok(Some(line));
-            }
-            let mut chunk = String::new();
-            match self.reader.read_line(&mut chunk) {
-                Ok(0) => return Err("herdr closed the event subscription".into()),
-                Ok(_) => self.pending.push_str(&chunk),
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                    // read_line keeps what it read before the timeout in `chunk`; keep it for the next line.
-                    self.pending.push_str(&chunk);
-                    return Ok(None);
-                }
-                Err(e) => return Err(format!("herdr's event stream failed ({e})")),
-            }
-        }
+        self.conn.line(wait).map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => "herdr closed the event subscription".to_string(),
+            _ => format!("herdr's event stream failed ({e})"),
+        })
     }
 }
 
