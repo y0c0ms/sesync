@@ -2,21 +2,17 @@
 //! Windows reports only a pane's shell (`pane process-info` gives the shell and its pid, never the
 //! program inside), so "Open in herdr" asks Windows itself whether that shell is idle.
 
-/// Processes that do not count as a program running in a pane: shells (Git Bash's `bash.exe`
-/// launcher starts a second `bash.exe`), console hosts, and the helpers a prompt runs for a moment
-/// (the git branch in the prompt).
-const NOT_A_PROGRAM: [&str; 10] = [
-    "bash.exe", "sh.exe", "cmd.exe", "pwsh.exe", "powershell.exe", "conhost.exe", "openconsole.exe",
-    "git.exe", "starship.exe", "oh-my-posh.exe",
-];
+/// Processes that do not count as a program running in a pane: the console hosts Windows attaches to
+/// a console. Every other process below the pane's shell counts, a child shell and git included: a
+/// `bash script.sh` or a nested pwsh is a running program, and so is git at a credential prompt.
+const CONSOLE_HOSTS: [&str; 2] = ["conhost.exe", "openconsole.exe"];
 
-/// How long a program must last to count: a prompt starts short-lived tools while it draws (git
-/// for the branch, MSYS helpers), which one snapshot can catch.
+/// How long a program must last to count: a prompt starts short-lived tools while it draws (git for
+/// the branch, MSYS helpers), which one snapshot can catch, so a program must be in both snapshots.
 const LASTS: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Whether a program other than a shell, a console host or a prompt helper runs below `pid` and
-/// is still there [`LASTS`] later. None when the process list cannot be read, or off Windows (not
-/// needed there).
+/// Whether a program other than a console host runs below `pid` and is still there [`LASTS`] later.
+/// None when the process list cannot be read, or off Windows (not needed there).
 pub fn program_running_under(pid: u32) -> Option<bool> {
     let first = programs_below(&processes()?, pid);
     if first.is_empty() {
@@ -32,8 +28,8 @@ pub fn runs_a_program(procs: &[(u32, u32, String)], root: u32) -> bool {
     !programs_below(procs, root).is_empty()
 }
 
-/// The pids below `root` in a process list of (pid, parent pid, executable name) that are not a
-/// shell, a console host or a prompt helper.
+/// The pids below `root` in a process list of (pid, parent pid, executable name), other than console
+/// hosts.
 pub fn programs_below(procs: &[(u32, u32, String)], root: u32) -> std::collections::HashSet<u32> {
     let mut found = std::collections::HashSet::new();
     let mut frontier = vec![root];
@@ -43,7 +39,7 @@ pub fn programs_below(procs: &[(u32, u32, String)], root: u32) -> std::collectio
             if *ppid != parent || !seen.insert(*pid) {
                 continue;
             }
-            if !NOT_A_PROGRAM.contains(&name.to_ascii_lowercase().as_str()) {
+            if !CONSOLE_HOSTS.contains(&name.to_ascii_lowercase().as_str()) {
                 found.insert(*pid);
             }
             frontier.push(*pid);

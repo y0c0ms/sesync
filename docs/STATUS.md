@@ -101,9 +101,12 @@ tests win, and you fix this file. Update it at the end of every work session.
 - **Tests.** `tests/herdr_open.rs` models both kinds of herdr (programs shown, shell only): the
   calls made and their order, panes outside the session's directory never asked, 16 panes still 4
   calls, a tagged tab running something focused (unknown counts as running), an idle tagged tab
-  getting the command again, the status drawn before any call. `tests/proc_tree.rs`: Git Bash at
-  its prompt (launcher, inner bash, git) runs nothing; an agent below it does; another pane's does
-  not count. `tests/herdr_open_live.rs` was Unix-only; it now runs on Windows too against a real
+  getting the command again, the status drawn before any call. `tests/proc_tree.rs`: a shell with only
+  its console host is idle; a child shell (`bash script.sh`, a nested pwsh), git at a credential prompt
+  and a cmd shim are busy; an agent below counts; another pane's does not; a Git Bash launcher counts
+  as busy (the real shell is its child). Only the shell and its console host are idle, so a tagged
+  tab running a script is focused, never typed into.
+  `tests/herdr_open_live.rs` was Unix-only; it now runs on Windows too against a real
   herdr (opt-in): call counts, the pane's directory, the typed line holding the command alone, and
   the resume into the same tab once the program has ended.
 - **Not covered.** The live test needs a running herdr, so CI does not run it.
