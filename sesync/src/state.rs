@@ -30,12 +30,70 @@ pub struct Mirror {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TeamPush {
+    /// Hash of the canonical journal bytes at the last push, or at the last check that found the
+    /// completed turns unchanged (`turns`). Used only to skip re-parsing unchanged bytes.
     pub hash: String,
     pub pushed_at: f64,
     /// The member-list version this machine last sealed the conversation under, or last confirmed
     /// it has nothing to re-seal at (the stored record is someone else's, or already current).
     /// 0 when never recorded: a push made before this existed, which is then checked once.
     pub list: u64,
+    /// Fingerprint of the completed turns the team copy holds as far as this machine knows
+    /// (`turns::fingerprint`): what the last push or check agreed on. The next push is due only when
+    /// the local turns differ from it. Empty when never recorded (an older state file, or never pushed).
+    pub turns: String,
+}
+
+/// Why a conversation's team copy and this machine's copy do not agree. The daemon records it when a
+/// push is held back; while the local turns stay as they were, pushes for the conversation stay paused.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TeamConflict {
+    /// The turn fingerprint of the local conversation when the conflict was found.
+    pub local: String,
+    /// When it was found, seconds since the epoch.
+    pub at: f64,
+    pub kind: ConflictKind,
+    /// Behind: how many completed turns the team copy has more. Diverged: the common prefix length.
+    pub count: usize,
+    /// Diverged: completed turns this machine has past the common prefix.
+    pub local_new: usize,
+    /// Diverged: completed turns the team copy has past the common prefix.
+    pub team_new: usize,
+    /// Unverified: why the stored copy could not be read or verified. Never its content.
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    /// The team copy has completed turns this machine does not.
+    Behind,
+    /// Neither copy is a prefix of the other.
+    Diverged,
+    /// The stored copy cannot be opened or read as a journal.
+    Unverified,
+}
+
+impl TeamConflict {
+    /// The one-line reason the daemon log and the TUI show.
+    pub fn describe(&self) -> String {
+        match self.kind {
+            ConflictKind::Behind => format!("the team copy has {} more completed turn(s); this copy is behind, not pushed", self.count),
+            ConflictKind::Diverged => format!("diverged from the team copy after {} common turn(s); not pushed", self.count),
+            ConflictKind::Unverified => format!("the team copy cannot be verified ({}); not pushed", self.why),
+        }
+    }
+}
+
+/// A decision to push this machine's copy over the team's, made by the user in the TUI ("keep mine").
+/// It applies only to the exact local turns and the exact team record (sequence) the user reviewed,
+/// so a newer team push, or a newer local turn, makes it inert.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TeamForce {
+    /// The local turn fingerprint the user reviewed.
+    pub local: String,
+    /// The sequence of the team record the user reviewed.
+    pub team_seq: u64,
 }
 
 /// The outcome of the daemon's last attempts to write one mirror target of a session.
@@ -149,6 +207,15 @@ pub struct State {
     /// Per (space, conversation), the highest team record sequence this device has accepted.
     /// A record below it is a rollback and is refused. Only ever raised.
     pub team_seen: BTreeMap<String, u64>,
+    /// Per (space, conversation): why a push was held back, while the team copy and this machine's
+    /// copy disagree (`TeamConflict`). Written by the daemon; the TUI reads it from the file.
+    pub team_conflict: BTreeMap<String, TeamConflict>,
+    /// Per (space, conversation): a "keep mine" the user chose in the TUI (`TeamForce`). User-owned,
+    /// merged like the shares: the file holds it, and a save adds this process's new requests.
+    pub team_force: BTreeMap<String, TeamForce>,
+    /// Runtime only: forced-push requests this process made since it last read or wrote the file.
+    /// Never saved; `save_user` adds them to the file, and the absorbs keep them until then.
+    pub team_force_asked: BTreeMap<String, TeamForce>,
     /// Runtime only: conversation ids read from a pre-multi-team `marked` list. The caller
     /// folds them into `shares` once it knows the machine's teams. Never saved.
     pub legacy_marked: BTreeSet<String>,
@@ -248,6 +315,51 @@ impl State {
     /// Record the member-list version this team's copy of the conversation is settled at.
     pub fn set_team_list(&mut self, space: &str, conversation: &str, list: u64) {
         self.team.entry(team_key(space, conversation)).or_default().list = list;
+    }
+
+    /// What the last push or check recorded for this team's copy of the conversation (all empty when none).
+    pub fn team_record(&self, space: &str, conversation: &str) -> TeamPush {
+        self.team.get(&team_key(space, conversation)).cloned().unwrap_or_default()
+    }
+
+    /// Record that the team copy agrees with these completed turns, for these bytes, without a push. Used
+    /// by the migration from bytes-only state and by a check that found the team copy identical.
+    pub fn record_team_turns(&mut self, space: &str, conversation: &str, hash: &str, turns: &str) {
+        let e = self.team.entry(team_key(space, conversation)).or_default();
+        e.hash = hash.to_string();
+        e.turns = turns.to_string();
+    }
+
+    /// The turn fingerprint a push wrote (`record_team_push` records the bytes and the time).
+    pub fn set_team_turns(&mut self, space: &str, conversation: &str, turns: &str) {
+        self.team.entry(team_key(space, conversation)).or_default().turns = turns.to_string();
+    }
+
+    /// Why this team's copy of the conversation is held back, if it is.
+    pub fn team_conflict(&self, space: &str, conversation: &str) -> Option<&TeamConflict> {
+        self.team_conflict.get(&team_key(space, conversation))
+    }
+
+    /// Record a conflict (`Some`), or clear it (`None`) once the copies agree or the user resolved it.
+    pub fn set_team_conflict(&mut self, space: &str, conversation: &str, conflict: Option<TeamConflict>) {
+        match conflict {
+            Some(c) => { self.team_conflict.insert(team_key(space, conversation), c); }
+            None => { self.team_conflict.remove(&team_key(space, conversation)); }
+        }
+    }
+
+    /// The user's "keep mine" for this team's copy of the conversation, if one was chosen.
+    pub fn team_force(&self, space: &str, conversation: &str) -> Option<&TeamForce> {
+        self.team_force.get(&team_key(space, conversation))
+    }
+
+    /// Ask for a push of this machine's copy over the team's copy with sequence `team_seq`, which the
+    /// user reviewed, when the local turns are `local`. Saved with the next `save_user`.
+    pub fn request_team_force(&mut self, space: &str, conversation: &str, local: &str, team_seq: u64) {
+        let key = team_key(space, conversation);
+        let f = TeamForce { local: local.to_string(), team_seq };
+        self.team_force.insert(key.clone(), f.clone());
+        self.team_force_asked.insert(key, f);
     }
 
     /// When the last successful push for this team happened, if any.
@@ -540,6 +652,7 @@ impl State {
                     hash: v.get("hash").and_then(Value::as_str).unwrap_or("").to_string(),
                     pushed_at: v.get("pushed_at").and_then(Value::as_f64).unwrap_or(0.0),
                     list: v.get("list").and_then(Value::as_u64).unwrap_or(0),
+                    turns: v.get("turns").and_then(Value::as_str).unwrap_or("").to_string(),
                 });
             }
         }
@@ -548,6 +661,22 @@ impl State {
             for (conv, seq) in seen {
                 if let Some(n) = seq.as_u64() {
                     st.team_seen.insert(conv.clone(), n);
+                }
+            }
+        }
+        // Conflicts and forced-push requests are optional too. An entry that does not parse is dropped:
+        // the next push check finds the conflict again, and a request is only ever a deliberate choice.
+        if let Some(c) = raw.get("team_conflict").and_then(Value::as_object) {
+            for (key, v) in c {
+                if let Ok(conflict) = serde_json::from_value::<TeamConflict>(v.clone()) {
+                    st.team_conflict.insert(key.clone(), conflict);
+                }
+            }
+        }
+        if let Some(f) = raw.get("team_force").and_then(Value::as_object) {
+            for (key, v) in f {
+                if let Ok(force) = serde_json::from_value::<TeamForce>(v.clone()) {
+                    st.team_force.insert(key.clone(), force);
                 }
             }
         }
@@ -602,6 +731,11 @@ impl State {
         self.shares = disk.shares.clone();
         // The user's deletes are theirs too; the caller forgets them (`forget_deleted`).
         self.deleted = disk.deleted.clone();
+        // Forced-push requests are the user's too; one this process made and has not saved yet stays.
+        self.team_force = disk.team_force.clone();
+        for (key, f) in &self.team_force_asked {
+            self.team_force.insert(key.clone(), f.clone());
+        }
         if self.legacy_marked.is_empty() {
             self.legacy_marked = disk.legacy_marked.clone();
         }
@@ -700,10 +834,15 @@ impl State {
         // A session deleted here leaves the file now, whether or not a daemon runs to apply it.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         disk.forget_deleted(now);
+        // A "keep mine" asked here goes into the file; the file's other requests stay as they are.
+        for (key, f) in std::mem::take(&mut self.team_force_asked) {
+            disk.team_force.insert(key, f);
+        }
         disk.save(path)?;
         // This process now holds what the file holds for the user's fields.
         self.shares = disk.shares.clone();
         self.deleted = disk.deleted.clone();
+        self.team_force = disk.team_force.clone();
         for (key, s) in self.sources.iter_mut() {
             if let Some(d) = disk.sources.get(key) {
                 s.chosen_targets = d.chosen_targets.clone();
@@ -735,8 +874,10 @@ impl State {
             "subagents": self.subagents,
             "shares": self.shares.iter().map(|(c, spaces)| (c.clone(), serde_json::json!(spaces.iter().collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
             "deleted": self.deleted,
-            "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at, "list": v.list}))).collect::<serde_json::Map<_, _>>(),
+            "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at, "list": v.list, "turns": v.turns}))).collect::<serde_json::Map<_, _>>(),
             "team_seen": self.team_seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
+            "team_conflict": self.team_conflict.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
+            "team_force": self.team_force.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
         });
         // A unique temp name per writer (the daemon and the TUI both save this file), synced to
         // disk before the rename, then the directory entry is synced. A crash leaves the old file

@@ -2,13 +2,14 @@
 //! due marked session, sealed for the listed devices. Does nothing when no team is configured, so
 //! an install without a team behaves as before.
 
-use crate::device_keys::load_or_create;
-use crate::sealed::seal_for_devices;
+use crate::device_keys::{load_or_create, DeviceFile};
+use crate::sealed::{open_stored_for_writer, seal_for_devices, SealError, Trust};
 use crate::state::State;
 use crate::team_join;
 use crate::team_push::HttpTeam;
-use crate::team_sync::{push_due, ResealCheck, TeamPass, DEFAULT_TEAM_QUIET_SECS};
+use crate::team_sync::{push_due, Codec, ResealCheck, TeamPass, DEFAULT_TEAM_QUIET_SECS};
 use crate::team_watch::fetch_and_verify;
+use sesync_team::signed_records::Binding;
 use std::path::Path;
 
 /// Why a team pass could not run at all. A pass that runs reports per-session results instead.
@@ -25,6 +26,45 @@ pub enum NotRun {
 /// Settings read from the environment, as the team side already uses them.
 pub fn team_quiet_secs() -> f64 {
     std::env::var("SESYNC_TEAM_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TEAM_QUIET_SECS)
+}
+
+/// The daemon's codec: seals for the devices the verified list names, and opens a stored copy the way
+/// this device's reader does (`open_stored_for_writer`).
+struct DaemonCodec<'a> {
+    writer: &'a DeviceFile,
+    trust: &'a Trust,
+    space: &'a str,
+}
+
+impl Codec for DaemonCodec<'_> {
+    fn seal(&mut self, conversation: &str, version: u64, plain: &[u8]) -> Result<Vec<u8>, String> {
+        seal_for_devices(self.writer, self.trust, self.space, conversation, version, plain)
+            .map_err(|e| format!("cannot seal: {e:?}"))
+    }
+
+    fn open(&mut self, conversation: &str, floor: u64, stored: &[u8]) -> Result<Vec<u8>, String> {
+        let expect = Binding {
+            space: self.space.to_string(),
+            conversation: conversation.to_string(),
+            min_sequence: floor,
+        };
+        open_stored_for_writer(self.writer, self.trust, &expect, stored).map_err(|e| why_unreadable(&e))
+    }
+}
+
+/// Why a stored copy could not be read, in words a person can act on. Never the content.
+fn why_unreadable(e: &SealError) -> String {
+    match e {
+        SealError::StaleList { .. } => "it is sealed under an older member list, so the author must re-seal it".into(),
+        SealError::UnknownAuthor => "it was written by a device the member list does not name".into(),
+        SealError::BadSignature => "its signature does not verify".into(),
+        SealError::NotForThisDevice => "it is not sealed to this device".into(),
+        SealError::Rollback { .. } => "it is older than a record this machine already accepted".into(),
+        SealError::WrongSpace | SealError::WrongConversation => "it is bound to another team or conversation".into(),
+        SealError::Malformed | SealError::UnsupportedFormat => "it is not a readable record".into(),
+        SealError::TooLarge => "it is larger than the session limit".into(),
+        SealError::Crypto(_) => "its content does not decrypt".into(),
+    }
 }
 
 /// Run a pass for every team this machine belongs to: each team pushes the sessions shared with
@@ -64,12 +104,9 @@ pub fn run(
         // now holds, so members who hold that list (and any member just added) can open them.
         let reseal = trust.version().ok()
             .map(|list| ResealCheck { list, author: writer.public_signing().to_vec() });
-        let seal = |session: &str, version: u64, plain: &[u8]| -> Result<Vec<u8>, String> {
-            seal_for_devices(&writer, &trust, &space, session, version, plain)
-                .map_err(|e| format!("cannot seal: {e:?}"))
-        };
+        let mut codec = DaemonCodec { writer: &writer, trust: &trust, space: &space };
         let mut content = |id: &str| canon.get(id, |id| content_of(id));
-        passes.push(push_due(state, &remote, &space, now, quiet, content, &mut last_change_of, seal,
+        passes.push(push_due(state, &remote, &space, now, quiet, content, &mut last_change_of, &mut codec,
                              reseal.as_ref()));
     }
     if passes.is_empty() { return Err(NotRun::NoTeam); }
@@ -102,7 +139,13 @@ pub fn summary(pass: &TeamPass) -> String {
     if !pass.resealed.is_empty() {
         s.push_str(&format!(", {} re-sealed under the current member list", pass.resealed.len()));
     }
-    for (id, why) in &pass.failed {
+    if !pass.waiting_for_turn.is_empty() {
+        s.push_str(&format!(", {} waiting for a first completed turn", pass.waiting_for_turn.len()));
+    }
+    if !pass.refused.is_empty() {
+        s.push_str(&format!(", {} held back (the team copy is not written over)", pass.refused.len()));
+    }
+    for (id, why) in pass.refused.iter().chain(pass.failed.iter()) {
         s.push_str(&format!("; {id}: {why}"));
     }
     s

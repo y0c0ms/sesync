@@ -3,6 +3,26 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: team turns, phase 2 (branch team-turns): pushes judge turns and never write over a newer copy
+
+- **Why.** A push was due when the canonical bytes changed, and nothing read the team's copy first:
+  a machine behind the team replaced its newer turns (last push won, silently).
+- **Now.** A push is due only when the completed turns change (`turns.rs`). Under the lease, the
+  stored copy is read and compared (`team_sync::check_stored`): identical records the fingerprint;
+  this machine ahead pushes; behind, diverged or unverifiable is held and written to
+  `State::team_conflict` (the reason is shown, pushes for those turns pause). A first upgrade records
+  the fingerprint without pushing. "Keep mine" (`State::team_force`) overwrites only the copy the user
+  reviewed (its sequence) for exactly their local turns. State: `team[].turns`, `team_conflict`,
+  `team_force` (ARCHITECTURE "Push path", "Persistence"). Client-only: no wire or record change.
+  `daemon_pass` log names held conversations. Invariant 27 in AGENTS.
+- **Tests.** `tests/team_sync.rs` (32: the silent-overwrite case, ahead after a teammate's push, diverged,
+  metadata-only, prompt without reply, the upgrade migration, identical copy, unverifiable copy with its
+  reason, paused hold, keep-mine applied and made inert, restart), `tests/sealed_client.rs` (a writer
+  reads its own record sealed under an older list; another member's stale record is refused).
+  Mutation check: with the behind-hold removed, `a_behind_machine_never_replaces_newer_turns` fails.
+  Fixtures that pushed raw bytes now push journals (`team_lifecycle_e2e`, `team_pass_teams`,
+  `team_pass_live`, `daemon_watch_live`).
+
 ## 2026-10-28: team turns, phase 1 (branch team-turns): the comparison unit
 
 - **Why.** Team sync judged change by the bytes of the canonical journal, so omp metadata appended

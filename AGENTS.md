@@ -115,7 +115,7 @@ HS_E2E=1 sh build-test.sh
   the cache is `manage::TitleCache`), `qr`, `clipboard`, `remote`, `remote_http`.
 - **Team client**: `team_cli` (admin commands), `team_join`, `device_keys`, `sealed`,
   `team_pull_verified` (the live pull), `team_watch`, `team_push`, `team_sync` (trigger),
-  `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`.
+  `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`, `turns` (completed turns and the comparison).
 - **Test-only today** (do not wire new features to these without a decision): `team_pull`
   (superseded by `team_pull_verified`), `team_conflict`, `divergence`,
   `harness::claude::compaction`.
@@ -160,6 +160,7 @@ Each one has a test; if you change the area, keep the test and add one for the n
 | 24 | A team this machine can no longer use is never a dead end: a pull the server refuses says so (the team's card, the status line, the daemon log), never reads as an empty team, and "Leave a team" removes a revoked, removed or declined membership with its shares, or a team managed here. | `PullOutcome::error`, `team_actions::leave`, `App::left_team` |
 | 25 | Two TUIs never overwrite each other's choices: a save writes only the shares and chosen targets changed in that process since it last read or wrote the file, a re-read takes every other choice from the file, and deletes are only ever added. | `State::user_base`, `State::save_user`, `State::absorb_user_choices`, `App::save_user`, `App::absorb_daemon_state` |
 | 26 | A member-list change never hides a shared conversation for good: each machine re-seals, under the current list, every unchanged shared conversation whose stored record its own signature proves it wrote, once per list change; it never re-seals a record someone else wrote last, and never on the word of an unverified header. | `team_sync::needs_reseal`, `signed_records::authorship`, `State::team_list` |
+| 27 | A team copy is never overwritten by a machine that lacks its completed turns: the push reads the stored copy under the lease, and writes only when this machine is the same or ahead of it (or the user chose "keep mine" for the exact copy they reviewed). Behind, diverged and unverifiable copies are held, and the hold is recorded. Change is judged on completed turns, never bytes or file times. | `team_sync::push_due`, `team_sync::check_stored`, `turns::compare`, `State::team_conflict`, `State::team_force`, `tests/team_sync.rs` (`a_behind_machine_never_replaces_newer_turns`, `a_diverged_copy_is_never_written_over`), `tests/turns.rs` |
 
 ## Change recipes
 

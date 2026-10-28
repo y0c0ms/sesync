@@ -36,7 +36,8 @@ fn one_damaged_or_left_team_does_not_stop_the_push_into_the_others() {
     }
 
     let now = 2_000_000_000.0;
-    let passes = sesync::team_pass::run(&wcfg, &mut state, now, |_| Ok(b"the shared session".to_vec()), |_| Some(now - 1_000.0))
+    let journal = b"{\"type\":\"session\",\"version\":3,\"id\":\"ses_1\",\"cwd\":\"/tmp\"}\n{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n".to_vec();
+    let passes = sesync::team_pass::run(&wcfg, &mut state, now, |_| Ok(journal.clone()), |_| Some(now - 1_000.0))
         .expect("the healthy team is still pushed");
     let pushed: Vec<&String> = passes.iter().flat_map(|p| p.pushed.iter()).collect();
     assert_eq!(pushed, vec!["ses_1"], "pushed once, into alpha");
@@ -53,5 +54,5 @@ fn one_damaged_or_left_team_does_not_stop_the_push_into_the_others() {
     };
     let out = watch.pull_all(&BTreeMap::new());
     assert_eq!(out.shown.len(), 1, "the reader in alpha gets it");
-    assert_eq!(out.shown[0].text, b"the shared session");
+    assert_eq!(out.shown[0].text, journal);
 }

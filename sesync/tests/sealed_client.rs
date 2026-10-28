@@ -4,7 +4,7 @@
 //! text. A record is bound to its space, conversation and sequence: one sealed for another space or
 //! conversation is refused, and one below the reader's floor is a rollback.
 use sesync::device_keys::{load_or_create, DeviceFile};
-use sesync::sealed::{open_for_device, seal_for_devices, SealError, Trust, MAX_SESSION_BYTES};
+use sesync::sealed::{open_for_device, open_stored_for_writer, seal_for_devices, SealError, Trust, MAX_SESSION_BYTES};
 use sesync_team::membership::{device_entry, Device, MemberList};
 use sesync_team::session_keys::{open_session_bound, seal_session_bound, session_aad, unwrap_for, wrap_for, DataKey, Wrap};
 use sesync_team::signed_records::{open_record, seal_record, Binding};
@@ -88,6 +88,39 @@ fn a_list_that_the_pinned_admin_did_not_sign_is_refused() {
     let r2 = open_for_device(&reader, &forged, &expect("personal", "ses_f"), &rec);
     assert!(matches!(r2, Err(SealError::BadSignature)), "{r2:?}");
     let _ = std::fs::remove_dir_all(&w); let _ = std::fs::remove_dir_all(&r);
+}
+
+#[test]
+fn a_writer_reads_back_its_own_record_sealed_under_a_list_it_no_longer_holds() {
+    // The guard reads the stored copy before it writes. The writer's own record must open after the
+    // member list moved on, or a membership change would make the writer's own conversation unreadable
+    // to its own push.
+    let w = dir("ow"); let r = dir("or");
+    let admin = Device::generate();
+    let writer = load_or_create(&w).unwrap();
+    let reader = load_or_create(&r).unwrap();
+    let old = trust(&admin, &[&writer, &reader]);
+    let newer = Trust::new(admin.public_key(), MemberList::new(2, vec![device_entry(&team_device(&writer)), device_entry(&team_device(&reader))]).sign(&admin).to_bytes());
+    let rec = seal_for_devices(&writer, &old, "personal", "ses_o", 1, b"my own text").unwrap();
+    assert!(matches!(open_for_device(&writer, &newer, &expect("personal", "ses_o"), &rec), Err(SealError::StaleList { .. })),
+        "the shared reader path still refuses a stale list");
+    let text = open_stored_for_writer(&writer, &newer, &expect("personal", "ses_o"), &rec).unwrap();
+    assert_eq!(text, b"my own text");
+    for d in [&w, &r] { let _ = std::fs::remove_dir_all(d); }
+}
+
+#[test]
+fn a_writer_does_not_read_another_members_stale_record_as_its_own() {
+    let w = dir("aw"); let r = dir("ar");
+    let admin = Device::generate();
+    let writer = load_or_create(&w).unwrap();
+    let other = load_or_create(&r).unwrap();
+    let old = trust(&admin, &[&writer, &other]);
+    let newer = Trust::new(admin.public_key(), MemberList::new(2, vec![device_entry(&team_device(&writer)), device_entry(&team_device(&other))]).sign(&admin).to_bytes());
+    let rec = seal_for_devices(&other, &old, "personal", "ses_a", 1, b"theirs").unwrap();
+    assert!(matches!(open_stored_for_writer(&writer, &newer, &expect("personal", "ses_a"), &rec),
+        Err(SealError::StaleList { .. })), "another member's record under an older list is refused: they must re-seal it");
+    for d in [&w, &r] { let _ = std::fs::remove_dir_all(d); }
 }
 
 #[test]

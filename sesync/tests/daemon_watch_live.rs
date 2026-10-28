@@ -112,7 +112,9 @@ fn the_watch_loop_pushes_a_marked_session_and_raises_the_floor_on_the_next_pull(
     std::fs::create_dir_all(dir.join("pi").join("sessions")).unwrap();
     std::fs::create_dir_all(dir.join("claude").join("projects")).unwrap();
     let journal = sessions.join(format!("2026-10-01T10-00-00-000Z_{SID}.jsonl"));
-    std::fs::write(&journal, format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{SID}\"}}\n{PLAINTEXT}\n")).unwrap();
+    std::fs::write(&journal, format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{SID}\"}}\n\
+{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{{\"role\":\"user\",\"content\":\"a question\"}}}}\n\
+{{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{PLAINTEXT}\"}}]}}}}\n")).unwrap();
     let file = std::fs::OpenOptions::new().write(true).open(&journal).unwrap();
     file.set_times(std::fs::FileTimes::new()
         .set_modified(SystemTime::now() - Duration::from_secs(3600))).unwrap();

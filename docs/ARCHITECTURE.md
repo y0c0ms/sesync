@@ -642,21 +642,60 @@ rewrites in another way than the rules above would show as a change.
 
 ## Push path (exactly what runs)
 
-1. `State::marked` holds the sessions the user marked. Nothing else is eligible.
-2. `team_sync::is_due` requires the source to be quiet for `SESYNC_TEAM_QUIET` (default
-   120 s) and the plaintext hash to differ from the last successful push.
-3. `team_sync::canonical_for_source` produces the team copy: the omp/Pi journal as-is for
-   omp/Pi sources, `sesync-conv from-claude` for Claude, `from-antigravity` for Antigravity, and
-   `opencode export` + `sesync-conv from-opencode` for OpenCode. Reasoning is kept only where
-   the converter can carry it as ordinary text; signed Claude thinking is dropped.
-4. `team_push` acquires the lease. **The lease version is the record sequence.**
-5. `sealed::seal_for_devices` compresses, encrypts, wraps the key to every listed device,
-   and signs a v2 record bound to `(space, conversation, sequence)`.
-6. `HttpTeam::put` posts to `/record/sealed?space&conversation&machine&version`. The server
-   checks the token, the exact lease version, the signature, the author's place in the
-   current list and the record's sequence equal to that version, then stores the bytes.
-7. On success the daemon records `{hash, pushed_at}` in `State::team`. Sealing is randomized,
-   so the change check must never hash sealed bytes (there is a regression test for this).
+1. `State::shares` holds the sessions the user shared with a team. Nothing else is eligible.
+2. The canonical journal is built (`team_sync::canonical_for_source`: the omp/Pi file as it is, or
+   converted: `sesync-conv from-claude` for Claude, `from-antigravity`, and `opencode export` +
+   `sesync-conv from-opencode`). Its **completed turns** are parsed and fingerprinted
+   (`turns::turns_of`, `turns::fingerprint`). When the bytes equal the recorded push bytes
+   (`State::team[].hash`), the recorded fingerprint is used without parsing again.
+3. A session with no completed turn yet is not sent (`TeamPass::waiting_for_turn`).
+4. Migration: a session whose recorded push has no fingerprint (a state file from before turns) and
+   whose bytes still equal the recorded hash records its fingerprint and sends nothing. No mass
+   re-push on upgrade.
+5. Due: the turns differ from the recorded fingerprint, the source has been quiet for
+   `SESYNC_TEAM_QUIET` (default 120 s), and no held conflict (`State::team_conflict`) applies to these
+   exact turns. Metadata appended to a journal, a trailing prompt and a reply still running tools
+   never make a session due. `team_sync::is_due` is the pure rule.
+6. `team_push` takes the conversation's lease. Then the guard (`team_sync::check_stored`) reads the
+   stored record under the lease and compares its turns with this machine's:
+   - nothing stored: push;
+   - the stored copy opens (`sealed::open_stored_for_writer`: this machine's own records under any
+     member list, anyone else's under the current verified list) and `turns::compare` says
+     **Identical**: nothing is written, the fingerprint is recorded;
+   - **Ahead** (the stored copy is a prefix of this machine's): push, as the next sequence, even if
+     the stored sequence is newer than the last one this machine accepted;
+   - **Behind** (this machine's turns are a prefix of the team copy) or **Diverged**: nothing is
+     written. `State::team_conflict` records the reason, and pushes for these turns stay paused until
+     the local turns change or the user decides (the TUI shows it);
+   - the stored copy cannot be opened or read as a journal: nothing is written; the conflict says why
+     (`unverified`), never the content.
+   - **Keep mine** (`State::team_force`): the user chose to push this machine's copy over the team's.
+     It applies only to the exact local turns and the exact stored sequence the user reviewed. Any
+     other stored sequence leaves the guard above in charge, so a decision made about an older team
+     copy never overwrites a newer push.
+7. The record is sealed for the listed devices (`sealed::seal_for_devices`) under the lease version,
+   which is its sequence, and written (`HttpTeam::put`, `POST /record/sealed`). The server checks the
+   token, the exact lease version, the signature, the author's place in the current list and that the
+   sequence equals the version, then stores the bytes. Sealing is randomized, so the change check
+   never hashes sealed bytes.
+8. On success `State::team[]` records the bytes hash, the push time, the list version and the turn
+   fingerprint, and the conflict is cleared. A check that found the copy identical records the
+   fingerprint and bytes without a push time.
+
+```mermaid
+flowchart TD
+    A["shared session: quiet, turns changed"] --> H{"held for these turns?"}
+    H -->|yes| P["paused: nothing read, nothing written"]
+    H -->|no| L["take the lease"]
+    L --> R{"stored copy?"}
+    R -->|none| W["seal and write"]
+    R -->|opens| C{"compare the completed turns"}
+    R -->|"cannot open or read"| U["nothing written<br/>conflict: unverified, with the reason"]
+    C -->|identical| I["nothing written<br/>fingerprint recorded"]
+    C -->|"local is ahead"| W
+    C -->|"team is ahead or diverged"| B["nothing written<br/>conflict recorded, pushes paused"]
+    K["keep mine, for the reviewed<br/>local turns and team sequence"] -.-> W
+```
 
 ## Pull path (exactly what runs)
 
@@ -815,7 +854,9 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 | `subagents` | parent session → subagent transcript paths |
 | `deleted` | user-owned, written by the TUI: source key → when the user deleted it. Every load and merge (daemon and TUI) forgets each such session that is gone (`State::forget_deleted`): the record goes and its copies are released, so it is never listed as missing and the daemon does not bring it back. Kept for a day, which any running daemon outlasts |
 | `shares` | user-owned, written by the TUI: conversation id → the teams it is shared into; merged per conversation (see "The user's choices merge per key"). A file written before teams were per session carries a `marked` list instead, folded into `shares` once the machine's teams are known |
-| `team` | per session: `{hash, pushed_at, list}` of the last successful push; `list` is the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once) |
+| `team` | per session: `{hash, pushed_at, list, turns}`. `hash`: the canonical bytes at the last push, or at the last check that found the turns unchanged (used only to skip re-parsing). `pushed_at`: the last successful push. `list`: the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once). `turns`: the turn fingerprint the team copy agreed with at the last push or check (`turns::fingerprint`); empty in older files, which migrate on their first pass without a push (see "Push path" step 4) |
+| `team_conflict` | daemon-written, per (space, conversation): `{local, at, kind, count, local_new, team_new, why}`. Present while a push is held back: `kind` is `behind`, `diverged` or `unverified`; `local` is the turn fingerprint when it was found, and pushes stay paused while the local turns still equal it. Cleared by a push or by a check that finds the copies identical; once the local turns change, the next guard run replaces or clears it |
+| `team_force` | user-owned, written by the TUI's "keep mine": per (space, conversation): `{local, team_seq}`. It applies only to that local fingerprint and that team sequence (`push_due`, step 6), so it goes inert once either moves. Merged like the shares: a save adds this process's new requests, and the daemon reads the file |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
 
 A missing state file is empty state; a corrupt one is an error (silently dropping it would
@@ -923,6 +964,9 @@ daemon.
 | Approve with a fingerprint that does not match the request | refused locally; nothing is signed |
 | Revoke or remove that would drop the admin's own key | refused locally; nothing is signed |
 | A pending device's token on any member route | 403, as for a revoked device |
+| The team copy is ahead of this machine (or diverged from it) | nothing is written; the conversation is held (`team_conflict`) and its pushes stay paused until its local turns change or the user decides on the Team tab |
+| The stored copy cannot be opened or read (sealed under an older list by another member, not sealed to this device, not a journal) | nothing is written; held as `unverified` with the reason, never its content; the author re-seals it, or the user decides |
+| A conversation with no completed turn yet | nothing is sent; it waits for the first completed turn |
 
 ## Live vs test-only modules
 
