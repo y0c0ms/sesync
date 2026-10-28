@@ -127,7 +127,7 @@ pub fn open_terminal(
     agent: Option<&AgentKind>,
 ) -> Result<Opened, Failure> {
     let title = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let label = herdr_open::tab_label(agent.map_or("terminal", |kind| kind.id), &title);
+    let label = herdr_open::tab_label(agent.map_or("terminal", |kind| kind.id), &title, "");
     let mut tab_params = json!({ "cwd": cwd.display().to_string(), "label": label, "focus": false });
     if let Some(workspace) = &launch.workspace_id {
         tab_params["workspace_id"] = json!(workspace);

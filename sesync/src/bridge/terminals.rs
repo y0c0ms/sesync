@@ -94,7 +94,7 @@ fn runs(r: &Running, conv: &Conversation) -> bool {
 
 /// The label a terminal shows: the harness and the conversation's title, as "open in herdr" names a tab.
 pub fn label(conv: &Conversation) -> String {
-    herdr_open::tab_label(&conv.harness, &conv.title)
+    herdr_open::tab_label(&conv.harness, &conv.title, "")
 }
 
 /// One `session.tabs` entry for a pane running the conversation. Only terminal tabs: sesync has no
