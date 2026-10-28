@@ -131,6 +131,7 @@ impl TeamRemote for HttpTeam {
     }
 
     fn stored(&self, space: &str, conversation: &str) -> Result<Option<Vec<u8>>, PushError> {
+        crate::team_url::check_scheme(&self.base).map_err(PushError::Refused)?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)).build();
         let url = format!("{}/record/sealed/read", self.base.trim_end_matches('/'));
         let body = serde_json::json!({"space": space, "conversation": conversation, "machine": self.machine});

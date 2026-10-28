@@ -58,12 +58,14 @@ tests win, and you fix this file. Update it at the end of every work session.
   the same.
 - **Now.** The push step re-seals, under the current list, each unchanged shared conversation whose
   stored record is this machine's own and sealed under an older list (`team_sync::needs_reseal`),
-  once per conversation and list version (`TeamPush::list`, kept in the state file). "Own" is proven
-  by the record's signature (`signed_records::authorship`, new in sesync-team), with the floor this
-  machine accepted as the lowest sequence, so a forged header or a replayed older record cannot make
-  a machine republish. A record someone else wrote last is left for them, so an older copy never
-  replaces newer content. The daemon logs `N re-sealed under the current member list` and counts it
-  as activity for the poll interval.
+  once per conversation and list version (`TeamPush::list`, kept in the state file). The check runs
+  under the conversation's lease, after the lease is taken, so a push another member lands in between
+  is seen and kept. "Own" is proven by the record's signature (`signed_records::authorship`, new in
+  sesync-team), with the floor this machine accepted as the lowest sequence, so a forged header or a
+  replayed older record cannot make a machine republish. A record someone else wrote last is left for
+  them: the lease is given back unwritten. The stored-record read (push and pull) refuses plain http
+  outside loopback like every other team request. The daemon logs `N re-sealed under the current member
+  list` and counts it as activity for the poll interval.
 - **Not fixed.** A machine that is off keeps its records unreadable until it runs again; nobody else
   can re-seal them (only the author signs its records).
 - **Suites** (Windows, sandboxed): `sesync` 603 passed, `sesync-team` 199 passed, 0 failed.
