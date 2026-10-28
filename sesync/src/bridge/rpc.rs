@@ -9,12 +9,14 @@
 //!   * `agentSession.subscribeStatus`: the agent statuses of those panes;
 //!   * `files.*` and `git.*`: read-only, confined to the project directory (files.rs, git.rs);
 //!   * `notifications.testPush`: a synthetic in-app notification.
+//!   * `speech.models.list` and `speech.dictation.*`: phone dictation, transcribed by a local whisper server (dictation.rs).
 //! Every other method answers `method_not_found`. The app reads that as "not available here" and skips
 //! the read, so the rest of its screens degrade rather than fail.
 
 use super::catalog::{self, Catalog, Conversation, Project};
 use super::herdr::{self, Herdr};
 use super::notify;
+use super::dictation::Dictation;
 use super::{confine, files, git, pins};
 use super::start;
 use super::stream::{self, Conn};
@@ -63,6 +65,8 @@ pub struct Ctx {
     pub usage: usage::Store,
     /// Image uploads in progress, by upload id.
     pub uploads: uploads::Store,
+    /// Phone dictation: the one dictation in progress, and the whisper server it transcribes through.
+    pub dictation: Dictation,
     /// How this host starts agent sessions (`preflight.detectAgents`, `agentSession.create`).
     pub launch: start::Launch,
 }
@@ -117,6 +121,11 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
         "git.history" => git::history(&params, ctx),
         "git.commitCompare" => git::commit_compare(&params, ctx),
         "git.branchCompare" => git::branch_compare(&params, ctx),
+        "speech.models.list" => Ok(ctx.dictation.models()),
+        "speech.dictation.start" => ctx.dictation.start(&params, conn.id()),
+        "speech.dictation.chunk" => ctx.dictation.chunk(&params, conn.id()),
+        "speech.dictation.finish" => ctx.dictation.finish(&params, conn.id()),
+        "speech.dictation.cancel" => ctx.dictation.cancel(&params, conn.id()),
         other => return Some(error(&id, "method_not_found", &format!("Unknown method: {other}"))),
     };
     Some(match outcome {
@@ -583,6 +592,7 @@ mod tests {
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
+            dictation: crate::bridge::dictation::Dictation::new(crate::bridge::dictation::Whisper::from_env()),
             launch: start::Launch::default(),
         }
     }

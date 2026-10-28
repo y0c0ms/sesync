@@ -15,6 +15,7 @@ pub mod approvals;
 pub mod catalog;
 pub mod cli;
 pub mod devices;
+pub mod dictation;
 pub mod e2ee;
 pub mod herdr;
 pub mod keys;

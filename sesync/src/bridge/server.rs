@@ -104,6 +104,8 @@ async fn connection(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) ->
     let sink = Sink::new(out_tx, Arc::clone(&channel));
     let conn = Arc::new(Conn::new(sink.clone()));
     let result = serve_requests(&mut rx, &channel, &sink, &conn, &shared, peer).await;
+    // The phone's dictation ends with its connection: its audio is dropped, never transcribed later.
+    shared.ctx.dictation.cancel_connection(conn.id());
     // Dropping the connection stops its streams; each stream's sender goes with it, so the writer ends.
     drop(conn);
     drop(sink);

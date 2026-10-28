@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use sesync::bridge::catalog::{Catalog, Conversation, StateCatalog};
 use sesync::bridge::devices;
 use sesync::bridge::{notify, ntfy, start, uploads, usage};
+use sesync::bridge::dictation::{Dictation, Whisper};
 use sesync::bridge::keys;
 use sesync::bridge::net;
 use sesync::bridge::rpc::{Ctx, Host};
@@ -79,6 +80,7 @@ async fn start_with(dir: PathBuf, catalog: Arc<dyn Catalog>, herdr: Arc<dyn herd
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
+            dictation: Dictation::new(Whisper::from_env()),
             launch: start::Launch::default(),
         },
     });
@@ -963,6 +965,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        dictation: Dictation::new(Whisper::from_env()),
         launch: start::Launch::resuming(resume),
     };
     let bridge = start_ctx(dir, ctx.clone()).await;
@@ -1524,6 +1527,7 @@ async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        dictation: Dictation::new(Whisper::from_env()),
         launch: start::Launch::default(),
     };
     let b = start_ctx(bridge_dir, ctx).await;
@@ -1578,4 +1582,143 @@ async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane
             "{pane} received the prompt: {calls:?}"
         );
     }
+}
+
+/// A whisper stand-in on loopback. Each request is read in full, answered after `delay` with `status` and
+/// `reply`. Returns the transcription URL.
+fn fake_whisper(status: u16, reply: &'static str, delay: Duration) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/audio/transcriptions", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            read_http_request(&mut stream);
+            std::thread::sleep(delay);
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+        }
+    });
+    url
+}
+
+/// Reads one HTTP request: its head, then as many body bytes as its Content-Length names.
+fn read_http_request(stream: &mut std::net::TcpStream) {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = std::io::Read::read(stream, &mut buf) {
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..end]).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+}
+
+fn whisper_at(url: String, timeout: Duration) -> Whisper {
+    Whisper { url, model: "whisper-gpu".into(), language: "auto".into(), timeout }
+}
+
+/// A bridge over a fresh directory whose dictation transcribes through `whisper`.
+async fn dictation_bridge(name: &str, whisper: Whisper) -> Bridge {
+    let dir = sandbox(name);
+    let ctx = Ctx {
+        catalog: Arc::new(FixedCatalog(vec![])),
+        herdr: absent_herdr(&dir),
+        host: Host { machine_name: "test-box".into(), platform: "linux" },
+        locks: LockTools { sesync_lock: dir.join("no-sesync-lock"), lock_dir: dir.join("locks") },
+        turns: Turns::default(),
+        dir: dir.clone(),
+        notify: notify::Hub::new(None),
+        usage: usage::Store::default(),
+        uploads: uploads::Store::default(),
+        dictation: Dictation::new(whisper),
+        launch: start::Launch::default(),
+    };
+    start_ctx(dir, ctx).await
+}
+
+/// `ms` milliseconds of 16 kHz mono PCM, base64 as the app sends a chunk.
+fn speech_chunk(ms: u32) -> String {
+    let pcm: Vec<u8> = (0..16 * ms).flat_map(|i| ((i % 64) as i16 - 32).to_le_bytes()).collect();
+    STANDARD.encode(pcm)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dictation_round_trips_over_the_encrypted_link() {
+    let url = fake_whisper(200, r#"{"text":" hello over the link "}"#, Duration::ZERO);
+    let b = dictation_bridge("dictation-ok", whisper_at(url, Duration::from_secs(5))).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 11).await;
+    assert_eq!(phone.auth(&token).await["type"], "e2ee_authenticated");
+
+    let models = phone.rpc(&token, "m", "speech.models.list").await;
+    assert_eq!(models["result"]["selectedModelId"], "whisper-gpu", "{models}");
+    assert_eq!(models["result"]["models"][0]["status"], "ready", "{models}");
+
+    let started = phone.rpc_params(&token, "s", "speech.dictation.start", json!({ "dictationId": "d1" })).await;
+    assert_eq!(started["ok"], true, "{started}");
+    let chunk = phone
+        .rpc_params(&token, "c", "speech.dictation.chunk", json!({ "dictationId": "d1", "audioBase64": speech_chunk(1000), "sampleRate": 16000 }))
+        .await;
+    assert_eq!(chunk["ok"], true, "{chunk}");
+    let finished = phone.rpc_params(&token, "f", "speech.dictation.finish", json!({ "dictationId": "d1" })).await;
+    assert_eq!(finished["ok"], true, "{finished}");
+    assert_eq!(finished["result"]["text"], "[TRANSCRIBED] hello over the link", "{finished}");
+
+    // The setup and model writes stay unserved: the mic path never calls them.
+    let setup = phone.rpc(&token, "x", "speech.dictation.setup").await;
+    assert_eq!(setup["error"]["code"], "method_not_found", "{setup}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dictation_refusals_and_server_errors_reach_the_phone() {
+    let url = fake_whisper(503, "{}", Duration::ZERO);
+    let b = dictation_bridge("dictation-503", whisper_at(url, Duration::from_secs(5))).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 12).await;
+    assert_eq!(phone.auth(&token).await["type"], "e2ee_authenticated");
+    phone.rpc_params(&token, "s", "speech.dictation.start", json!({ "dictationId": "d2" })).await;
+
+    // Six seconds is over the five-second chunk limit: refused before it is decoded.
+    let long = phone
+        .rpc_params(&token, "c", "speech.dictation.chunk", json!({ "dictationId": "d2", "audioBase64": speech_chunk(6000), "sampleRate": 16000 }))
+        .await;
+    assert_eq!(long["error"]["code"], "bad_request", "{long}");
+    assert_eq!(long["error"]["message"], "Dictation audio chunk is longer than 5 seconds", "{long}");
+
+    let ok = phone
+        .rpc_params(&token, "c2", "speech.dictation.chunk", json!({ "dictationId": "d2", "audioBase64": speech_chunk(1000), "sampleRate": 16000 }))
+        .await;
+    assert_eq!(ok["ok"], true, "{ok}");
+    let finished = phone.rpc_params(&token, "f", "speech.dictation.finish", json!({ "dictationId": "d2" })).await;
+    assert_eq!(finished["ok"], false, "{finished}");
+    assert_eq!(finished["error"]["code"], "unavailable", "{finished}");
+    assert!(finished["error"]["message"].as_str().unwrap_or_default().contains("HTTP 503"), "{finished}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_whisper_times_out_over_the_encrypted_link() {
+    let url = fake_whisper(200, r#"{"text":"late"}"#, Duration::from_secs(3));
+    let b = dictation_bridge("dictation-slow", whisper_at(url, Duration::from_millis(300))).await;
+    let (_, token) = pair(&b.dir, "phone");
+    let mut phone = Phone::hello(&b, 13).await;
+    assert_eq!(phone.auth(&token).await["type"], "e2ee_authenticated");
+    phone.rpc_params(&token, "s", "speech.dictation.start", json!({ "dictationId": "d3" })).await;
+    phone.rpc_params(&token, "c", "speech.dictation.chunk", json!({ "dictationId": "d3", "audioBase64": speech_chunk(1000), "sampleRate": 16000 })).await;
+    let finished = phone.rpc_params(&token, "f", "speech.dictation.finish", json!({ "dictationId": "d3" })).await;
+    assert_eq!(finished["error"]["code"], "unavailable", "{finished}");
+    assert!(finished["error"]["message"].as_str().unwrap_or_default().contains("timed out"), "{finished}");
 }
