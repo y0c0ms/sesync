@@ -3,7 +3,7 @@
 // `sesync bridge serve`. The Orca files are copied, unchanged, next to this script so their imports
 // resolve against this package's pinned zod and tweetnacl.
 //
-//   ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "orca://pair?code=…"
+//   ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "agenthub://pair?code=…"
 //
 // Exit 0 only when every check passes. The output never includes the device token.
 
@@ -172,15 +172,16 @@ async function hello(endpoint: string, serverPublic: Uint8Array): Promise<Wire> 
 }
 
 const url = process.argv[2]
-if (!url || !url.startsWith('orca://pair')) {
-  console.error('usage: npm run interop -- "orca://pair?code=…"   (the url sesync bridge pair prints)')
+if (!url || !/^(agenthub|orca):\/\/pair/i.test(url)) {
+  console.error('usage: npm run interop -- "agenthub://pair?code=…"   (the url sesync bridge pair prints; orca:// links from before the rename work too)')
   process.exit(2)
 }
 
 // 1. Orca's own codec and schema accept the offer. decodePairingOffer throws on a schema refusal.
 const offer = (() => {
   try {
-    return pairing.decodePairingOffer(url)
+    // Orca's desktop codec reads only the orca scheme; the phone reads both. The code is the same either way.
+    return pairing.decodePairingOffer(url.replace(/^agenthub:/i, 'orca:'))
   } catch (error) {
     record('Orca PairingOfferSchema accepts the offer', false, error instanceof Error ? error.message : String(error))
     process.exit(1)

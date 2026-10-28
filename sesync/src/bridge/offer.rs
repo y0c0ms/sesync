@@ -1,7 +1,8 @@
 //! The pairing offer the phone scans, version 2 (`src/shared/mobile-relay-pairing-offer.ts`). The
-//! JSON is encoded as unpadded base64url and carried as `orca://pair?code=…`, which is what
-//! `encodePairingOffer` in `src/shared/pairing.ts` produces. Only direct offers exist here: no relay
-//! block, so no relay credentials.
+//! JSON is encoded as unpadded base64url and carried as `agenthub://pair?code=…`, the scheme the
+//! phone app registers. `encodePairingOffer` in `src/shared/pairing.ts` writes the same code under
+//! `orca://`; the app still reads that form for offers printed before the rename. Only direct offers
+//! exist here: no relay block, so no relay credentials.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -9,6 +10,9 @@ use serde_json::json;
 
 /// Orca's `PAIRING_ENDPOINT_MAX_CHARACTERS`.
 const ENDPOINT_MAX: usize = 16 * 1024;
+
+/// The start of the pairing link. The phone app registers the `agenthub` scheme with the OS.
+const PAIR_LINK: &str = "agenthub://pair?code=";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -34,9 +38,9 @@ impl Offer {
         self.json().to_string()
     }
 
-    /// The `orca://pair?code=` link, the same text the QR code carries.
+    /// The `agenthub://pair?code=` link, the same text the QR code carries.
     pub fn url(&self) -> String {
-        format!("orca://pair?code={}", URL_SAFE_NO_PAD.encode(self.to_json()))
+        format!("{PAIR_LINK}{}", URL_SAFE_NO_PAD.encode(self.to_json()))
     }
 }
 
@@ -83,11 +87,18 @@ mod tests {
     fn the_url_decodes_back_to_the_same_json_without_padding() {
         let offer = sample();
         let url = offer.url();
-        let code = url.strip_prefix("orca://pair?code=").expect("scheme and query");
+        let code = url.strip_prefix("agenthub://pair?code=").expect("scheme and query");
         assert!(!code.contains('='), "padding is stripped, as the desktop does");
         assert!(!code.contains('+') && !code.contains('/'), "base64url alphabet");
         let json = String::from_utf8(URL_SAFE_NO_PAD.decode(code).unwrap()).unwrap();
         assert_eq!(json, offer.to_json());
+    }
+
+    #[test]
+    fn the_link_is_agenthub_not_orca() {
+        let url = sample().url();
+        assert!(url.starts_with("agenthub://pair?code="), "the phone app registers agenthub");
+        assert!(!url.starts_with("orca:"), "the bridge prints no orca links");
     }
 
     #[test]

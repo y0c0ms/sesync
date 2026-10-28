@@ -15,7 +15,7 @@ Orca is MIT-licensed (stablyai/orca). Its protocol is read from the source at th
 
 | Command | What it does |
 |---|---|
-| `sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]` | Pairs a new device. Prints the pairing offer (v2 JSON), the `orca://pair?code=` URL and a terminal QR. The device token is in that output and nowhere else. |
+| `sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]` | Pairs a new device. Prints the pairing offer (v2 JSON), the `agenthub://pair?code=` URL and a terminal QR. The device token is in that output and nowhere else. |
 | `sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,…] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]` | Serves in the foreground until Ctrl-C. Defaults: `0.0.0.0:6768`, allowed networks `10.10.20.0/24,192.168.1.0/24,127.0.0.0/8`, herdr socket `$HERDR_SOCKET_PATH` else `$HOME/.config/herdr/herdr.sock`, ntfy `http://192.168.100.178:30181` topic `agents`, plan usage every 600 s from `omp`. |
 | `sesync bridge devices` | Lists paired devices: id, label, creation time. Never prints tokens. |
 | `sesync bridge revoke <device-id>` | Removes a device. Its token is refused on the next frame, with no restart. |
@@ -47,8 +47,10 @@ Writes are atomic (temp file, then rename) and created owner-only from the start
 
 ## Pairing offer v2
 
-The offer is the JSON below, encoded as unpadded base64url and carried as `orca://pair?code=…`
-(the same encoding Orca's `encodePairingOffer` produces). The QR code carries the same URL.
+The offer is the JSON below, encoded as unpadded base64url and carried as `agenthub://pair?code=…`
+(the same encoding Orca's `encodePairingOffer` produces under `orca://`). The QR code carries the same
+URL. The phone app registers the `agenthub` scheme and still reads `orca://pair?code=` links printed
+before this change; `sesync bridge` prints only `agenthub://`.
 
 ```json
 {"v":2,"endpoint":"ws://10.10.20.3:6768","deviceToken":"<43 chars>","publicKeyB64":"<44 chars>"}
@@ -342,7 +344,7 @@ the terminal stream.
 SB=$(mktemp -d)
 env HOME="$SB" ./target/debug/sesync bridge pair --endpoint ws://127.0.0.1:6768 --label interop | grep '^url:'
 env HOME="$SB" ./target/debug/sesync bridge serve --listen 127.0.0.1:6768 &   # stop it by PID afterwards
-cd tools/bridge-interop && npm install && ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "orca://pair?code=…"
+cd tools/bridge-interop && npm install && ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "agenthub://pair?code=…"
 ```
 
 Not verified here: a real phone, the emulator run (orca-phone `fork/e2e`), a live `omp usage --json` run, Claude Code approvals, and real ntfy delivery.
