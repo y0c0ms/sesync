@@ -644,15 +644,37 @@ mod tests {
         assert_eq!(d.chunk(&chunk_params("d1", &pcm(16)), 1).unwrap_err().0, "dictation_stream_not_started");
     }
 
-    /// Live smoke against the real whisper server (`SESYNC_WHISPER_URL` or the default). Run by hand:
+    /// The PCM of a WAV's `data` chunk, found by walking the RIFF chunks (encoders add others, such as LIST).
+    fn data_chunk(wav: &[u8]) -> Option<&[u8]> {
+        let mut at = 12;
+        while at + 8 <= wav.len() {
+            let size = u32::from_le_bytes(wav[at + 4..at + 8].try_into().ok()?) as usize;
+            let body = wav.get(at + 8..at + 8 + size)?;
+            if &wav[at..at + 4] == b"data" {
+                return Some(body);
+            }
+            at += 8 + size + size % 2;
+        }
+        None
+    }
+
+    /// Live smoke: the WAV's audio goes through start, chunk and finish against the real whisper server
+    /// (`SESYNC_WHISPER_URL` or the default). Run by hand, once:
     /// `SESYNC_LIVE_WAV=/path/16k-mono.wav cargo test live_whisper -- --ignored --nocapture`.
     #[test]
     #[ignore = "needs the live whisper server and SESYNC_LIVE_WAV"]
-    fn live_whisper_transcribes_a_wav() {
+    fn live_whisper_transcribes_a_wav_through_the_dictation_path() {
         let path = std::env::var("SESYNC_LIVE_WAV").expect("set SESYNC_LIVE_WAV to a 16 kHz mono WAV");
         let bytes = std::fs::read(path).unwrap();
-        let text = transcribe(&Whisper::from_env(), &bytes).unwrap_or_else(|e| panic!("{}", e.1));
+        let pcm = data_chunk(&bytes).expect("the WAV has a data chunk");
+        let d = Dictation::new(Whisper::from_env());
+        d.start(&start_params("live"), 1).unwrap();
+        for piece in pcm.chunks(MAX_CHUNK_BYTES) {
+            d.chunk(&chunk_params("live", piece), 1).unwrap();
+        }
+        let reply = d.finish(&json!({ "dictationId": "live" }), 1).unwrap_or_else(|e| panic!("{}: {}", e.0, e.1));
+        let text = reply["text"].as_str().unwrap_or_default();
         println!("LIVE_TRANSCRIPT: {text}");
-        assert!(!text.is_empty(), "the live server returned no text");
+        assert!(text.starts_with(TRANSCRIBED_PREFIX), "{reply}");
     }
 }
