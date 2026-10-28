@@ -256,6 +256,7 @@ async fn worktree_ps_lists_each_conversation_as_a_row_and_reports_it_not_open_wi
     let row = &reply["result"]["worktrees"][0];
     assert_eq!(row["path"], "/home/u/work/alpha");
     assert_eq!(row["displayName"], "fix login");
+    assert_eq!(row["conversationAgent"], "omp", "a closed conversation resumes in its own harness");
     assert_eq!(row["status"], "inactive", "herdr is absent, so nothing is open");
     assert_eq!(row["liveTerminalCount"], 0);
 
@@ -950,6 +951,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
     let session = journals[0].display().to_string();
 
     let dir = herdr.home.join("config/bridge");
+    let resume = start::Resume::new(roots.locations.clone(), roots.home.clone(), &herdr.socket, None);
     let catalog = Arc::new(StateCatalog { roots, state_file: herdr.home.join("state.json") });
     let ctx = Ctx {
         catalog,
@@ -961,7 +963,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
-        launch: start::Launch::default(),
+        launch: start::Launch::resuming(resume),
     };
     let bridge = start_ctx(dir, ctx.clone()).await;
     let (_, token) = pair(&bridge.dir, "phone");
@@ -1144,20 +1146,96 @@ async fn an_uploaded_image_is_staged_as_a_path_and_reaches_the_model() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_agent_tab_for_a_conversation_is_listed_with_its_pane() {
+async fn an_agent_tab_for_an_open_conversation_is_its_own_pane_and_a_project_tab_is_not_it() {
     let Some(mut w) = live_world("create", "rules:\n  - match: 'never zzz'\n    reply: {text: x}\n", None).await else {
         return;
     };
     let detected = w.rpc("detect", "preflight.detectAgents", json!({})).await;
     let agents = detected["result"].as_array().expect("a bare array of agent ids");
     assert!(agents.iter().any(|a| a == "omp"), "omp is installed: {detected}");
-
     let worktree = w.worktree.clone();
-    let created = w.rpc("create", "session.tabs.createTerminal", json!({ "worktree": worktree, "agent": "omp" })).await;
-    let new_terminal = created["result"]["tab"]["id"].as_str().expect("the new tab's id").to_string();
-    assert_ne!(new_terminal, w.terminal);
-    let listed = w.tab_where("the new tab in the conversation", |t| t["id"] == new_terminal.as_str()).await;
-    assert_eq!(listed["type"], "terminal", "{listed}");
+
+    // The conversation is open: its own agent asks for a tab and gets the pane already running it.
+    let again = w.rpc("again", "session.tabs.createTerminal", json!({ "worktree": worktree, "agent": "omp" })).await;
+    assert_eq!(again["result"]["tab"]["id"], w.terminal.as_str(), "{again}");
+
+    // Another harness is refused: the conversation is never opened as a different session.
+    let other = w.rpc("other", "session.tabs.createTerminal", json!({ "worktree": worktree, "agent": "claude" })).await;
+    assert_eq!(other["error"]["code"], "bad_request", "{other}");
+
+    // A project's tab is a fresh agent of the project: listed under no conversation.
+    let rows = w.rpc("ps", "worktree.ps", json!({})).await;
+    let repo = rows["result"]["worktrees"][0]["repoId"].as_str().expect("the conversation's repo id").to_string();
+    let project = w.rpc("project", "session.tabs.createTerminal", json!({ "worktree": repo, "agent": "omp" })).await;
+    let fresh = project["result"]["tab"]["id"].as_str().expect("the project tab's id").to_string();
+    assert_ne!(fresh, w.terminal);
+    let tabs = w.rpc("tabs", "session.tabs.list", json!({ "worktree": worktree })).await;
+    let listed: Vec<&str> = tabs["result"]["tabs"].as_array().unwrap().iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(listed, vec![w.terminal.as_str()], "the project tab is not the conversation's: {tabs}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_conversations_tab_and_resuming_it_continues_the_same_conversation() {
+    // A resumed omp asks the model for a title first (the first run used --no-title). The catch-all answers that
+    // request briefly, so the prompt is not queued behind the fake model's long default reply.
+    let scenario = "rules:\n  - name: resumed\n    match: 'e2e resume please\\s*$'\n    reply: {text: \"resumed reply\"}\n  - name: other\n    reply: {text: \"ok\"}\n";
+    let Some(mut w) = live_world("resume", scenario, None).await else {
+        return;
+    };
+
+    // The operator closes the conversation's tab in herdr: the phone then lists no tab for it.
+    let pane = herdr::list_panes(&w.herdr.api()).unwrap().into_iter().find(|p| p.terminal_id == w.terminal).expect("the conversation's pane");
+    w.herdr.cli(&["tab", "close", pane.tab_id.as_str()]);
+    let worktree = w.worktree.clone();
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let tabs = w.rpc("gone", "session.tabs.list", json!({ "worktree": worktree })).await;
+        if tabs["result"]["tabs"].as_array().is_some_and(|t| t.is_empty()) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the closed tab is still listed: {tabs}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Resume: the create names the conversation's own agent and gets the conversation's pane back.
+    let created = w
+        .rpc("resume", "session.tabs.createTerminal", json!({ "worktree": worktree, "agent": "omp", "clientMutationId": "resume-1" }))
+        .await;
+    let resumed = created["result"]["tab"]["id"].as_str().unwrap_or_else(|| panic!("the resumed tab: {created}")).to_string();
+    let tab = w.tab_where("the resumed tab in the conversation", |t| t["id"] == resumed.as_str()).await;
+    assert_eq!(tab["agentStatus"]["providerSession"]["id"], w.session.as_str(), "the same journal: {tab}");
+
+    // The phone's prompt lands in that pane, and the model answers in the same transcript.
+    w.terminal = resumed;
+    w.send("e2e resume please").await;
+    let session = w.session.clone();
+    let deadline = std::time::Instant::now() + TURN;
+    loop {
+        let page = w.rpc("page", "nativeChat.readSession", json!({ "agent": "omp", "sessionId": session, "limit": 50 })).await;
+        if page["result"]["messages"].to_string().contains("resumed reply") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let screen = w.rpc("screen", "terminal.read", json!({ "terminal": w.terminal })).await;
+            panic!("the resumed reply never reached the transcript: {page}\nscreen: {screen}\nmodel requests: {:?}", w.fake.requests());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // Resuming writes to the conversation's own journal: exactly one exists, and it is the one the tab showed.
+    let journals = journals_under(&w.herdr.home.join(".omp"));
+    assert_eq!(journals.len(), 1, "no second journal: {journals:?}");
+    assert_eq!(journals[0].display().to_string(), w.session, "the same session file");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conversation_resume_is_refused_for_a_session_this_host_does_not_list() {
+    let Some(mut w) = live_world("remote", "rules:\n  - match: 'never zzz'\n    reply: {text: x}\n", None).await else {
+        return;
+    };
+    let remote = w.rpc("remote", "session.tabs.createTerminal", json!({ "worktree": "sesync-0000000000000000::conv-0000000000000000", "agent": "omp" })).await;
+    assert_eq!(remote["error"]["code"], "worktree_not_found", "{remote}");
+    assert!(remote["error"]["message"].as_str().unwrap_or("").contains("not on this machine"), "{remote}");
+    assert_eq!(w.herdr.cli(&["pane", "list"]).matches("\"pane_id\"").count(), 1, "the remote create opened nothing");
 }
 
 #[tokio::test(flavor = "multi_thread")]

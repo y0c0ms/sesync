@@ -3,6 +3,13 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: phone "create a tab" resumes the conversation (branch sesync-release)
+
+- **Why.** On a real phone, closing a conversation's herdr tab and creating one from the session screen started a fresh omp; the bridge bound that pane to the conversation, so the phone showed the old history while "Hi" went into a new session.
+- **What changed.** `session.tabs.createTerminal` on a conversation's worktree goes through `herdr_open::open_with_focus` (focus left alone): an open pane is reused, a tagged idle shell gets the resume command again, otherwise a tab runs the harness's resume command; with no active workspace one is created. The reply waits until herdr reports the agent's status. A different agent than the conversation's harness is refused. A project's worktree keeps the fresh-agent tab. Resumed panes are never recorded against the conversation; listing goes by argv or tab tag only, so a terminal id herdr reuses after a restart cannot inherit it. `terminal.send` with enter is refused with `not_running_agent` (tag but no agent) or `agent_waiting_on_prompt` (pane blocked) before anything is typed. `worktree.ps` rows carry `conversationAgent`.
+- **Tests.** `start.rs` unit tests (the operator's bug: `opening_a_closed_conversation_resumes_it_instead_of_a_fresh_session`), double create, other workspace, recycled terminal id, idle shell, no workspace, other machine; rpc send refusals; live `tests/bridge.rs` close-and-resume against a real herdr and omp with fake-model.
+- **Not verified.** Claude and OpenCode resumes live (Claude's `--help` says `--resume` keeps the session id unless `--fork-session`). A harness that never reports a status waits the full 10 s before the reply.
+
 ## 2026-10-28: phone sessions: Claude and OpenCode chats open (branch sesync-release)
 
 - **Why.** Opening a Claude or OpenCode session on the phone failed with "claude chats are not read in-process; their canonical journal comes from sesync-conv". The tabs listed; only `nativeChat.readSession` and `nativeChat.subscribe` refused.

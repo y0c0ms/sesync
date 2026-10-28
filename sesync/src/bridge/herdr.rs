@@ -30,6 +30,12 @@ pub trait Herdr: Send + Sync {
     /// Run `method` with `params` and return the reply's `result`, or herdr's error message.
     fn call(&self, method: &str, params: Value) -> Result<Value, String>;
 
+    /// Names the herdr server these calls reach. The bridge talks to one server, so the default is one name for
+    /// all of its calls; a test double that stands for several servers names each of them.
+    fn scope(&self) -> String {
+        String::new()
+    }
+
     /// Pane agent-status changes for `pane_ids`. Canned answers have none, so the default refuses.
     fn status_events(&self, _pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
         Err("herdr status events are not available here".into())

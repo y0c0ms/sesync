@@ -248,6 +248,7 @@ fn worktree_row(c: &Conversation, panes: &[&Running], now: f64) -> Value {
     let agents: Vec<Value> = panes.iter().map(|r| terminals::agent_row(r, c, now)).collect();
     json!({
         "worktreeId": c.worktree_id(),
+        "conversationAgent": c.harness,
         "repoId": repo,
         "repo": name,
         "path": c.dir,
@@ -408,6 +409,8 @@ fn terminal_clear(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
 /// A prompt submission. When the pane runs a conversation, the conversation is claimed in sesync-lock
 /// first and released when the agent's turn ends. A pane with a detected agent gets the prompt through
 /// herdr's agent API, which orders the text before Enter; any other pane gets the text, then Enter.
+/// A conversation's pane that no longer runs its agent (the agent quit, and the shell is left) takes no
+/// prompt, and a pane waiting on a prompt is answered in the pane itself, never by a prompt the phone sends.
 fn submit(ctx: &Ctx, pane: &herdr::Pane, text: &str) -> Result<(), Failure> {
     let h = ctx.herdr.as_ref();
     let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
@@ -417,6 +420,15 @@ fn submit(ctx: &Ctx, pane: &herdr::Pane, text: &str) -> Result<(), Failure> {
         .find(|r| r.pane.terminal_id == pane.terminal_id)
         .and_then(|r| terminals::conversation_of(r, &conversations))
         .cloned();
+    if conv.is_none() && pane.agent.is_none() {
+        let labels = herdr::tab_labels(h).map_err(|m| ("herdr_unavailable", m))?;
+        if labels.get(&pane.tab_id).is_some_and(|label| terminals::is_session_tab(label)) {
+            return Err(("not_running_agent", "that conversation's pane no longer runs its agent, so the message was not typed into its shell".into()));
+        }
+    }
+    if pane.agent_status == "blocked" {
+        return Err(("agent_waiting_on_prompt", "that pane is waiting on a prompt; answer it in the pane first".into()));
+    }
     if let Some(c) = &conv {
         ctx.turns.begin(&ctx.locks, &c.lock_id(), &pane.terminal_id).map_err(|m| ("conversation_locked", m))?;
     }
@@ -902,5 +914,82 @@ mod tests {
             assert_eq!(refused["error"]["code"], "invalid_relative_path", "{escape}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A context whose conversations resume through the in-memory herdr `herdr`, and whose lock tool grants
+    /// every claim, so a send into a conversation's pane is not refused for a held turn.
+    fn resuming_ctx(conversations: Vec<Conversation>, herdr: &Arc<crate::bridge::testkit::FakeHerdr>) -> Ctx {
+        let dir = std::env::temp_dir().join(format!("sesync-rpc-send-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("sesync-lock");
+        crate::fake_cli::stage(&tool, "#!/bin/sh\nexit 0\n");
+        let launch = crate::bridge::testkit::resume_launch(herdr, crate::harness::Locations::default(), dir.join("home"), std::time::Duration::from_secs(1));
+        let mut c = crate::bridge::testkit::ctx_on(conversations, herdr.clone(), launch, &dir);
+        c.locks = LockTools { sesync_lock: tool, lock_dir: dir };
+        c
+    }
+
+    /// The tab label `herdr_open` gives a conversation's tab: its harness, its title, and its session tag.
+    fn session_label(conv: &Conversation) -> String {
+        crate::herdr_open::tab_label(&conv.harness, &conv.title, &crate::herdr_open::session_tag(&conv.key))
+    }
+
+    #[test]
+    fn a_prompt_to_a_running_conversation_reaches_its_agent_pane() {
+        let c_ = conv("a", "/s/a.jsonl", "/work/a", 1.0);
+        let herdr = crate::bridge::testkit::FakeHerdr::new();
+        let pane = herdr.open_tab("w-main", &session_label(&c_), "/work/a", &["omp", "--resume", "/s/a.jsonl"]);
+        let c = resuming_ctx(vec![c_], &herdr);
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("s", "terminal.send", json!({"terminal": pane.terminal_id, "text": "hello", "enter": true})), &c, &conn).unwrap();
+        assert_eq!(reply["result"]["send"]["accepted"], true, "{reply}");
+        assert_eq!(herdr.sends(), vec![(pane.pane_id.clone(), "hello".to_string())], "the agent's pane got the prompt");
+    }
+
+    #[test]
+    fn a_prompt_to_a_conversation_whose_agent_quit_is_refused_and_types_nothing() {
+        let c_ = conv("a", "/s/a.jsonl", "/work/a", 1.0);
+        let herdr = crate::bridge::testkit::FakeHerdr::new();
+        let pane = herdr.open_tab("w-main", &session_label(&c_), "/work/a", &["omp", "--resume", "/s/a.jsonl"]);
+        herdr.quit_agent(&pane.terminal_id);
+        let c = resuming_ctx(vec![c_], &herdr);
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("s", "terminal.send", json!({"terminal": pane.terminal_id, "text": "hello", "enter": true})), &c, &conn).unwrap();
+        assert_eq!(reply["error"]["code"], "not_running_agent", "{reply}");
+        assert!(herdr.sends().is_empty(), "nothing was typed into the bare shell: {:?}", herdr.calls());
+    }
+
+    #[test]
+    fn a_prompt_to_a_pane_waiting_on_a_prompt_is_refused_so_it_does_not_answer_it() {
+        let c_ = conv("a", "/s/a.jsonl", "/work/a", 1.0);
+        let herdr = crate::bridge::testkit::FakeHerdr::new();
+        let pane = herdr.open_tab("w-main", &session_label(&c_), "/work/a", &["omp", "--resume", "/s/a.jsonl"]);
+        herdr.set_status(&pane.terminal_id, "blocked");
+        let c = resuming_ctx(vec![c_], &herdr);
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("s", "terminal.send", json!({"terminal": pane.terminal_id, "text": "hello", "enter": true})), &c, &conn).unwrap();
+        assert_eq!(reply["error"]["code"], "agent_waiting_on_prompt", "{reply}");
+        assert!(herdr.sends().is_empty(), "the prompt's answer was not typed");
+    }
+
+    #[test]
+    fn a_prompt_to_a_plain_shell_tab_is_unchanged() {
+        let herdr = crate::bridge::testkit::FakeHerdr::new();
+        let pane = herdr.open_tab("w-main", "terminal: proj", "/work/proj", &[]);
+        let c = resuming_ctx(vec![], &herdr);
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("s", "terminal.send", json!({"terminal": pane.terminal_id, "text": "ls", "enter": true})), &c, &conn).unwrap();
+        assert_eq!(reply["result"]["send"]["accepted"], true, "{reply}");
+        assert_eq!(herdr.sends(), vec![(pane.pane_id.clone(), "ls".to_string())]);
+    }
+
+    #[test]
+    fn worktree_rows_name_the_harness_of_their_conversation() {
+        let c_ = conv("a", "/s/a.jsonl", "/work/a", 1.0);
+        let herdr = crate::bridge::testkit::FakeHerdr::new();
+        let c = resuming_ctx(vec![c_], &herdr);
+        let (conn, _rx) = conn();
+        let reply = dispatch(&req("w", "worktree.ps", json!({})), &c, &conn).unwrap();
+        assert_eq!(reply["result"]["worktrees"][0]["conversationAgent"], "omp", "{reply}");
     }
 }

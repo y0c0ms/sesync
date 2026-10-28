@@ -98,7 +98,7 @@ Served methods:
 | `clipboard.startImageUpload`, `appendImageUploadChunk`, `commitImageUpload`, `abortImageUpload`, `saveImageAsTempFile` | Staged images. Commit and save return the path string the app puts in the prompt. See Images. |
 | `preflight.detectAgents` | A bare array of installed agent ids. |
 | `settings.get` | `{settings:{}}`: no default agent and none disabled. |
-| `session.tabs.createTerminal` `{worktree, agent}` | `{tab:{type:"terminal", id, terminal, title}}`: a new herdr tab in the conversation's directory running the agent with no resume. See New sessions. |
+| `session.tabs.createTerminal` `{worktree, agent}` | `{tab:{type:"terminal", id, terminal, title}}`: for a conversation's worktree, the pane running that conversation (an open one is reused, otherwise it is resumed with the harness's resume command); for a project's worktree, a new tab running the agent with no resume. See New sessions. |
 | `notifications.subscribe` `{includeDesktopSuppressed?}` | Streams `{type:"ready", subscriptionId, epoch}`, then `{type:"notification", agentState, paneKey, notificationId, …}` frames: `agentState` is `done` for finished and `blocked` for needs input. `notifications.getMissedSince {lastSeenSeq, epoch?}` replays from memory. See Notifications. |
 | `notifications.registerPush`, `unregisterPush` | `{registered:false}`: there is no FCM. |
 | `notifications.testPush` | `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no `notifications.subscribe` stream is open. A synthetic in-app notification (see Notifications). |
@@ -120,6 +120,8 @@ Every other method, including the structured `agentSession.*` calls (`send`, `cu
 `bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
 reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read, or a chat's transcript cannot be converted),
 `send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder),
+`not_running_agent` (the conversation's tab is left with a shell) and `agent_waiting_on_prompt` (the pane is blocked on a prompt), both refused before anything is typed,
+`agent_not_started` (a create's agent did not come up),
 `invalid_relative_path`, `not_found`, `binary_file`, `file_too_large`, `not_a_file`, `not_a_directory` and
 `directory_too_large` (file reads), `not_a_repository`, `git_refused` and `git_failed` (git reads).
 
@@ -264,7 +266,12 @@ When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines a
 
 ## New sessions
 
-`preflight.detectAgents` lists the agents on PATH from the table in `start.rs` (claude, omp, opencode, pi, and antigravity as `agy`). `session.tabs.createTerminal {worktree, agent}` opens an unfocused herdr tab in the conversation's directory and starts the agent with `agent.start`, with no resume argument. The new pane is remembered as belonging to that worktree (`terminals::remember_pane`), so `session.tabs.list` shows it before its agent has a session id. If herdr refuses `agent.start`, the tab the call made is closed and the call fails with `agent_not_started`.
+`preflight.detectAgents` lists the agents on PATH from the table in `start.rs` (claude, omp, opencode, pi, and antigravity as `agy`). `session.tabs.createTerminal {worktree, agent}` has two cases, decided by the worktree id:
+
+- **A conversation's worktree** (a `worktree.ps` row, `<repo>::conv-…`) resumes the conversation the way "Open in herdr" does (`herdr_open::open_with_focus`, with focus left alone). A pane herdr already lists as running the conversation is reused. Otherwise a tab runs the harness's resume command (`omp --resume <session>`, `claude --resume <id>`, `pi --session <session>`), so the conversation's own journal grows. The reply is the pane herdr lists as running it, once herdr reports its agent up (not `unknown`), so a prompt sent after the reply is not lost in the agent's start-up screen. `agent` may be omitted or must equal the conversation's harness (`conversationAgent` on the row); any other agent fails with `bad_request` before anything opens. `cwd` is refused. A tab left with an idle shell (the agent quit) gets the resume command typed into that shell. With no workspace left in herdr, a workspace opens in the conversation's directory. A resume that never lists its pane within 10 s closes the tab it made and fails with `agent_not_started`. A conversation this host does not list (a copy on another host) fails with `worktree_not_found`, "not on this machine", and nothing opens.
+- **A project's worktree** (no conversation; the selector is a repo id) opens an unfocused herdr tab in the project's directory and starts the agent with `agent.start`, with no resume argument, or a plain shell when no agent is named. The pane is recorded against the project's id, which no conversation has, so no conversation lists it.
+
+Chat sends (`terminal.send` with `enter`) are refused with `not_running_agent` when the pane's tab carries a conversation's tag but no agent runs in it (the agent quit and the shell is left), and with `agent_waiting_on_prompt` when herdr reports the pane `blocked`. Nothing is typed in either case. A conversation's pane is listed only while its foreground argv carries the session's id (or its tab's tag names it), never by a record kept by the bridge, so a terminal id herdr reuses after a restart belongs to no conversation.
 
 ## Notifications
 

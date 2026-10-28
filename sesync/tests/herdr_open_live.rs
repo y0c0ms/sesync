@@ -11,10 +11,10 @@
 
 use sesync::herdr_open::{self, Herdr, Opened, Plan, Process, Runner};
 use serde_json::Value;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One herdr CLI call through the real runner, parsed.
@@ -26,11 +26,11 @@ fn herdr_json(args: &[&str]) -> Value {
 }
 
 /// The real runner, counting its calls.
-struct Counting(Rc<Cell<usize>>);
+struct Counting(Arc<AtomicUsize>);
 
 impl Runner for Counting {
     fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
-        self.0.set(self.0.get() + 1);
+        self.0.fetch_add(1, Ordering::Relaxed);
         Process.run(program, args)
     }
 }
@@ -87,20 +87,20 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
     };
     let plan = Plan { argv, cwd: project.clone(), cwd_fallback: false, label: label.clone(), tag };
     let shell = herdr_open::PaneShell::current(&home());
-    let calls = Rc::new(Cell::new(0));
-    let herdr = Herdr::from_env(Box::new(Counting(Rc::clone(&calls))));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let herdr = Herdr::from_env(Box::new(Counting(Arc::clone(&calls))));
     let shows_programs = !cfg!(windows);
     let tabs_before = tab_labels().len();
 
     let started = Instant::now();
     let opened = herdr_open::open(&herdr, &plan, shell, herdr_open::Detect::platform()).expect("the first open creates a tab");
-    println!("first open: {:?}, {} herdr calls", started.elapsed(), calls.get());
+    println!("first open: {:?}, {} herdr calls", started.elapsed(), calls.load(Ordering::Relaxed));
     let Opened::Created { tab_id } = opened.clone() else {
         panic!("the first open should create a tab, got {opened:?}");
     };
     let mut guard = CloseTab { herdr: Herdr::from_env(Box::new(Process)), tab: Some(tab_id.clone()) };
     if !shows_programs {
-        assert_eq!(calls.get(), 4, "tab list, tab create, pane run, tab focus, whatever the number of panes");
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "tab list, tab create, pane run, tab focus, whatever the number of panes");
     }
 
     // The tab carries the label, is focused, and its root pane starts in the session's directory.
@@ -136,11 +136,11 @@ fn a_session_opens_in_its_directory_runs_and_a_second_open_focuses_the_same_tab(
     }
 
     // A second open finds the session's tab and focuses it; no tab is added.
-    calls.set(0);
+    calls.store(0, Ordering::Relaxed);
     let again = herdr_open::open(&herdr, &plan, shell, herdr_open::Detect::platform()).expect("the second open focuses");
     assert_eq!(again, Opened::Focused { tab_id: tab_id.clone() });
     if !shows_programs {
-        assert_eq!(calls.get(), 4, "tab list, pane list, the tagged pane's process info, tab focus");
+        assert_eq!(calls.load(Ordering::Relaxed), 4, "tab list, pane list, the tagged pane's process info, tab focus");
 
         // The program ends (as after a herdr restart, when the tab comes back at its prompt): the
         // next open types the command into the same tab instead of opening another.

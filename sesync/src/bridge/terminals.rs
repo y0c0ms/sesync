@@ -34,19 +34,30 @@ pub struct Running {
     pub fallback: Option<String>,
 }
 
-/// Panes the bridge opened, by herdr terminal id, with the worktree id they were opened for. A pane
-/// opened without a resume runs no session id yet, so its argv cannot place it; this does. Entries of
-/// panes herdr no longer lists are dropped on the next listing.
-static OPENED: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Panes the bridge opened, by herdr server and terminal id, with the worktree id they were opened for. A pane
+/// opened for a project needs no argv to place it; this does. Entries of panes a server no longer lists are dropped
+/// on that server's next listing, so one server's listing never drops another's records.
+static OPENED: LazyLock<Mutex<HashMap<(String, String), String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Record that the pane `terminal_id` belongs to the worktree `worktree_id`.
-pub fn remember_pane(terminal_id: &str, worktree_id: &str) {
-    OPENED.lock().insert(terminal_id.to_string(), worktree_id.to_string());
+/// Record that the pane `terminal_id` belongs to the worktree `worktree_id`. Only a project's fresh tab is
+/// recorded here, under its project id, which no conversation has. A conversation's pane is never recorded:
+/// it is listed while its foreground argv carries the session's id (or its tag names it), so it stops being
+/// the conversation when its agent exits, and a terminal id that herdr reuses after a restart belongs to no
+/// conversation. A record would outlive the agent and send the phone's prompts into a bare shell.
+pub fn remember_pane(herdr: &dyn Herdr, terminal_id: &str, worktree_id: &str) {
+    OPENED.lock().insert((herdr.scope(), terminal_id.to_string()), worktree_id.to_string());
+}
+
+/// Whether a tab label carries a session's tag (`herdr_open::tab_label`): a tab "open in herdr" opened for a
+/// conversation. Such a tab stays the conversation's tab after its agent quits and its shell is left.
+pub fn is_session_tab(label: &str) -> bool {
+    let tag: String = label.chars().rev().take(8).collect::<String>().chars().rev().collect();
+    tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit()) && label.ends_with(&herdr_open::tag_suffix(&tag))
 }
 
 /// The worktree id a pane was opened for, when the bridge opened it.
-pub fn owner_of(terminal_id: &str) -> Option<String> {
-    OPENED.lock().get(terminal_id).cloned()
+pub fn owner_of(herdr: &dyn Herdr, terminal_id: &str) -> Option<String> {
+    OPENED.lock().get(&(herdr.scope(), terminal_id.to_string())).cloned()
 }
 
 /// Every pane herdr has, with its foreground processes and the conversation it runs by the fallback
@@ -54,10 +65,15 @@ pub fn owner_of(terminal_id: &str) -> Option<String> {
 /// reported idle while one of its panes is unknown. `conversations` is what the fallback rules match.
 pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Vec<Running>, String> {
     let panes = herdr::list_panes(h)?;
+    let scope = h.scope();
     let owners: HashMap<String, String> = {
         let mut opened = OPENED.lock();
-        opened.retain(|terminal, _| panes.iter().any(|p| p.terminal_id == *terminal));
-        opened.clone()
+        opened.retain(|(server, terminal), _| *server != scope || panes.iter().any(|p| p.terminal_id == *terminal));
+        opened
+            .iter()
+            .filter(|((server, _), _)| *server == scope)
+            .map(|((_, terminal), worktree)| (terminal.clone(), worktree.clone()))
+            .collect()
     };
     let mut running: Vec<Running> = panes
         .into_iter()

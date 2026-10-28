@@ -26,8 +26,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest tab label, in characters.
 const LABEL_MAX: usize = 40;
 
-/// Runs one program and returns its standard output, or why it failed.
-pub trait Runner {
+/// Runs one program and returns its standard output, or why it failed. The phone bridge shares one
+/// client across its request threads, so a runner must be thread-safe.
+pub trait Runner: Send + Sync {
     fn run(&self, program: &str, args: &[String]) -> Result<String, String>;
 }
 
@@ -222,6 +223,17 @@ impl Herdr {
     /// Type `command` into a pane and press Enter.
     pub fn run_in_pane(&self, pane_id: &str, command: &str) -> Result<(), String> {
         self.call(&["pane", "run", pane_id, command]).map(|_| ())
+    }
+
+    /// Open a workspace in `cwd`, unfocused, for when herdr has none to open a tab in. Returns the workspace's first
+    /// tab's id and that tab's root pane's id.
+    pub fn create_workspace(&self, cwd: &Path, label: &str) -> Result<(String, String), String> {
+        let cwd = cwd.display().to_string();
+        let v = self.call(&["workspace", "create", "--cwd", cwd.as_str(), "--label", label, "--no-focus"])?;
+        match (v["result"]["tab"]["tab_id"].as_str(), v["result"]["root_pane"]["pane_id"].as_str()) {
+            (Some(tab), Some(pane)) => Ok((tab.to_string(), pane.to_string())),
+            _ => Err("herdr's new workspace has no tab or pane id".to_string()),
+        }
     }
 
     pub fn focus_tab(&self, tab_id: &str) -> Result<(), String> {
@@ -539,6 +551,12 @@ impl Detect<'static> {
 /// shell, the tagged tab's panes, and an idle one gets the command again instead of a second tab.
 /// A new tab is focused after its command is typed, so keys pressed meanwhile never reach its shell.
 pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Result<Opened, String> {
+    open_with_focus(herdr, plan, shell, detect, true)
+}
+
+/// [`open`], and with `focus` false the tab herdr shows is left where it is: a phone-initiated resume must not move
+/// the desktop's focus. Nothing else differs.
+pub fn open_with_focus(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect, focus: bool) -> Result<Opened, String> {
     let tab_labels = herdr
         .tab_labels()
         .map_err(|e| format!("herdr is not reachable ({e}); open sesync from a herdr popup while herdr runs"))?;
@@ -564,7 +582,9 @@ pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Res
                 procs.push(PaneProcs { pane_id: pane.pane_id, tab_id: pane.tab_id, tab_label, argvs });
             }
             if let Some(pane) = find_open_pane(&procs, plan.ident(), &plan.tag) {
-                herdr.focus_tab(&pane.tab_id)?;
+                if focus {
+                    herdr.focus_tab(&pane.tab_id)?;
+                }
                 return Ok(Opened::Focused { tab_id: pane.tab_id.clone() });
             }
         }
@@ -580,7 +600,9 @@ pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Res
                     match pid.and_then(program_running_under) {
                         Some(false) => idle = idle.or(Some(pane.pane_id)),
                         _ => {
-                            herdr.focus_tab(&tab_id)?;
+                            if focus {
+                                herdr.focus_tab(&tab_id)?;
+                            }
                             return Ok(Opened::Focused { tab_id });
                         }
                     }
@@ -589,7 +611,9 @@ pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Res
                     herdr
                         .run_in_pane(&pane_id, &command)
                         .map_err(|e| format!("could not start the resume command in herdr: {e}"))?;
-                    herdr.focus_tab(&tab_id)?;
+                    if focus {
+                        herdr.focus_tab(&tab_id)?;
+                    }
                     return Ok(Opened::Resumed { tab_id });
                 }
             }
@@ -600,8 +624,10 @@ pub fn open(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Detect) -> Res
         let _ = herdr.close_tab(&tab_id);
         return Err(format!("could not start the resume command in herdr: {e}"));
     }
-    herdr
-        .focus_tab(&tab_id)
-        .map_err(|e| format!("opened '{}' in a new herdr tab, but could not switch to it ({e})", plan.label))?;
+    if focus {
+        herdr
+            .focus_tab(&tab_id)
+            .map_err(|e| format!("opened '{}' in a new herdr tab, but could not switch to it ({e})", plan.label))?;
+    }
     Ok(Opened::Created { tab_id })
 }

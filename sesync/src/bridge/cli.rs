@@ -11,6 +11,7 @@ use crate::qr;
 use qrcodegen::QrCode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use crate::harness::Locations;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::sync::Arc;
@@ -41,15 +42,23 @@ enum Fail {
     Failed(String),
 }
 
-/// Run one `sesync bridge` command. `dir` is the bridge's state directory; `catalog` is called only
-/// by `serve`, so the other commands never read a session store. `locks` says where sesync-lock is
-/// and where its claims live; `serve` uses it for prompt turns.
-pub fn run(args: &[String], dir: &Path, locks: LockTools, catalog: impl FnOnce() -> Arc<dyn Catalog>) -> i32 {
+/// What `serve` reads sessions from: the catalog the phone lists, and the harness locations and home that resuming a
+/// conversation reads (`herdr_open::plan`).
+pub struct Sessions {
+    pub catalog: Arc<dyn Catalog>,
+    pub locations: Locations,
+    pub home: PathBuf,
+}
+
+/// Run one `sesync bridge` command. `dir` is the bridge's state directory; `sessions` is called only by `serve`, so
+/// the other commands never read a session store. `locks` says where sesync-lock is and where its claims live; `serve`
+/// uses it for prompt turns.
+pub fn run(args: &[String], dir: &Path, locks: LockTools, sessions: impl FnOnce() -> Sessions) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("pair") => pair(&args[1..], dir),
         Some("devices") => list_devices(&args[1..], dir),
         Some("revoke") => revoke(&args[1..], dir),
-        Some("serve") => serve(&args[1..], dir, catalog(), locks),
+        Some("serve") => serve(&args[1..], dir, sessions(), locks),
         _ => Err(Fail::Usage("expected a command".into())),
     };
     match result {
@@ -110,7 +119,7 @@ fn revoke(args: &[String], dir: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTools) -> Result<(), Fail> {
+fn serve(args: &[String], dir: &Path, sessions: Sessions, locks: LockTools) -> Result<(), Fail> {
     let opts = options(
         args,
         &["listen", "allow", "herdr-socket", "ntfy-url", "ntfy-topic", "ntfy-token-command", "usage-every", "omp"],
@@ -126,6 +135,7 @@ fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTool
     let keys = keys::load_or_create(&dir.join("server.key")).map_err(Fail::Failed)?;
     let paired = devices::list(dir).map_err(Fail::Failed)?.len();
     let push = push_config(&opts);
+    let Sessions { catalog, locations, home } = sessions;
     let ctx = Ctx {
         catalog,
         herdr: Arc::new(herdr::Socket::new(herdr_socket.clone())) as Arc<dyn Herdr>,
@@ -136,7 +146,7 @@ fn serve(args: &[String], dir: &Path, catalog: Arc<dyn Catalog>, locks: LockTool
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
-        launch: start::Launch::from_env(),
+        launch: start::Launch::from_env(locations, home, &herdr_socket),
     };
     if !opts.contains_key("no-usage") {
         let every = usage_every(&opts)?;

@@ -7,35 +7,35 @@ use sesync::herdr_open::{self, Detect, Herdr, Opened, PaneProcs, Runner};
 use sesync::manage::Roots;
 use sesync::state::State;
 use serde_json::json;
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 const SID: &str = "aaaaaaaa-1111-2222-3333-444444444444";
 const CLAUDE_ID: &str = "bbbbbbbb-1111-2222-3333-444444444444";
 
-type Calls = Rc<RefCell<Vec<Vec<String>>>>;
+type Calls = Arc<Mutex<Vec<Vec<String>>>>;
 
 /// A runner that answers from a script and records every call as `program args...`.
 struct Fake {
     calls: Calls,
-    answer: Rc<dyn Fn(&[String]) -> Result<String, String>>,
+    answer: Arc<dyn Fn(&[String]) -> Result<String, String> + Send + Sync>,
 }
 
 impl Runner for Fake {
     fn run(&self, program: &str, args: &[String]) -> Result<String, String> {
         let mut line = vec![program.to_string()];
         line.extend(args.iter().cloned());
-        self.calls.borrow_mut().push(line);
+        self.calls.lock().push(line);
         (self.answer)(args)
     }
 }
 
-fn fake_herdr(answer: impl Fn(&[String]) -> Result<String, String> + 'static) -> (Herdr, Calls) {
+fn fake_herdr(answer: impl Fn(&[String]) -> Result<String, String> + Send + Sync + 'static) -> (Herdr, Calls) {
     let calls = Calls::default();
-    let runner = Fake { calls: calls.clone(), answer: Rc::new(answer) };
+    let runner = Fake { calls: calls.clone(), answer: Arc::new(answer) };
     (Herdr::new("herdr-bin", Some("w3".to_string()), Box::new(runner)), calls)
 }
 
@@ -75,7 +75,7 @@ fn herdr_with_panes(panes: Vec<(&str, &str, Vec<Vec<&str>>)>) -> (Herdr, Calls) 
 
 /// The herdr calls made, without the binary, as words: `["tab", "list"]`, ...
 fn verbs(calls: &Calls) -> Vec<Vec<String>> {
-    calls.borrow().iter().map(|c| c[1..].to_vec()).collect()
+    calls.lock().iter().map(|c| c[1..].to_vec()).collect()
 }
 
 fn sandbox(name: &str) -> PathBuf {
@@ -493,7 +493,7 @@ fn a_pane_in_the_sessions_directory_whose_processes_cannot_be_read_stops_the_ope
     });
     let err = herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap_err();
     assert!(err.contains("could not read the processes of pane w2:p1"), "{err}");
-    assert!(!calls.borrow().iter().any(|c| c.contains(&"create".to_string())), "fails closed, no second copy");
+    assert!(!calls.lock().iter().any(|c| c.contains(&"create".to_string())), "fails closed, no second copy");
 }
 
 #[test]
@@ -571,7 +571,7 @@ fn the_open_says_it_started_before_any_herdr_call_is_made() {
     app.handle(Ev::Char('o'), Instant::now());
     assert!(app.has_pending_open());
     assert!(app.status().starts_with("opening '"), "the frame drawn now says so: {}", app.status());
-    assert!(calls.borrow().is_empty(), "nothing is asked of herdr before that frame");
+    assert!(calls.lock().is_empty(), "nothing is asked of herdr before that frame");
     app.run_pending_open();
     assert!(!app.has_pending_open());
     assert!(app.should_quit());
@@ -587,7 +587,7 @@ fn the_first_menu_row_opens_the_session_in_herdr_and_leaves_the_tui() {
     assert_eq!(app.mode(), Mode::Browse);
     assert!(app.should_quit(), "success closes the popup's TUI");
     assert!(app.status().contains("opened"), "status: {}", app.status());
-    assert!(calls.borrow().iter().any(|c| c.get(1..3) == Some(&["tab".to_string(), "create".to_string()][..])));
+    assert!(calls.lock().iter().any(|c| c.get(1..3) == Some(&["tab".to_string(), "create".to_string()][..])));
 }
 
 #[test]
@@ -625,5 +625,5 @@ fn a_run_that_answers_nothing_is_a_success() {
         }
     });
     assert_eq!(herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
-    assert!(calls.borrow().iter().any(|c| c.get(1..3) == Some(&["pane".to_string(), "run".to_string()][..])));
+    assert!(calls.lock().iter().any(|c| c.get(1..3) == Some(&["pane".to_string(), "run".to_string()][..])));
 }
