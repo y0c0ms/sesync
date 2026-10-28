@@ -593,6 +593,53 @@ Membership levels: the server's admin token authorizes `/admin/*`; a device toke
 (machine-scoped) authorizes member routes only while the machine is bound to a key the current
 signed list names. A write also needs the record signed by a device the current list names.
 
+## Completed turns (what team sync compares)
+
+A conversation is compared with its team copy by its **completed turns**, never by its bytes or
+file times (`sesync/src/turns.rs`). A turn is one user message and everything the assistant did
+in answer to it: text, tool calls and their results. It is completed when it ends with an
+assistant message that has no tool call (the final answer). A prompt still waiting for a reply, a
+reply still running tools, and an aborted or failed reply with no content are not turns yet.
+
+The turn hash is taken over normalized content, so one conversation hashes the same whichever
+harness it was read through:
+
+- **Kept:** the role sequence; text parts of user and assistant messages; tool calls by name and
+  arguments (a non-object argument compares as `{"input": v}`, as `sesync-conv` writes it); tool
+  results by their text, parts joined by a newline; a result counts only when it answers a call
+  seen earlier and not answered yet.
+- **Dropped:** ids, parent ids, timestamps, usage, model, stop reasons, thinking blocks and their
+  signatures, images, and any text that is blank or starts with `<`. The `<` rule is how a Claude
+  transcript marks wrappers and reasoning (`sesync-conv from-claude` drops them, or keeps reasoning
+  as a `<prior_reasoning>` text), so both sides drop it and a copy that went through Claude stays
+  equal. A prompt that starts with `<` is therefore not a turn of its own; its reply joins the turn
+  before it.
+- **Active branch:** the chain from the last message record in the file, followed by `parentId`,
+  through every record. It is **not** cut at a compaction: archived turns stay in the file, and a
+  copy made before the compaction still compares as a prefix.
+
+`compare(local, team)` is the longest common prefix of the two turn lists:
+`Identical`, `Ahead(n)` (local has n more), `Behind(n)` (the team copy has n more), or
+`Diverged { common, local_new, team_new }` (neither is a prefix of the other). A `fingerprint` of
+a turn list changes exactly when its completed turns change.
+
+```mermaid
+flowchart LR
+    J["journal bytes<br/>(omp/Pi form)"] --> P["active chain<br/>message records only"]
+    P --> N["normalize: text, calls, results<br/>drop ids, times, thinking, '<' text"]
+    N --> T["completed turns<br/>hash each"]
+    T --> C{"compare with<br/>the team copy's turns"}
+    C -->|same list| I["Identical"]
+    C -->|local is a prefix| A["Ahead n"]
+    C -->|team is a prefix| B["Behind n"]
+    C -->|neither| D["Diverged: common, both new parts"]
+```
+
+Known limits, all of them safe (a difference is reported, never written over): a conversation
+compacted in omp and copied through Claude loses its archived turns on the Claude side, so it
+compares as diverged; images and tool-call ids are not compared; a text part that a converter
+rewrites in another way than the rules above would show as a change.
+
 ## Push path (exactly what runs)
 
 1. `State::marked` holds the sessions the user marked. Nothing else is eligible.

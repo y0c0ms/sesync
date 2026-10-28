@@ -3,6 +3,21 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: team turns, phase 1 (branch team-turns): the comparison unit
+
+- **Why.** Team sync judged change by the bytes of the canonical journal, so omp metadata appended
+  to a file counted as a change, and nothing checked that a machine's copy was based on the team's
+  copy (a machine behind could replace newer turns). Phase 1 adds the unit the rest is built on.
+- **Now.** `sesync/src/turns.rs`: a journal's completed turns (user message, its replies, tool calls
+  and results, ended by a final assistant message), a normalized hash per turn, `fingerprint`, and
+  `compare` (Identical / Ahead / Behind / Diverged). The rules, and why they match across harnesses,
+  are in ARCHITECTURE "Completed turns". Nothing calls it yet: pushes and the Team tab still use bytes
+  (phases 2 and 3).
+- **Evidence.** `sesync/tests/turns.rs` (13): metadata records, trailing prompt, aborted reply, a
+  reply still running tools, ids/times/thinking, changed answer, prefix relations, fingerprint,
+  compaction not cutting the chain, a bad line named, omp -> to-claude -> from-claude through the
+  real `sesync-conv` gives identical turns, and a hand-written Claude transcript equals its omp form.
+
 ## 2026-10-27: Team tab shows what this machine shares, and pulls without ctrl+r
 
 - **Seen.** On the work PC a session marked for the team did not show on the Team tab ("Team
