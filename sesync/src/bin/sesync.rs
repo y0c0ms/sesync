@@ -657,8 +657,16 @@ fn main() {
         // The last line reported per waiting join, so "waiting for the admin" is logged once per
         // team per run, not on every team step.
         let mut join_notes: std::collections::BTreeMap<String, String> = Default::default();
+        // The shares as the team step last saw them: a session the user just shared or unshared
+        // is pushed on the next tick, not after the backed-off interval.
+        let mut shares_seen = state.shares.clone();
         loop {
             one_pass(&env, &mut state);
+            if state.shares != shares_seen {
+                shares_seen = state.shares.clone();
+                next_team_at = None;
+                team_backoff = team_backoff.next(true);
+            }
             let team_due = next_team_at.map_or(true, |t| std::time::Instant::now() >= t);
             if team_due {
                 // Set when a pull accepts a new record, a push succeeds or the admin approves a
@@ -1124,6 +1132,8 @@ fn run_tui(
     // Restore last-run taste (theme, tab) from this user's configuration directory.
     let prefs = sesync::app::prefs::load(&config_dir);
     app.restore_prefs(prefs.theme, prefs.view);
+    // The Team tab starts from a fresh pull (in the background), not from "not pulled yet".
+    app.request_team_refresh();
     tr("team and prefs loaded", &mut trace);
 
     // The state file is read back only when it changed since the last look: the daemon
@@ -1139,6 +1149,13 @@ fn run_tui(
         jobs.tick(&mut app, &config_dir);
         // A pull that finished while the terminal sat idle is applied now, not at the next key.
         collect_pull(&mut app, &mut pending_pull, &config_dir);
+        // A pull asked for without a key (start, opening the Team tab, a push the daemon just made)
+        // starts here; one asked for while another runs waits for it.
+        if !app.pulling() && app.take_refresh_request() {
+            if let started @ TeamPull::Running(_) = request_team_pull(&mut app, &config_dir) {
+                pending_pull = started;
+            }
+        }
         // Titles still to read go to their worker; the ones it read since are shown, and saved
         // once it has nothing left to read.
         title_worker.request(app.take_title_requests());

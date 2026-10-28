@@ -8,7 +8,7 @@ fn outcome(conv: &str, text: &[u8], seq: u64) -> PullOutcome {
     let mut accepted = std::collections::BTreeMap::new();
     accepted.insert(conv.to_string(), seq);
     PullOutcome {
-        shown: vec![PulledRecord { conversation: conv.to_string(), text: text.to_vec() }],
+        shown: vec![PulledRecord { conversation: conv.to_string(), text: text.to_vec(), mine: false }],
         accepted,
         ..Default::default()
     }

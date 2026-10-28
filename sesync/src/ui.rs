@@ -510,13 +510,42 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             Span::styled("managed here; join it to sync this machine", Style::default().fg(th.dim)),
         ]));
     }
-    head.push(Line::from(Span::styled(app.team_header(std::time::Instant::now()), Style::default().fg(th.dim))));
+    // This machine's shared sessions first: what it is sending, and whether it has gone out yet.
+    let shared = app.shared_from_here();
+    const SHARED_SHOWN: usize = 5;
+    if !shared.is_empty() {
+        head.push(Line::from(Span::styled(format!("Shared from this machine ({})", shared.len()), Style::default().fg(th.text).add_modifier(Modifier::BOLD))));
+        for s in shared.iter().take(SHARED_SHOWN) {
+            let color = if s.state.contains("waiting") || s.state.contains("changed") { th.warn } else { th.dim };
+            head.push(Line::from(vec![
+                Span::styled(format!("  {}  ", crate::session_cols::fit(&s.harness, 8)), Style::default().fg(th.dim)),
+                Span::styled(format!("{}  ", crate::session_cols::fit(&crate::session_cols::display_safe(&s.title), 40)), Style::default().fg(th.text)),
+                Span::styled(s.state.clone(), Style::default().fg(color)),
+            ]));
+        }
+        if shared.len() > SHARED_SHOWN {
+            head.push(Line::from(Span::styled(format!("  and {} more (Sessions tab, f view:marked)", shared.len() - SHARED_SHOWN), Style::default().fg(th.dim))));
+        }
+    }
+    let rows = app.team_rows();
+    head.push(Line::from(vec![
+        Span::styled("On the team  ", Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+        Span::styled(app.team_header(std::time::Instant::now()), Style::default().fg(th.dim)),
+    ]));
+    if !rows.is_empty() {
+        head.push(Line::from(Span::styled(
+            format!("  {}  {}  {}  {}", crate::session_cols::fit("TITLE", TEAM_TITLE_W), crate::session_cols::fit("FROM", 12),
+                crate::session_cols::fit("UPDATED", 9), "HERE"),
+            Style::default().fg(th.dim),
+        )));
+    }
     let parts = Layout::vertical([Constraint::Length(head.len() as u16), Constraint::Min(1)]).split(area);
     f.render_widget(Paragraph::new(head), parts[0]);
     let area = parts[1];
-    let rows = app.team_rows();
     if rows.is_empty() {
-        let msg = if !cards.is_empty() || app.team_configured() {
+        let msg = if app.pulling() {
+            "Pulling the team…"
+        } else if !cards.is_empty() || app.team_configured() {
             "No verified team sessions yet. Press ctrl+r to pull."
         } else {
             "Not in a team yet. Press ctrl+p and pick \"Join a team\", or \"Start a team\" on the admin machine."
@@ -528,12 +557,23 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let selected = Some(app.team_index());
     let offset = selected.unwrap_or(0).saturating_sub(height.saturating_sub(1));
     let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
-    let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();
+    let items: Vec<ListItem> = rows.iter().map(|r| {
+        let title = format!("{} · {}…", crate::session_cols::display_safe(&r.title), r.short_id);
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{}  ", crate::session_cols::fit(&title, TEAM_TITLE_W)), Style::default().fg(th.text)),
+            Span::styled(format!("{}  ", crate::session_cols::fit(r.from, 12)), Style::default().fg(if r.from == "this machine" { th.dim } else { th.text })),
+            Span::styled(format!("{}  ", crate::session_cols::fit(&r.updated, 9)), Style::default().fg(th.dim)),
+            Span::styled(if r.here { "yes" } else { "no (i imports it)" }, Style::default().fg(th.dim)),
+        ]))
+    }).collect();
     let list = List::new(items)
         .highlight_style(Style::default().bg(th.accent))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut list_state);
 }
+
+/// The width of the Team list's title column (title and short id).
+const TEAM_TITLE_W: usize = 50;
 
 // ----- floating dialogs -------------------------------------------------------------------
 
