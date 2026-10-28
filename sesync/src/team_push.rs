@@ -62,13 +62,24 @@ pub fn push_marked_sealed<R: TeamRemote>(state: &State, remote: &R, space: &str,
                                          seal: impl FnOnce(u64) -> Result<Vec<u8>, String>)
     -> Result<(), PushError>
 {
+    push_marked_sealed_if(state, remote, space, session_id, |version| seal(version).map(Some)).map(|_| ())
+}
+
+/// `push_marked_sealed` for a write that depends on what the server holds under the lease: `seal`
+/// may decline with `None` after reading it, and the lease is then given back without a write
+/// (`Ok(false)`). `Ok(true)` means the bytes were written.
+pub fn push_marked_sealed_if<R: TeamRemote>(state: &State, remote: &R, space: &str, session_id: &str,
+                                            seal: impl FnOnce(u64) -> Result<Option<Vec<u8>>, String>)
+    -> Result<bool, PushError>
+{
     if !state.is_shared_with(session_id, space) {
         return Err(PushError::Refused("session is not shared with this team".into()));
     }
     let version = remote.acquire(space, session_id)?;
     let _guard = Lease { remote, space: space.to_string(), conversation: session_id.to_string() };
-    let bytes = seal(version).map_err(PushError::Refused)?;
-    remote.put(space, session_id, version, &bytes)
+    let Some(bytes) = seal(version).map_err(PushError::Refused)? else { return Ok(false) };
+    remote.put(space, session_id, version, &bytes)?;
+    Ok(true)
 }
 
 /// Push already-sealed bytes for a marked session under a lease. For callers whose bytes do not

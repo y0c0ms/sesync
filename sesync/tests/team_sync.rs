@@ -4,7 +4,9 @@
 use sesync::harness::{Location, Locations, Tools};
 use sesync::state::State;
 use sesync::team_push::{PushError, TeamRemote};
-use sesync::team_sync::{is_due, push_due, DEFAULT_TEAM_QUIET_SECS};
+use sesync::team_sync::{is_due, push_due, ResealCheck, DEFAULT_TEAM_QUIET_SECS};
+use sesync_team::membership::Device;
+use sesync_team::signed_records::seal_record;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
@@ -299,4 +301,69 @@ fn a_harness_with_no_journal_format_is_refused() {
     let err = canonical("cursor", Path::new("x"), Path::new("/no"), None, &d).unwrap_err();
     assert!(err.contains("no canonical journal"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ----- a re-seal checks the stored record under the lease ---------------------------------------
+
+/// A server where another member's write can land between a read and a lease. `stored` answers
+/// from `record`; the next `acquire` lets `rival` land first. Every call is logged, in order.
+#[derive(Default)]
+struct Server {
+    record: RefCell<Option<Vec<u8>>>,
+    rival: RefCell<Option<Vec<u8>>>,
+    writes: RefCell<Vec<Vec<u8>>>,
+    log: RefCell<Vec<&'static str>>,
+}
+
+impl TeamRemote for Server {
+    fn acquire(&self, _s: &str, _c: &str) -> Result<u64, PushError> {
+        self.log.borrow_mut().push("acquire");
+        if let Some(rival) = self.rival.borrow_mut().take() {
+            *self.record.borrow_mut() = Some(rival);
+        }
+        Ok(1)
+    }
+    fn put(&self, _s: &str, _c: &str, _v: u64, bytes: &[u8]) -> Result<(), PushError> {
+        self.log.borrow_mut().push("put");
+        self.writes.borrow_mut().push(bytes.to_vec());
+        *self.record.borrow_mut() = Some(bytes.to_vec());
+        Ok(())
+    }
+    fn release(&self, _s: &str, _c: &str) -> Result<(), PushError> {
+        self.log.borrow_mut().push("release");
+        Ok(())
+    }
+    fn stored(&self, _s: &str, _c: &str) -> Result<Option<Vec<u8>>, PushError> {
+        self.log.borrow_mut().push("stored");
+        Ok(self.record.borrow().clone())
+    }
+}
+
+/// Alice's copy is unchanged since her push and the member list moves to 2. Bob's newer record lands
+/// after her check but before her lease, so her re-seal must not replace it.
+#[test]
+fn a_reseal_checks_the_stored_record_under_the_lease_so_a_newer_push_is_kept() {
+    let (alice, bob) = (Device::generate(), Device::generate());
+    let server = Server::default();
+    let mut state = State::default();
+    state.share("conv-1", "personal");
+    let plain = b"alice's turn".to_vec();
+
+    // Pass one, at list 1: Alice's copy is pushed, and her record is stored.
+    let seal_at_1 = |id: &str, v: u64, p: &[u8]| seal_record(&alice, 1, v, "personal", id, p).map_err(|e| format!("{e:?}"));
+    let pass = push_due(&mut state, &server, "personal", 1000.0, 120.0,
+        |_| Ok(plain.clone()), |_| Some(0.0), seal_at_1, None);
+    assert_eq!(pass.pushed, vec!["conv-1".to_string()], "{pass:?}");
+
+    // Pass two, at list 2: nothing changed, so only a re-seal could write. Bob's push lands first.
+    *server.rival.borrow_mut() = Some(seal_record(&bob, 2, 2, "personal", "conv-1", b"newer, from bob").unwrap());
+    server.log.borrow_mut().clear();
+    let seal_at_2 = |id: &str, v: u64, p: &[u8]| seal_record(&alice, 2, v, "personal", id, p).map_err(|e| format!("{e:?}"));
+    let check = ResealCheck { list: 2, author: alice.public_key() };
+    let pass = push_due(&mut state, &server, "personal", 2000.0, 120.0,
+        |_| Ok(plain.clone()), |_| Some(0.0), seal_at_2, Some(&check));
+    assert!(pass.resealed.is_empty() && pass.pushed.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    assert_eq!(pass.skipped_unchanged, vec!["conv-1".to_string()], "{pass:?}");
+    assert_eq!(server.writes.borrow().len(), 1, "Alice wrote nothing over Bob's record");
+    assert_eq!(*server.log.borrow(), vec!["acquire", "stored", "release"], "the lease is taken before the check");
 }

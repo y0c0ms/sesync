@@ -689,13 +689,15 @@ theirs (`RecordError::StaleList`), and a device added to the list was never a re
 records sealed before it, so after any approve, revoke or removal every stored record is unreadable
 until it is sealed again. Content pushes alone would leave a quiet conversation hidden for good. So
 each push step also asks, once per conversation and list version (`TeamPush::list`), whether an
-unchanged shared conversation needs it (`team_sync::needs_reseal`): it reads the stored record back
-and re-seals the same content under the current list only when the record's own signature proves
-this machine wrote it (`signed_records::authorship`, which needs no list and also refuses a sequence
-below this machine's floor, so a forged header or a replayed older record of its own cannot trigger
-it) and it is sealed under an older list. A record written last by someone else is left alone, so an
-older copy never replaces newer content; that author re-seals it, and until that machine runs again
-its records stay unreadable. The daemon logs `N re-sealed under the current member list`.
+unchanged shared conversation needs it. It takes the conversation's lease first and reads the stored
+record back under it (`team_sync::needs_reseal`); it re-seals the same content under the current list
+only when the record's own signature proves this machine wrote it (`signed_records::authorship`, which
+needs no list and also refuses a sequence below this machine's floor, so a forged header or a replayed
+older record of its own cannot trigger it) and it is sealed under an older list. A push another member
+lands after an earlier read is therefore seen, not replaced. A record written last by someone else gives
+the lease back without a write, so an older copy never replaces newer content; that author re-seals it,
+and until that machine runs again its records stay unreadable. The daemon logs `N re-sealed under the
+current member list`.
 
 Admission. The team code is a shared secret, so the server never admits on it: a code holder can
 ask to join and re-authenticate a key the admin already listed, nothing more. A new key waits as a

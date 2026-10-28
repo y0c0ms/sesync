@@ -12,7 +12,7 @@
 
 use crate::harness::{self, Locations, Tools};
 use crate::state::State;
-use crate::team_push::{push_marked_sealed, HttpTeam, PushError};
+use crate::team_push::{push_marked_sealed_if, HttpTeam, PushError};
 use sesync_team::signed_records::{authorship, Binding};
 use std::path::Path;
 
@@ -63,42 +63,33 @@ pub struct ResealCheck {
 
 /// Whether an unchanged conversation must be sealed again under `check.list`. True only when the
 /// record the server stores is this machine's own (proven by its signature, at or above the
-/// sequence this machine has already accepted) and sealed under an older list, or when the server
-/// stores none although this machine pushed one. A record by another author is theirs to re-seal:
-/// sending this machine's copy over it could replace newer content. Once the answer for this list
-/// is known it is recorded, so the server is asked once per conversation and list change.
-pub fn needs_reseal<R: crate::team_push::TeamRemote>(state: &mut State, remote: &R, space: &str,
-                                                     conversation: &str, check: &ResealCheck)
-    -> Result<bool, String>
+/// sequence `floor` this machine has already accepted) and sealed under an older list, or when the
+/// server stores none. A record by another author is theirs to re-seal: sending this machine's copy
+/// over it could replace newer content. Callers ask under the conversation's lease, so the record
+/// read here is the one their write would replace.
+pub fn needs_reseal<R: crate::team_push::TeamRemote>(remote: &R, space: &str, conversation: &str, floor: u64,
+                                                     check: &ResealCheck) -> Result<bool, String>
 {
-    if state.team_list(space, conversation) >= check.list {
-        return Ok(false);
-    }
     let stored = remote.stored(space, conversation)
         .map_err(|e| format!("cannot read the stored record: {e:?}"))?;
     let Some(record) = stored else { return Ok(true) };
     let expect = Binding {
         space: space.to_string(),
         conversation: conversation.to_string(),
-        min_sequence: state.seen_floor(space, conversation),
+        min_sequence: floor,
     };
-    let own_and_stale = matches!(authorship(&expect, &record),
-        Ok(a) if a.author == check.author && a.list_version < check.list);
-    if !own_and_stale {
-        // Someone else's record, already current, or one that does not verify (a bad signature,
-        // or a sequence below what this machine accepted): nothing for this machine to re-seal.
-        state.set_team_list(space, conversation, check.list);
-    }
-    Ok(own_and_stale)
+    Ok(matches!(authorship(&expect, &record),
+        Ok(a) if a.author == check.author && a.list_version < check.list))
 }
 
 /// Push every due marked session. `content_of` gives the canonical bytes for a session id, and
 /// `last_change_of` its source's last write time. `seal` takes the session id, the lease version the
 /// push was granted (the record's sequence) and the plaintext, and returns the bytes to send. A
 /// session with no content or a failed push is recorded in `failed` and the pass goes on. A
-/// successful push records the hash and time in state. With `reseal`, an unchanged session is
-/// also sent when `needs_reseal` says its stored record is this machine's and sealed under an
-/// older member list; `None` (no verified list) never re-seals.
+/// successful push records the hash and time in state. With `reseal`, an unchanged session is also
+/// sent when `needs_reseal`, asked under the session's lease, says its stored record is this machine's
+/// and sealed under an older member list. When it says no, nothing is sent and the list is recorded.
+/// `None` (no verified list) never re-seals.
 #[allow(clippy::too_many_arguments)]
 pub fn push_due<R, C, T, S>(
     state: &mut State,
@@ -128,27 +119,45 @@ where
         // time, so hashing the sealed bytes would make every quiet tick look like a change.
         let hash = crate::mirror::file_hash_bytes(&plain);
         let pushed_hash = state.team_hash(space, &id).unwrap_or_default();
-        let mut resealing = false;
+        // An unchanged conversation is checked for a re-seal only when its recorded list is behind
+        // `reseal` and its content is identical to the last push. Content still changing waits for its
+        // quiet period, and is then sealed under the current list anyway.
+        let mut verify = None;
         if !is_due(now, changed, quiet_secs, &hash, &pushed_hash) {
-            // Only content identical to the last push may be re-sealed: content still changing
-            // waits for its quiet period, and is then sealed under the current list anyway.
-            let check = reseal.filter(|_| hash == pushed_hash);
-            match check.map(|c| needs_reseal(state, remote, space, &id, c)) {
-                Some(Ok(true)) => resealing = true,
-                Some(Err(e)) => { out.failed.push((id, e)); continue; }
-                Some(Ok(false)) | None => { out.skipped_unchanged.push(id); continue; }
+            match reseal.filter(|c| hash == pushed_hash && state.team_list(space, &id) < c.list) {
+                Some(c) => verify = Some(c),
+                None => { out.skipped_unchanged.push(id); continue; }
             }
         }
-        // The lease is taken inside push_marked_sealed, and the version it grants is passed to
-        // seal, so the record's sequence is the version the bytes are written under.
-        let pushed = push_marked_sealed(state, remote, space, &id, |version| seal(&id, version, &plain));
+        // The lease is taken first. A re-seal reads the stored record under it, so no write from another
+        // member can land between that read and this one; if the record is not ours, nothing is written.
+        // The version the lease grants is passed to seal, so the record's sequence is the version written.
+        let floor = state.seen_floor(space, &id);
+        let mut resealing = false;
+        let pushed = push_marked_sealed_if(state, remote, space, &id, |version| {
+            if let Some(c) = verify {
+                if !needs_reseal(remote, space, &id, floor, c)? {
+                    return Ok(None);
+                }
+                resealing = true;
+            }
+            seal(&id, version, &plain).map(Some)
+        });
         match pushed {
-            Ok(()) => {
+            Ok(true) => {
                 state.record_team_push(space, &id, &hash, now);
                 if let Some(c) = reseal {
                     state.set_team_list(space, &id, c.list);
                 }
                 if resealing { out.resealed.push(id) } else { out.pushed.push(id) }
+            }
+            // Declined under the lease: the stored record is someone else's, or already current. Nothing
+            // was written, and this list is not asked about again.
+            Ok(false) => {
+                if let Some(c) = verify {
+                    state.set_team_list(space, &id, c.list);
+                }
+                out.skipped_unchanged.push(id);
             }
             Err(PushError::Held) => out.failed.push((id, "held by another machine; will retry".into())),
             Err(e) => out.failed.push((id, format!("{e:?}"))),
