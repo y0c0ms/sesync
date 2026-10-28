@@ -3,6 +3,13 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: phone sessions: a picker-started pane finds its conversation (branch sesync-release)
+
+- **Why.** The first phone test showed "no tab on this session" for a session started without "Open in herdr": an `omp --resume` picker in herdr pane `w3:p1`. The bridge matched a pane only by a session id in its foreground argv, or by a pane it opened itself.
+- **What changed.** `terminals::running_panes` gives each agent pane that no argv or owner places a fallback conversation: first the Open-in-herdr tag in the tab label (`tab.list`), then the agent's terminal title with its harness prefix removed (omp `π` then a spinner or `>`; Claude a glyph such as `✳`; OpenCode `OC | `), compared the way tab labels are normalised. When several conversations share the title, the pane's foreground directory (`pane.foreground_cwd`) must pick exactly one. Ambiguity gives no match: a conversation a pane already runs directly takes no fallback, and a fallback that two panes both fit goes to neither. The stream loops, the notification watcher and `terminal.send` pass the conversation list in.
+- **Tests.** `terminals.rs`: a picker pane by title and directory; one title in two directories; ambiguity; a shared title with no directory match; direct claims unchanged; the tag; the Claude and OpenCode title shapes; a pane must run its conversation's harness; emoji titles. `rpc.rs`: the picker pane is the tab of its conversation through `session.tabs.list`. Bridge unit tests 229 (218 before).
+- **Not verified.** A picker pane on the phone itself. The live pane list has the shape the rules expect (`w3:p1`: argv `omp --resume`, title `π > Main agent`, foreground `/home/yocoms/SkillsOutlie`); the matching is checked against canned herdr answers.
+
 ## 2026-10-28: team turns, phase 3 (branch team-turns): one Team list, five divergence choices, take theirs guarded
 
 - **Why.** The Team tab listed what this machine shares and what the team holds in two sections, with

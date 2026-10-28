@@ -381,7 +381,7 @@ fn watch(ctx: &Ctx, every: Duration) {
                 }
             }
         }
-        let mut panes = match terminals::running_panes(ctx.herdr.as_ref()) {
+        let mut panes = match terminals::running_panes(ctx.herdr.as_ref(), &conversations) {
             Ok(panes) => {
                 herdr_error = None;
                 panes
@@ -463,10 +463,12 @@ mod tests {
                 agent: Some("omp".into()),
                 title: None,
                 rows: None,
+                foreground_cwd: None,
             },
             argvs: Vec::new(),
             prompt: None,
             owner: None,
+            fallback: None,
         }
     }
 

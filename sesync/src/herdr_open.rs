@@ -461,7 +461,7 @@ pub struct PaneProcs {
 
 /// The suffix a session's tab label ends with. sesync's tabs carry it, so a session stays findable
 /// when herdr reports no argument lists for its pane (Windows).
-fn tag_suffix(tag: &str) -> String {
+pub fn tag_suffix(tag: &str) -> String {
     if tag.is_empty() { String::new() } else { format!(" · {tag}") }
 }
 

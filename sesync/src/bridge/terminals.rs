@@ -9,6 +9,7 @@ use super::approvals;
 use super::catalog::Conversation;
 use super::herdr::{self, Herdr, Pane};
 use crate::herdr_open;
+use crate::session_cols::display_safe;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -21,13 +22,16 @@ const SCREEN_LINES: u32 = 60;
 
 /// A herdr pane with the argument lists of its foreground processes. `prompt` is set only when herdr
 /// reports the pane blocked on a prompt the bridge recognises: the app's `interactivePrompt` envelope.
-/// `owner` is the worktree id the bridge opened the pane for (see `remember_pane`).
+/// `owner` is the worktree id the bridge opened the pane for (see `remember_pane`). `fallback` is the
+/// worktree id the pane runs by the tag and title rules, set only when no argument list or owner
+/// places the pane (see `assign_fallbacks`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Running {
     pub pane: Pane,
     pub argvs: Vec<Vec<String>>,
     pub prompt: Option<String>,
     pub owner: Option<String>,
+    pub fallback: Option<String>,
 }
 
 /// Panes the bridge opened, by herdr terminal id, with the worktree id they were opened for. A pane
@@ -45,25 +49,134 @@ pub fn owner_of(terminal_id: &str) -> Option<String> {
     OPENED.lock().get(terminal_id).cloned()
 }
 
-/// Every pane herdr has, with its foreground processes. Fails closed: a pane whose processes cannot
-/// be read fails the listing, so no conversation is reported idle while one of its panes is unknown.
-pub fn running_panes(h: &dyn Herdr) -> Result<Vec<Running>, String> {
+/// Every pane herdr has, with its foreground processes and the conversation it runs by the fallback
+/// rules. Fails closed: a pane whose processes cannot be read fails the listing, so no conversation is
+/// reported idle while one of its panes is unknown. `conversations` is what the fallback rules match.
+pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Vec<Running>, String> {
     let panes = herdr::list_panes(h)?;
     let owners: HashMap<String, String> = {
         let mut opened = OPENED.lock();
         opened.retain(|terminal, _| panes.iter().any(|p| p.terminal_id == *terminal));
         opened.clone()
     };
-    panes
+    let mut running: Vec<Running> = panes
         .into_iter()
         .map(|pane| {
             let argvs = herdr::foreground_argvs(h, &pane.pane_id)
                 .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
             let prompt = blocked_prompt(h, &pane);
             let owner = owners.get(&pane.terminal_id).cloned();
-            Ok(Running { pane, argvs, prompt, owner })
+            Ok(Running { pane, argvs, prompt, owner, fallback: None })
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    // Tab labels cost one herdr call, so they are read only when some pane runs an agent.
+    let labels = if running.iter().any(|r| r.pane.agent.is_some()) {
+        herdr::tab_labels(h).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    assign_fallbacks(&mut running, conversations, &labels);
+    Ok(running)
+}
+
+/// Give a fallback conversation to each agent pane that no argument list or owner places. The rules, in
+/// order: the Open-in-herdr tag in the pane's tab label names the conversation; else the pane's agent and
+/// the title its terminal shows (`pane_title_name`) name one conversation, or, when several share that
+/// title, exactly one of them lives in the pane's foreground directory. Never ambiguous: a conversation
+/// that a pane already runs directly takes no fallback, and one that two panes both fit goes to neither.
+fn assign_fallbacks(panes: &mut [Running], conversations: &[Conversation], labels: &HashMap<String, String>) {
+    let ids: Vec<String> = conversations.iter().map(Conversation::worktree_id).collect();
+    let direct = |r: &Running, i: usize| runs_directly(r, &conversations[i], &ids[i]);
+    let carried: Vec<bool> = (0..conversations.len()).map(|i| panes.iter().any(|r| direct(r, i))).collect();
+    let claims: Vec<Option<usize>> = panes
+        .iter()
+        .map(|r| {
+            if r.pane.agent.is_none() || (0..conversations.len()).any(|i| direct(r, i)) {
+                return None;
+            }
+            fallback_conversation(r, conversations, labels).filter(|&i| !carried[i])
+        })
+        .collect();
+    let mut claimants = vec![0usize; conversations.len()];
+    for i in claims.iter().flatten() {
+        claimants[*i] += 1;
+    }
+    for (r, claim) in panes.iter_mut().zip(claims) {
+        r.fallback = claim.filter(|&i| claimants[i] == 1).map(|i| ids[i].clone());
+    }
+}
+
+/// The one conversation a pane's tag or title names, when exactly one fits.
+fn fallback_conversation(r: &Running, conversations: &[Conversation], labels: &HashMap<String, String>) -> Option<usize> {
+    let agent = r.pane.agent.as_deref()?;
+    if let Some(label) = labels.get(&r.pane.tab_id) {
+        let tagged: Vec<usize> = conversations
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| label.ends_with(&herdr_open::tag_suffix(&herdr_open::session_tag(&c.key))))
+            .map(|(i, _)| i)
+            .collect();
+        match tagged.as_slice() {
+            [only] => return Some(*only),
+            [] => {}
+            _ => return None,
+        }
+    }
+    let name = pane_title_name(agent, r.pane.title.as_deref()?)?;
+    let same: Vec<usize> = conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.harness == agent && display_safe(&c.title) == name)
+        .map(|(i, _)| i)
+        .collect();
+    match same.as_slice() {
+        [only] => Some(*only),
+        [] => None,
+        several => {
+            let dir = r.pane.foreground_cwd.as_deref()?;
+            let mut in_dir = several.iter().filter(|&&i| same_dir(&conversations[i].dir, dir));
+            match (in_dir.next(), in_dir.next()) {
+                (Some(&i), None) => Some(i),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn same_dir(a: &str, b: &str) -> bool {
+    !a.is_empty() && a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// The conversation title a pane's terminal title shows, normalised as tab labels are (`display_safe`),
+/// for the agents that title their terminal with it. omp writes `π`, then a spinner or `>`, then the title;
+/// Claude Code writes a glyph (`✳`, or a spinner while it works), then the title; OpenCode writes `OC | `
+/// then the title. None for any other agent, or a title that does not have that shape.
+pub fn pane_title_name(agent: &str, title: &str) -> Option<String> {
+    let rest = match agent {
+        "omp" => {
+            let rest = title.strip_prefix('π')?.trim_start();
+            let first = rest.chars().next()?;
+            if first != '>' && !is_spinner(first) {
+                return None;
+            }
+            &rest[first.len_utf8()..]
+        }
+        "claude" => title.trim_start_matches(|c: char| c.is_whitespace() || is_claude_glyph(c)),
+        "opencode" => title.strip_prefix("OC | ")?,
+        _ => return None,
+    };
+    let name = display_safe(rest);
+    (!name.is_empty()).then_some(name)
+}
+
+/// A Braille pattern: the spinner glyphs terminal titles animate with.
+fn is_spinner(c: char) -> bool {
+    ('\u{2800}'..='\u{28FF}').contains(&c)
+}
+
+/// The glyphs Claude Code puts before a title: its idle mark and working spinner (Dingbats and the middle dot).
+fn is_claude_glyph(c: char) -> bool {
+    c == '·' || ('\u{2700}'..='\u{27BF}').contains(&c) || is_spinner(c)
 }
 
 /// The prompt a blocked pane is waiting on, read from its recent screen. Best effort: a pane whose
@@ -87,9 +200,16 @@ pub fn conversation_of<'a>(pane: &Running, conversations: &'a [Conversation]) ->
     conversations.iter().find(|c| runs(pane, c))
 }
 
+/// Whether `r` runs `conv`: directly (see `runs_directly`), or by the fallback rules.
 fn runs(r: &Running, conv: &Conversation) -> bool {
-    r.owner.as_deref() == Some(conv.worktree_id().as_str())
-        || conv.idents.iter().any(|ident| herdr_open::argv_carries(&r.argvs, ident))
+    let worktree = conv.worktree_id();
+    runs_directly(r, conv, &worktree) || r.fallback.as_deref() == Some(worktree.as_str())
+}
+
+/// Whether `r` runs `conv` by what herdr reports: the bridge opened the pane for `worktree`, or a
+/// foreground argument carries one of `conv`'s session ids.
+fn runs_directly(r: &Running, conv: &Conversation, worktree: &str) -> bool {
+    r.owner.as_deref() == Some(worktree) || conv.idents.iter().any(|ident| herdr_open::argv_carries(&r.argvs, ident))
 }
 
 /// The label a terminal shows: the harness and the conversation's title, as "open in herdr" names a tab.
@@ -313,11 +433,13 @@ mod tests {
                 agent_status: status.into(),
                 agent: agent.map(str::to_string),
                 title: None,
+                foreground_cwd: None,
                 rows: Some(40),
             },
             argvs: vec![argv.iter().map(|s| s.to_string()).collect()],
             prompt: None,
             owner: None,
+            fallback: None,
         }
     }
 
@@ -420,5 +542,128 @@ mod tests {
         let row = agent_row(&r, &c, 5.0);
         assert_eq!(row["paneKey"], "term_a");
         assert_eq!(row["state"], "blocked");
+    }
+
+    /// A pane running `agent` with the given terminal title and foreground directory.
+    fn titled(id: &str, term: &str, agent: &str, title: &str, cwd: &str, argv: &[&str]) -> Running {
+        let mut r = pane(id, term, "idle", false, Some(agent), argv);
+        r.pane.title = Some(title.into());
+        r.pane.foreground_cwd = Some(cwd.into());
+        r
+    }
+
+    fn ids(panes: &[&Running]) -> Vec<String> {
+        panes.iter().map(|r| r.pane.terminal_id.clone()).collect()
+    }
+
+    #[test]
+    fn a_picker_started_omp_pane_runs_the_conversation_its_title_and_directory_name() {
+        let main = conv("omp", "Main agent", "uuid-1", "/home/u/SkillsOutlie");
+        let mut panes = vec![titled("w3:p1", "term_p1", "omp", "π ⠴ Main agent", "/home/u/SkillsOutlie", &["omp", "--resume"])];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &main)), ["term_p1"]);
+    }
+
+    #[test]
+    fn two_conversations_with_one_title_are_told_apart_by_the_pane_directory() {
+        let here = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let there = conv("omp", "Main agent", "uuid-2", "/work/beta");
+        let convs = vec![here.clone(), there.clone()];
+        let mut panes = vec![titled("w1:p1", "term_a", "omp", "π > Main agent", "/work/beta/", &["omp", "--resume"])];
+        assign_fallbacks(&mut panes, &convs, &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &there)), ["term_a"]);
+        assert!(panes_of(&panes, &here).is_empty());
+    }
+
+    #[test]
+    fn a_title_several_conversations_share_matches_none_unless_the_directory_settles_it() {
+        let a = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let b = conv("omp", "Main agent", "uuid-2", "/work/beta");
+        let convs = vec![a.clone(), b.clone()];
+        let elsewhere = titled("w1:p1", "term_a", "omp", "π > Main agent", "/work/gamma", &["omp"]);
+        let mut unknown_dir = titled("w1:p2", "term_b", "omp", "π > Main agent", "/work/alpha", &["omp"]);
+        unknown_dir.pane.foreground_cwd = None;
+        for pane in [elsewhere, unknown_dir] {
+            let mut panes = vec![pane];
+            assign_fallbacks(&mut panes, &convs, &HashMap::new());
+            assert!(panes_of(&panes, &a).is_empty() && panes_of(&panes, &b).is_empty(), "no match: ambiguous");
+        }
+    }
+
+    #[test]
+    fn two_panes_that_fit_one_conversation_both_go_to_neither() {
+        let main = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let mut panes = vec![
+            titled("w1:p1", "term_a", "omp", "π > Main agent", "/work/alpha", &["omp"]),
+            titled("w1:p2", "term_b", "omp", "π ⠴ Main agent", "/work/alpha", &["omp"]),
+        ];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
+        assert!(panes_of(&panes, &main).is_empty());
+    }
+
+    #[test]
+    fn a_conversation_a_pane_runs_directly_takes_no_title_fallback() {
+        let main = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let mut panes = vec![
+            pane("w1:p1", "term_a", "working", true, Some("omp"), &["omp", "--resume", "uuid-1"]),
+            titled("w1:p2", "term_b", "omp", "π > Main agent", "/work/alpha", &["omp", "--resume"]),
+        ];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &main)), ["term_a"]);
+    }
+
+    #[test]
+    fn the_open_in_herdr_tag_in_the_tab_label_names_the_conversation_before_any_title() {
+        let a = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let b = Conversation { key: "/s/beta".into(), ..conv("omp", "Main agent", "uuid-2", "/work/alpha") };
+        let convs = vec![a.clone(), b.clone()];
+        let mut panes = vec![titled("w1:p1", "term_a", "omp", "π > Main agent", "/work/alpha", &["omp", "--resume"])];
+        let tag = crate::herdr_open::session_tag(&b.key);
+        let labels = HashMap::from([("w1:t1".to_string(), format!("omp: Main agent · {tag}"))]);
+        assign_fallbacks(&mut panes, &convs, &labels);
+        assert!(panes_of(&panes, &a).is_empty());
+        assert_eq!(ids(&panes_of(&panes, &b)), ["term_a"]);
+    }
+
+    #[test]
+    fn claude_and_opencode_panes_match_their_own_title_shape_and_harness_only() {
+        let claude = conv("claude", "TestFromOPENCODE", "uuid-c", "/work/c");
+        let opencode = conv("opencode", "DoppleClankerMain", "ses_o", "/work/o");
+        let convs = vec![claude.clone(), opencode.clone()];
+        let mut panes = vec![
+            titled("w3:pG", "term_g", "claude", "✳ TestFromOPENCODE", "/work/c", &["claude"]),
+            titled("w3:pF", "term_f", "opencode", "OC | DoppleClankerMain", "/work/o", &["opencode"]),
+            titled("w3:pX", "term_x", "claude", "OC | DoppleClankerMain", "/work/o", &["claude"]),
+        ];
+        assign_fallbacks(&mut panes, &convs, &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &claude)), ["term_g"]);
+        assert_eq!(ids(&panes_of(&panes, &opencode)), ["term_f"]);
+    }
+
+    #[test]
+    fn a_pane_must_run_the_harness_its_conversation_has() {
+        let main = conv("omp", "Main agent", "uuid-1", "/work/alpha");
+        let mut panes = vec![titled("w1:p1", "term_a", "claude", "✳ Main agent", "/work/alpha", &["claude"])];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
+        assert!(panes_of(&panes, &main).is_empty());
+    }
+
+    #[test]
+    fn an_emoji_in_a_title_matches_on_both_sides_as_tab_labels_show_it() {
+        let mod_session = conv("omp", "📚 MOD: Deploy ModularStudy locally", "uuid-m", "/work/mod");
+        let mut panes = vec![titled("w3:pH", "term_h", "omp", "π > 📚 MOD: Deploy ModularStudy locally", "/work/mod", &["omp"])];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&mod_session), &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &mod_session)), ["term_h"]);
+    }
+
+    #[test]
+    fn a_terminal_title_names_its_conversation_by_each_harness_shape() {
+        assert_eq!(pane_title_name("omp", "π > Main agent").as_deref(), Some("Main agent"));
+        assert_eq!(pane_title_name("omp", "π ⠴ Main agent").as_deref(), Some("Main agent"));
+        assert_eq!(pane_title_name("omp", "yocoms@yocomsMain:~/projects"), None);
+        assert_eq!(pane_title_name("claude", "✳ TestFromOPENCODE").as_deref(), Some("TestFromOPENCODE"));
+        assert_eq!(pane_title_name("opencode", "OC | DoppleClankerMain").as_deref(), Some("DoppleClankerMain"));
+        assert_eq!(pane_title_name("opencode", "DoppleClankerMain"), None);
+        assert_eq!(pane_title_name("pi", "π > Main agent"), None);
     }
 }

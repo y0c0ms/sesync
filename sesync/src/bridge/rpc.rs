@@ -178,14 +178,13 @@ fn handle_param(params: &Value) -> Result<String, Failure> {
 /// The conversation a worktree id names, and the herdr panes now. Fails when the conversation is not
 /// listed, or herdr cannot be read: an empty tab list would then claim nothing is open.
 fn resolve(ctx: &Ctx, worktree: &str) -> Result<(Conversation, Vec<Running>), Failure> {
-    let conversation = ctx
-        .catalog
-        .conversations()
-        .map_err(|m| ("unavailable", m))?
-        .into_iter()
+    let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
+    let conversation = conversations
+        .iter()
         .find(|c| c.worktree_id() == worktree)
+        .cloned()
         .ok_or_else(|| ("worktree_not_found", format!("no conversation {worktree}")))?;
-    let panes = terminals::running_panes(ctx.herdr.as_ref()).map_err(|m| ("herdr_unavailable", m))?;
+    let panes = terminals::running_panes(ctx.herdr.as_ref(), &conversations).map_err(|m| ("herdr_unavailable", m))?;
     Ok((conversation, panes))
 }
 
@@ -218,7 +217,7 @@ fn find_terminal(ctx: &Ctx, handle: &str) -> Result<herdr::Pane, Failure> {
 fn worktree_ps(ctx: &Ctx) -> Result<Value, Failure> {
     let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
     // Live state is best-effort: without herdr every conversation shows as not open, and the list still loads.
-    let panes = terminals::running_panes(ctx.herdr.as_ref()).unwrap_or_default();
+    let panes = terminals::running_panes(ctx.herdr.as_ref(), &conversations).unwrap_or_default();
     let now = terminals::now_ms();
     let pinned = pins::load(&ctx.dir).unwrap_or_else(|m| {
         eprintln!("sesync bridge: {m}");
@@ -342,7 +341,7 @@ fn terminal_list(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
         }
         None => {
             let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
-            let panes = terminals::running_panes(ctx.herdr.as_ref()).map_err(|m| ("herdr_unavailable", m))?;
+            let panes = terminals::running_panes(ctx.herdr.as_ref(), &conversations).map_err(|m| ("herdr_unavailable", m))?;
             panes
                 .iter()
                 .filter_map(|r| terminals::conversation_of(r, &conversations).map(|c| terminals::terminal_row(r, c)))
@@ -412,10 +411,12 @@ fn terminal_clear(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
 fn submit(ctx: &Ctx, pane: &herdr::Pane, text: &str) -> Result<(), Failure> {
     let h = ctx.herdr.as_ref();
     let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
-    let argvs = herdr::foreground_argvs(h, &pane.pane_id).map_err(|m| ("herdr_unavailable", m))?;
-    let owner = terminals::owner_of(&pane.terminal_id);
-    let running = Running { pane: pane.clone(), argvs, prompt: None, owner };
-    let conv = terminals::conversation_of(&running, &conversations).cloned();
+    let panes = terminals::running_panes(h, &conversations).map_err(|m| ("herdr_unavailable", m))?;
+    let conv = panes
+        .iter()
+        .find(|r| r.pane.terminal_id == pane.terminal_id)
+        .and_then(|r| terminals::conversation_of(r, &conversations))
+        .cloned();
     if let Some(c) = &conv {
         ctx.turns.begin(&ctx.locks, &c.lock_id(), &pane.terminal_id).map_err(|m| ("conversation_locked", m))?;
     }
@@ -489,7 +490,7 @@ fn unsubscribe(params: &Value, conn: &Conn) -> Value {
 
 fn status_subscribe(ctx: &Ctx, conn: &Conn, id: &Value) -> Result<(), Failure> {
     let conversations = ctx.catalog.conversations().map_err(|m| ("unavailable", m))?;
-    let panes = terminals::running_panes(ctx.herdr.as_ref()).map_err(|m| ("herdr_unavailable", m))?;
+    let panes = terminals::running_panes(ctx.herdr.as_ref(), &conversations).map_err(|m| ("herdr_unavailable", m))?;
     let sessions = stream::sessions(&panes, &conversations, terminals::now_ms());
     let last: HashMap<String, Value> = sessions
         .iter()
@@ -706,6 +707,27 @@ mod tests {
         assert_eq!(result["activeTabId"], "term_b");
         assert_eq!(result["worktree"], c_.worktree_id().as_str());
         assert!(result["snapshotVersion"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_picker_started_pane_is_the_tab_of_the_conversation_its_title_and_directory_name() {
+        let main = conv("Main agent", "uuid-1", "/w/a", 1.0);
+        let other = conv("Main agent", "uuid-2", "/w/b", 2.0);
+        let panes = json!({"type":"pane_list","panes":[
+            {"pane_id":"w1:p1","terminal_id":"term_a","tab_id":"w1:t1","focused":true,"agent_status":"idle",
+             "agent":"omp","terminal_title":"π ⠴ Main agent","foreground_cwd":"/w/a"}
+        ]});
+        let argvs = json!({"process_info":{"foreground_processes":[{"argv":["omp","--resume"]}]}});
+        let c = ctx(Arc::new(Fixed(vec![main.clone(), other.clone()])), herdr_with(panes, argvs));
+        let (conn, _rx) = conn();
+        let tabs_of = |wanted: &Conversation| {
+            let request = req("t", "session.tabs.list", json!({"worktree": format!("id:{}", wanted.worktree_id())}));
+            dispatch(&request, &c, &conn).unwrap()["result"]["tabs"].clone()
+        };
+        let tabs = tabs_of(&main);
+        assert_eq!(tabs.as_array().unwrap().len(), 1, "{tabs}");
+        assert_eq!(tabs[0]["terminal"], "term_a");
+        assert!(tabs_of(&other).as_array().unwrap().is_empty(), "the other directory's conversation shows no tab");
     }
 
     #[test]

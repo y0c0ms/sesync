@@ -302,21 +302,21 @@ pub fn tabs_key(snapshot: &Value) -> Value {
 }
 
 pub fn run_tabs(mut t: Tabs) {
-    let mut conv: Option<Conversation> = None;
+    let mut convs: Vec<Conversation> = Vec::new();
     let mut refreshed = Instant::now();
     loop {
         thread::sleep(LIST_POLL);
         if t.stop.load(Ordering::Relaxed) {
             break;
         }
-        if conv.is_none() || refreshed.elapsed() >= CATALOG_REFRESH {
+        if convs.is_empty() || refreshed.elapsed() >= CATALOG_REFRESH {
             if let Ok(list) = t.catalog.conversations() {
-                conv = list.into_iter().find(|c| c.worktree_id() == t.worktree);
+                convs = list;
             }
             refreshed = Instant::now();
         }
-        let Some(c) = conv.as_ref() else { break };
-        let Ok(panes) = terminals::running_panes(t.herdr.as_ref()) else { continue };
+        let Some(c) = convs.iter().find(|c| c.worktree_id() == t.worktree) else { break };
+        let Ok(panes) = terminals::running_panes(t.herdr.as_ref(), &convs) else { continue };
         let mine = terminals::panes_of(&panes, c);
         let mut snapshot = terminals::tabs_result(
             &t.worktree,
@@ -379,7 +379,7 @@ pub fn run_status(mut t: Status) {
             }
             refreshed = Instant::now();
         }
-        let Ok(panes) = terminals::running_panes(t.herdr.as_ref()) else { continue };
+        let Ok(panes) = terminals::running_panes(t.herdr.as_ref(), &convs) else { continue };
         for session in sessions(&panes, &convs, terminals::now_ms()) {
             let id = session["sessionId"].as_str().unwrap_or("").to_string();
             let key = without_clock(session.clone());

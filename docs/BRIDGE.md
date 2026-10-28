@@ -85,7 +85,7 @@ Served methods:
 | `worktree.ps` | `{worktrees:[…], totalCount, truncated:false}`: one row per sesync conversation, newest first. `status` and `agents` come from the herdr panes running it (see Mapping). Without herdr the rows still load, as not open. `isPinned` is the conversation's pin. |
 | `worktree.set` `{worktree, isPinned}` | `{worktree, isPinned}`: pins a conversation. The pin is kept in `pins.json` under the bridge's state directory, never in sesync's store. Any other non-null field is refused as `bad_request`. |
 | `repo.list` | `{repos:[…]}`: the conversations' project directories, for grouping. Ids match the rows' `repoId`. |
-| `session.tabs.list` `{worktree:"id:<wt>"}` | `{worktree, publicationEpoch, snapshotVersion, tabs:[…], activeTabId, activeTabType}`: one `type:"terminal"` tab per pane running the conversation. Empty when none is open. |
+| `session.tabs.list` `{worktree:"id:<wt>"}` | `{worktree, publicationEpoch, snapshotVersion, tabs:[…], activeTabId, activeTabType}`: one `type:"terminal"` tab per pane running the conversation (see Mapping for what "running" means). Empty when none is open. |
 | `session.tabs.subscribe` `{worktree}` | Streams `{type:"snapshot", …tabs}` then `{type:"updated", …tabs}` when the tab list changes. `session.tabs.unsubscribe {worktree, subscriptionId?}` ends it. |
 | `terminal.list` `{worktree?, handles?}` | `{terminals:[…], totalCount, truncated:false}`: one row per pane (`handle` = herdr's terminal id). |
 | `terminal.read` `{terminal}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last 200 rows as text. |
@@ -132,7 +132,7 @@ phone accepts a host with `minCompatibleMobileVersion` 2 or lower.
 |---|---|
 | host | this machine (the bridge) |
 | worktree | one sesync conversation: its parent session and that session's mirrors. `worktreeId = <repoId>::<conversation id>`; `repoId = sesync-<hash of the project directory>`, the same id `repo.list` reports; `conversation id = conv-<hash of harness and parent key>`. Both hashes are stable while the parent session's file or store id is. |
-| tab / terminal | one herdr pane whose foreground argv carries one of the conversation's session ids as a flag's value (`argv_carries`, the rule "open in herdr" uses). Handle and terminal id = herdr's `terminal_id`, which stays with the terminal when its pane moves. |
+| tab / terminal | one herdr pane running the conversation. A pane runs it when its foreground argv carries one of the conversation's session ids as a flag's value (`argv_carries`, the rule "open in herdr" uses), or the bridge opened the pane for it. When no pane does, the pane runs it when the conversation is the one its tab tag or title names: the Open-in-herdr tag ends the pane's tab label; else the pane's agent is the conversation's harness and its terminal title, with the harness's prefix removed (omp `π` then a spinner or `>`; Claude Code a glyph such as `✳`; OpenCode `OC \| `), is the conversation's title, and when several conversations share that title, the one in the pane's foreground directory. Never ambiguous: a conversation a pane already runs directly takes no fallback, and a fallback two panes both fit goes to neither. Handle and terminal id = herdr's `terminal_id`, which stays with the terminal when its pane moves. |
 | agent status | herdr `agent_status`: `working` → `working`; `blocked` → `blocked`; `done` → `done`; `idle` or `unknown` → `waiting`. A tab row's `agentStatus` carries that `state`, `paneKey` (`tabId:terminalId`), `terminalHandle`, `agentType` (the conversation's harness), `providerSession.id` (the journal session id `nativeChat` reads by), and `interactivePrompt` when the pane is blocked on a recognised approval or question. Worktree status: working → `working`, blocked → `permission`, done → `done`, otherwise `active`/`waiting`. Session status (`agentSession.subscribeStatus`): working → `working`, blocked → `attention`, idle or done → `idle`, unknown → null. |
 
 ## Terminal streams
@@ -290,7 +290,7 @@ every 5 seconds).
 The bridge talks to herdr over its Unix socket: one JSON request per line, one reply line per request,
 each request on its own connection, 5 s timeout. The socket is `$HERDR_SOCKET_PATH`, else
 `$HOME/.config/herdr/herdr.sock`; `--herdr-socket` overrides it. Methods used: `pane.list`, `pane.get`,
-`pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`. The bridge never
+`pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`, and `tab.list` (tab labels, read only when an agent pane is listed, for the tag rule). The bridge never
 creates, closes, or resizes panes. Verified against herdr 0.9.1 (protocol 22):
 
 - `pane.read` with `format:"ansi"` returns CRLF line endings and the colour codes herdr keeps.
@@ -317,7 +317,7 @@ The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`,
 - `src/bridge/*`: unit tests for the herdr reply and pane parsing, the conversation id and worktree
   mapping, the tab, terminal and status shapes, the binary frame codec and 48 KiB chunking, the
   stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
-  named and a timed release), and the RPC dispatch against canned herdr answers.
+  named and a timed release), the RPC dispatch against canned herdr answers, and the pane fallback rules (the tag, the title and directory, ambiguity, and that an argv or owner match is never overridden).
 - `src/bridge/pins.rs`: pins survive a reload, the file is owner-only, a damaged file fails the write and is left alone, `isPinned` must be a boolean, and no other field is accepted. `rpc.rs` tests: the pin shows on the worktree row, `terminal.clearBuffer` sends Ctrl-L and reports a missing pane, write verbs and unserved methods answer `method_not_found`, and every read method is routed. `notify.rs`: a test push reaches a live stream, is kept out of the history, and is refused with no stream.
 - `src/bridge/confine.rs`, `files.rs`, `git.rs`: the path confinement (`..`, absolute paths, NUL, `.git`, a symlink that leaves the project or enters `.git`), the size caps, the `.gitignore`-honouring search, the git allowlist (every other verb and each unlisted option is refused before git starts, and a write verb leaves the repository unchanged), and reads of real files and a real `git init` repository in a sandbox. `rpc.rs` also runs a live repository through dispatch.
 - `src/bridge/e2ee.rs` pins the NaCl framing against a tweetnacl vector (both directions, and the

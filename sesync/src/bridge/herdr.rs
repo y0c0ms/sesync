@@ -7,6 +7,7 @@
 //! parsing lives here too, as pure functions over the `result` object.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -199,6 +200,8 @@ pub struct Pane {
     /// The agent herdr detected in the pane, when it detected one.
     pub agent: Option<String>,
     pub title: Option<String>,
+    /// The directory the pane's foreground process runs in, when herdr reports it.
+    pub foreground_cwd: Option<String>,
     /// The visible rows, when herdr reports the pane's scroll geometry.
     pub rows: Option<u64>,
 }
@@ -214,6 +217,7 @@ pub fn parse_pane(p: &Value) -> Option<Pane> {
         agent_status: text(p, "agent_status").unwrap_or_else(|| "unknown".into()),
         agent: text(p, "agent").filter(|a| !a.is_empty()),
         title: text(p, "title").or_else(|| text(p, "terminal_title")).filter(|t| !t.trim().is_empty()),
+        foreground_cwd: text(p, "foreground_cwd").filter(|d| !d.trim().is_empty()),
         rows: p["scroll"]["viewport_rows"].as_u64(),
     })
 }
@@ -245,6 +249,13 @@ pub fn parse_read(result: &Value) -> Result<String, String> {
 
 pub fn list_panes(h: &dyn Herdr) -> Result<Vec<Pane>, String> {
     parse_panes(&h.call("pane.list", json!({}))?)
+}
+
+/// Every tab's label by tab id. A tab sesync opened for a session carries the session's tag in its label.
+pub fn tab_labels(h: &dyn Herdr) -> Result<HashMap<String, String>, String> {
+    let result = h.call("tab.list", json!({}))?;
+    let tabs = result["tabs"].as_array().ok_or("herdr's tab list has no tabs")?;
+    Ok(tabs.iter().filter_map(|t| Some((text(t, "tab_id")?, text(t, "label").unwrap_or_default()))).collect())
 }
 
 pub fn pane_info(h: &dyn Herdr, pane_id: &str) -> Result<Pane, String> {
