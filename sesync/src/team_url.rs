@@ -29,7 +29,9 @@ pub fn check_scheme_with(base: &str, allow_http: bool) -> Result<(), String> {
     } else {
         host.split(':').next().unwrap_or("")
     };
-    let loopback = host == "localhost" || host.starts_with("127.") || host == "::1";
+    // Parse the address: a name that merely starts with "127." (127.attacker.example) is not loopback.
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if loopback || allow_http {
         return Ok(());
     }
@@ -70,6 +72,13 @@ mod tests {
     #[test]
     fn userinfo_cannot_make_a_remote_host_look_local() {
         assert!(check_scheme_with("http://127.0.0.1@10.10.20.6:30500", false).is_err());
+    }
+
+    #[test]
+    fn a_name_that_starts_with_127_is_not_loopback() {
+        assert!(check_scheme_with("http://127.attacker.example:30500", false).is_err());
+        assert!(check_scheme_with("http://127.0.0.1.attacker.example", false).is_err());
+        assert!(check_scheme_with("http://127.255.0.9:30500", false).is_ok());
     }
 
     #[test]
