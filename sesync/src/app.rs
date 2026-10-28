@@ -1261,7 +1261,7 @@ impl App {
                 short_id: id.chars().take(8).collect(),
                 from: if mine { "this machine" } else { "teammate" },
                 updated: newest.map_or_else(|| "-".to_string(), |t| crate::session_cols::relative(now, t)),
-                here: mine || here.contains(id),
+                here: here.contains(id),
             }
         }).collect()
     }
