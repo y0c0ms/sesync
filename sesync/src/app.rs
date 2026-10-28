@@ -13,6 +13,11 @@ use std::time::Instant;
 use crate::members::{Act, Members, Step};
 use crate::team_actions::{AdminDone, AdminJob, SetupDone};
 use crate::team_cli::Command;
+use crate::team_compare::Compared;
+use crate::team_watch::TeamCopy;
+
+mod team_tab;
+pub use team_tab::{Choice, PendingReplace, Resolve, RowState, Side, TeamRow};
 
 /// How long an informational status message stays before the view fades it. Failures stay.
 pub const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
@@ -93,6 +98,8 @@ pub enum Mode {
     LeavePick,
     /// The team members dialog: the roster and the approve, refuse, revoke and remove keys.
     Members,
+    /// The divergence dialog: both copies' new turns after their common history, and the five choices.
+    Resolve,
 }
 
 /// Which dialog the form serves: joining a team or starting one (admin side).
@@ -218,6 +225,8 @@ pub enum Ev {
     PreviewDown,
     /// Open the leave-a-team picker (from the command list).
     OpenLeave,
+    /// Open the divergence dialog for the selected Team row (from the command list).
+    OpenResolve,
 }
 
 /// One row of the command list as the view draws it.
@@ -251,16 +260,23 @@ pub struct App {
     /// Set when a key changed a field the app owns (a mark or a mirror choice); the
     /// caller saves state only then, not on every keypress.
     user_dirty: bool,
-    /// Team sessions from the last pull, as (id, bytes). Shown for display; written only when
-    /// the user confirms an import.
-    team: Vec<(String, Vec<u8>)>,
-    /// Every verified copy the last pull returned, by team. `team` is built from these (the
-    /// newest copy of each conversation), and leaving a team removes only that team's copies.
+    /// Every verified copy the last pull returned, by team. The Team list is built from these: one
+    /// row per conversation, from the newest copy of each. Leaving a team removes only its copies.
     team_copies: Vec<crate::team_watch::TeamCopy>,
-    /// Conversations whose shown copy this device wrote.
-    team_mine: std::collections::HashSet<String>,
-    /// Cursor into `team`, kept separate from the session cursor.
+    /// Cursor into the Team list (`team_rows`), kept separate from the session cursor.
     team_index: usize,
+    /// The newest comparison of each conversation's local and team copies (`team_compare`).
+    compared: std::collections::BTreeMap<String, Compared>,
+    /// What each conversation's comparison was last asked for: a new listing or team sequence asks again.
+    compare_asked: std::collections::BTreeMap<String, team_tab::Asked>,
+    /// Device fingerprint to member@machine, from the last roster the admin read (LATEST BY).
+    roster_names: std::collections::BTreeMap<String, String>,
+    /// The open divergence dialog, if any.
+    resolve: Option<Resolve>,
+    /// A confirmed "take theirs" waiting for the bin to save the state and replace the local copy.
+    pending_replace: Option<PendingReplace>,
+    /// Where replaced copies are archived (the daemon's `archive`), set by the caller.
+    archive_dir: Option<PathBuf>,
     /// Ids imported in this run, in order. Recorded so the result can be shown.
     imported: Vec<String>,
     /// The space currently shown, if any, and the sessions last fetched for it.
@@ -377,29 +393,6 @@ pub const TRANSCRIPT_MAX_LINES: usize = 4000;
 /// How long a team pull stays current for the Team tab: opening the tab after that pulls again.
 pub const TEAM_LIST_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// One row of the Team list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TeamRow {
-    pub title: String,
-    /// The conversation id's first 8 characters, enough to tell rows apart.
-    pub short_id: String,
-    /// "this machine" when this device wrote the copy shown, else "teammate".
-    pub from: &'static str,
-    /// How long ago the copy's newest turn happened ("5m ago"), or "-".
-    pub updated: String,
-    /// A session of this conversation is on this machine (written here, or imported).
-    pub here: bool,
-}
-
-/// A session this machine shares, as the Team tab lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedRow {
-    pub title: String,
-    pub harness: String,
-    /// Per team: on the team (pushed when), waiting for the daemon, or changed since its push.
-    pub state: String,
-}
-
 impl App {
     /// Lists the sessions and reads every title before it returns. The CLI and tests use this;
     /// the TUI uses [`App::new_deferred`].
@@ -430,10 +423,14 @@ impl App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
             defer_titles, title_wanted, title_asked: Default::default(), pending_open: None,
-            team: Vec::new(),
             team_copies: Vec::new(),
-            team_mine: Default::default(),
             team_index: 0,
+            compared: Default::default(),
+            compare_asked: Default::default(),
+            roster_names: Default::default(),
+            resolve: None,
+            pending_replace: None,
+            archive_dir: None,
             imported: Vec::new(),
             space: None,
             remote: Vec::new(),
@@ -605,13 +602,9 @@ impl App {
     /// Show these team sessions, with no team behind them (a caller that has rows only). Display
     /// only; nothing is written by this, and leaving a team does not remove these rows.
     pub fn set_team_sessions(&mut self, sessions: Vec<(String, Vec<u8>)>) {
-        self.team_copies.clear();
-        self.team_mine.clear();
-        self.show_team_rows(sessions);
-    }
-
-    fn show_team_rows(&mut self, rows: Vec<(String, Vec<u8>)>) {
-        self.team = rows;
+        self.team_copies = sessions.into_iter().map(|(conversation, text)| TeamCopy {
+            space: String::new(), conversation, seq: 1, text, mine: false, by: String::new(),
+        }).collect();
         self.clamp_team_index();
     }
 
@@ -653,12 +646,10 @@ impl App {
     /// Record what a team pull returned: every verified copy, by team (the list shows the newest
     /// copy of each conversation), and how many records the app refused.
     pub fn set_pull_result(&mut self, copies: Vec<crate::team_watch::TeamCopy>, refused: usize) {
-        let rows = crate::team_watch::newest_of(&copies);
-        self.team_mine = copies.iter().filter(|c| c.mine).map(|c| c.conversation.clone()).collect();
         self.team_copies = copies;
-        self.show_team_rows(rows);
-        let shown = self.team.len();
+        self.clamp_team_index();
         self.pulling = false;
+        let shown = self.team_rows().len();
         self.last_pull = Some((Instant::now(), shown, refused));
         self.say(if refused == 0 {
             format!("team pull: {shown} verified")
@@ -670,7 +661,7 @@ impl App {
     /// One dim line above the team list: how many rows it shows, when this run last pulled, and
     /// how many records the pull refused. So an empty list is never mistaken for an empty team.
     pub fn team_header(&self, now: Instant) -> String {
-        let mut s = format!("{} session(s)", self.team.len());
+        let mut s = format!("{} session(s)", self.team_rows().len());
         match self.last_pull {
             Some((at, _, refused)) => {
                 s.push_str(&format!(" · pulled {}s ago", now.saturating_duration_since(at).as_secs()));
@@ -757,6 +748,7 @@ impl App {
             Mode::DeleteConfirm => "ctrl+d delete · any other key cancels".to_string(),
             Mode::SharePick => "space tick · a all · n none · enter keep · esc cancel".to_string(),
             Mode::LeavePick => "up/down move · enter twice leaves · esc cancel".to_string(),
+            Mode::Resolve => "up/down scroll · tab switch side · 1-5 choose · y confirm · esc decide later".to_string(),
             Mode::Browse => match self.view {
                 View::Sessions => {
                     let view_key = match self.filter_scope {
@@ -769,7 +761,7 @@ impl App {
                     }
                     f
                 }
-                View::Team => "enter import · ctrl+r pull · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
+                View::Team => "i import · enter resolve · ctrl+r pull · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
             },
         }
     }
@@ -1201,11 +1193,9 @@ impl App {
                     // Only rows this team's pulls brought over leave the list; a conversation
                     // another team holds too stays, as that team's copy.
                     if self.team_copies.iter().any(|c| c.space == req.team) {
-                        let before = self.team.len();
+                        let before = self.team_rows().len();
                         self.team_copies.retain(|c| c.space != req.team);
-                        let rows = crate::team_watch::newest_of(&self.team_copies);
-                        self.show_team_rows(rows);
-                        let gone = before - self.team.len();
+                        let gone = before.saturating_sub(self.team_rows().len());
                         if gone > 0 {
                             msg.push_str(&format!("; {gone} of its session(s) left the Team list"));
                         }
@@ -1247,60 +1237,14 @@ impl App {
         self.team_configured = yes;
     }
 
-    /// The team list: one row per pulled conversation, newest copy of each.
-    pub fn team_rows(&self) -> Vec<TeamRow> {
-        let now = unix_now();
-        let here: std::collections::HashSet<String> = self.groups.iter().map(|g| self.state.team_id_of(&g.key)).collect();
-        self.team.iter().map(|(id, bytes)| {
-            let text = String::from_utf8_lossy(bytes);
-            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            let (title, found) = crate::harness::journal::omp_title_from_lines(&lines);
-            let title = if found && !title.trim().is_empty() { title } else { "untitled".to_string() };
-            // The newest turn's time: records are appended in order, so the last stamped line.
-            let newest = lines.iter().rev()
-                .filter(|l| l.contains("\"timestamp\""))
-                .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()
-                    .and_then(|v| v["timestamp"].as_str().and_then(crate::prompts::parse_rfc3339)));
-            let mine = self.team_mine.contains(id);
-            TeamRow {
-                title,
-                short_id: id.chars().take(8).collect(),
-                from: if mine { "this machine" } else { "teammate" },
-                updated: newest.map_or_else(|| "-".to_string(), |t| crate::session_cols::relative(now, t)),
-                here: mine || here.contains(id),
-            }
-        }).collect()
-    }
-
-    /// The sessions this machine shares, with where each one is: pushed, waiting for the daemon, or
-    /// changed since its last push. Newest first, as the session list.
-    pub fn shared_from_here(&self) -> Vec<SharedRow> {
-        let now = unix_now();
-        self.groups.iter().filter_map(|g| {
-            let id = self.state.team_id_of(&g.key);
-            let teams = self.state.shares_of(&id);
-            if teams.is_empty() {
-                return None;
-            }
-            let changed = self.state.sources.get(&g.key).map_or(0.0, |s| s.last_seen_change);
-            let state = teams.iter().map(|space| {
-                match self.state.team_pushed_at(space, &id).filter(|t| *t > 0.0) {
-                    None => format!("{space}: waiting for the daemon to push it"),
-                    Some(at) if changed > at => format!("{space}: changed since its push {}; pushed again once quiet", crate::session_cols::relative(now, at)),
-                    Some(at) => format!("{space}: on the team, pushed {}", crate::session_cols::relative(now, at)),
-                }
-            }).collect::<Vec<_>>().join(" · ");
-            Some(SharedRow { title: g.title.clone(), harness: g.fmt.clone(), state })
-        }).collect()
-    }
-
     /// What the command list needs to know about the current state.
     fn palette_ctx(&self) -> palette::Ctx {
         palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
             session_shared: self.is_selected_marked(),
-            team_selected: self.team.get(self.team_index).is_some(),
+            team_selected: self.team_selected().is_some(),
+            resolve: self.resolve_ready(),
             team_configured: self.team_configured,
             team_to_manage: !self.manageable_teams().is_empty(),
             teams_here: !self.team_cards.is_empty() || !self.admin_teams.is_empty(),
@@ -1337,7 +1281,7 @@ impl App {
     }
 
     fn clamp_team_index(&mut self) {
-        self.team_index = self.team_index.min(self.team.len().saturating_sub(1));
+        self.team_index = self.team_index.min(self.team_rows().len().saturating_sub(1));
     }
 
     /// Move the cursor by `delta` rows, clamped to the list. The caller has already cancelled any
@@ -1350,7 +1294,7 @@ impl App {
 
     /// Move the team cursor by `delta`, clamped to the team list.
     fn move_team(&mut self, delta: isize) {
-        let last = self.team.len().saturating_sub(1) as isize;
+        let last = self.team_rows().len().saturating_sub(1) as isize;
         let next = (self.team_index as isize).saturating_add(delta).clamp(0, last);
         self.team_index = next as usize;
     }
@@ -1472,7 +1416,7 @@ impl App {
         }
         // ctrl+t opens the colour scheme picker from anywhere except the questions and dialogs
         // that own the screen; inside them it stays out of the way.
-        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members) {
+        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members | Mode::Resolve) {
             self.disarm(now);
             self.open_theme();
             return;
@@ -1503,6 +1447,7 @@ impl App {
             Mode::DeleteConfirm => self.handle_delete_confirm(ev),
             Mode::SharePick => self.handle_share_pick(ev),
             Mode::LeavePick => self.handle_leave_pick(ev),
+            Mode::Resolve => self.handle_resolve(ev),
             Mode::Browse => self.handle_browse(ev, now),
         }
     }
@@ -1537,6 +1482,7 @@ impl App {
             Ev::OpenInvite => self.open_invite(),
             Ev::OpenMembers => self.open_members(),
             Ev::OpenLeave => self.open_leave(),
+            Ev::OpenResolve => self.open_resolve(),
             Ev::CtrlD => {
                 if self.view != View::Sessions {
                     self.say("delete works on local sessions only; press tab");
@@ -1568,6 +1514,7 @@ impl App {
             // Enter on a local session opens its options; ctrl+p always opens the command list.
             // Tab switches the pane.
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
+            Ev::Enter if self.view == View::Team => self.enter_team(),
             Ev::Enter | Ev::CtrlP => self.open_palette(),
             Ev::Tab => self.switch_view(),
             Ev::Char('i') => match self.view {
@@ -1811,7 +1758,8 @@ impl App {
                 ("q / esc", "quit (esc clears a kept filter first)"),
             ],
             View::Team => vec![
-                ("i", "import the selected team session into this harness"),
+                ("enter", "resolve the selected behind or diverged conversation: keep mine, take theirs, or fork"),
+                ("i", "import the team copy of a conversation this machine does not hold"),
                 ("ctrl+r", "pull the team's verified sessions from the server"),
                 ("tab", "back to the local sessions"),
                 ("ctrl+p", "open the command list"),
@@ -1863,18 +1811,6 @@ impl App {
     /// Whether the taste changed since the caller last persisted it, and clear that flag.
     pub fn take_prefs_dirty(&mut self) -> bool {
         std::mem::replace(&mut self.prefs_dirty, false)
-    }
-
-    /// Ask before writing a team session into the harness. The question is about the row on
-    /// screen right now; only that exact one survives a later refresh.
-    fn ask_import(&mut self) {
-        let Some(sel) = self.team.get(self.team_index).cloned() else {
-            self.say("no team session selected");
-            return;
-        };
-        self.say(format!("import team session {} into your harness? y/n", sel.0));
-        self.pending_import = Some(sel);
-        self.mode = Mode::Confirm;
     }
 
     // ----- the command list ---------------------------------------------------------------
@@ -2473,6 +2409,7 @@ impl App {
         self.admin_busy = false;
         match result {
             Ok(AdminDone::Roster(view)) => {
+                self.remember_roster(&view);
                 if let Some(m) = self.members.as_mut() {
                     m.set_roster(&view);
                 }
@@ -2594,50 +2531,6 @@ impl App {
                 self.mode = Mode::Browse;
                 self.say("import cancelled");
             }
-        }
-    }
-
-    /// Write a confirmed team session, as it is (a canonical journal), into the first harness
-    /// whose own files are journals, filed the way that harness files its own: in the folder it
-    /// lists for the project directory the session's header records (the home when there is
-    /// none), under the start-time name its listing reads. A session that harness already holds
-    /// is left alone.
-    fn import_team_session(&mut self, id: &str, bytes: &[u8]) {
-        use crate::harness::journal;
-        let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
-            self.fail("not imported: no harness keeps canonical journals");
-            return;
-        };
-        let loc = self.roots.locations.of(h.id());
-        let head = journal::session_head(bytes);
-        let home = self.roots.home.display().to_string();
-        let cwd = head.cwd.clone().unwrap_or_else(|| home.clone());
-        let Some(folder) = h.folder_for_cwd(loc, &home, &cwd) else {
-            self.fail(format!("not imported: {} has no project folder to file it in", h.id()));
-            return;
-        };
-        // The harness lists only `<timestamp>_<uuid>.jsonl`. A header without a usable start time
-        // takes the import's; an id that cannot be written in that form is refused, so no file
-        // is written that nothing shows.
-        let mut name = journal::journal_filename(head.timestamp.as_deref().unwrap_or_default(), id);
-        if !journal::is_listed_session_name(&name) {
-            name = journal::journal_filename(&journal::now_iso_ms(), id);
-        }
-        if !journal::is_listed_session_name(&name) {
-            self.say(format!("not imported: team session id {id} is not a harness session id"));
-            return;
-        }
-        if h.sessions(loc).iter().any(|p| h.id_in(&p.display().to_string()).as_deref() == Some(id)) {
-            self.fail(format!("not imported: {} already holds session {id}", h.id()));
-            return;
-        }
-        match crate::team_import::import_confirmed(&folder.join(name), bytes, true) {
-            Ok(_) => {
-                self.imported.push(id.to_string());
-                self.say(format!("imported team session {id} into {}", h.id()));
-                self.refresh_rows();
-            }
-            Err(e) => self.fail(format!("not imported: {e:?}")),
         }
     }
 

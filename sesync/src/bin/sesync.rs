@@ -1193,6 +1193,10 @@ fn run_tui(
     // list never waits on a large transcript or a conversion.
     let preview = sesync::preview::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
     tr("preview worker started", &mut trace);
+    // The Team list compares this machine's copy with the team's on a worker: a Claude transcript is
+    // converted to be read, and the list never waits on that (invariant 22).
+    let compare = sesync::team_compare::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
+    tr("compare worker started", &mut trace);
     // The Team tab and "Refresh team" exist before the first pull; without configuration they
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
@@ -1205,6 +1209,8 @@ fn run_tui(
         sesync::manage::TitleCache::load(&titles_file));
     tr("app built", &mut trace);
     app.migrate_legacy_team_state(&teams);
+    // "Take theirs" keeps the replaced copy in the daemon's archive, the same folder.
+    app.set_archive_dir(state_file.with_file_name("archive"));
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
     app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
@@ -1236,6 +1242,11 @@ fn run_tui(
     let mut jobs = TeamJobs::default();
     loop {
         jobs.tick(&mut app, &config_dir);
+        // The Team list's comparisons go to their worker; its answers are applied between frames.
+        for job in app.take_compare_jobs() {
+            compare.request(job);
+        }
+        app.apply_compared(compare.take());
         // A pull that finished while the terminal sat idle is applied now, not at the next key.
         collect_pull(&mut app, &mut pending_pull, &config_dir);
         // A pull asked for without a key (start, opening the Team tab, a push the daemon just made)
@@ -1347,6 +1358,8 @@ fn run_tui(
             }
             seen_state = stamp;
         }
+        // A confirmed "take theirs" saves its replacement mark first, then replaces the local copy.
+        app.run_pending_replace(&state_file);
         if app.take_user_dirty() {
             if let Err(e) = app.save_user(&state_file) {
                 eprintln!("sesync: cannot save state: {e}");

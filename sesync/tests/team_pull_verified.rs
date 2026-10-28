@@ -92,7 +92,8 @@ fn a_verified_record_is_returned_for_display() {
     let src = Fake { records: vec![("ses_1".into(), rec)] };
     let out = pull_verified(&src, &reader, Some(&t), &no_floor());
     assert_eq!(out.shown.len(), 1);
-    assert_eq!(out.shown[0], PulledRecord { conversation: "ses_1".into(), text: b"the text".to_vec(), mine: false });
+    let by = sesync_team::membership::fingerprint(&device_entry(&team_device(&writer)));
+    assert_eq!(out.shown[0], PulledRecord { conversation: "ses_1".into(), text: b"the text".to_vec(), mine: false, by });
     assert_eq!(out.dropped, 0);
     assert_eq!(out.rolled_back, 0);
     assert_eq!(out.accepted.get("ses_1"), Some(&1), "the accepted sequence is reported");
@@ -256,7 +257,8 @@ fn a_conversation_with_no_floor_is_still_fetched_even_when_others_are_skipped() 
     let out = pull_verified(&src, &reader, Some(&t), &floors);
     assert_eq!(out.unchanged, 1, "ses_a has a floor at its advertised sequence: skipped");
     assert_eq!(src.fetches.get(), 1, "only ses_b, which has no floor, was fetched");
-    assert_eq!(out.shown, vec![PulledRecord { conversation: "ses_b".into(), text: b"b".to_vec(), mine: false }]);
+    let by = sesync_team::membership::fingerprint(&device_entry(&team_device(&writer)));
+    assert_eq!(out.shown, vec![PulledRecord { conversation: "ses_b".into(), text: b"b".to_vec(), mine: false, by }]);
     for d in [&w, &r] { let _ = std::fs::remove_dir_all(d); }
 }
 

@@ -3,14 +3,34 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: team turns, phase 3 (branch team-turns): one Team list, five divergence choices, take theirs guarded
+
+- **Why.** The Team tab listed what this machine shares and what the team holds in two sections, with
+  file times and bytes deciding what was "changed". A conflict had no decision the user could take
+  without losing a copy.
+- **What changed.** One list (`app/team_tab.rs`): state from completed turns (`team_compare` worker),
+  markers `= ↑ ↓ ≠ •`, columns for harness, project folder and LATEST BY. Enter on a `≠` or held `↓`
+  row opens the divergence dialog (side by side when wide, stacked when narrow) with five choices; every
+  choice but "decide later" keeps both histories (the continued side keeps its id, the other is an omp
+  fork, optionally shared as its own conversation). Take theirs records `State::superseded` before it
+  replaces the file, so a turn-taking Claude mirror of the old copy is never promoted back. The palette
+  has "Resolve this conversation"; the Team footer names `i import`.
+- **Decisions to confirm.** The five option texts are this session's reading of the brief; check them.
+  Forks install into omp (the first native journal harness). LATEST BY shows member@machine only after
+  this run's roster read. Take theirs needs a file-backed omp or Pi journal.
+- **Tests.** `tests/team_tab.rs` (states, markers, LATEST BY, footer, palette), `tests/team_divergence.rs`
+  (five choices, mirror guard), `tests/team_render.rs` (TestBackend list and dialog, wide and narrow),
+  `tests/team_compare.rs` (worker).
+
 ## 2026-10-28: release line `sesync-release` (from team-turns 2e4b4e6): herdr, phone bridge, agenthub links
 
 - **Why.** One build for the phone trial and the Team tab: team turns, the herdr line (`sesync-herdr`)
-  and the phone bridge line (`sesync-bridge`) on one branch. Phase 3 of team turns is not included.
+  and the phone bridge line (`sesync-bridge`) on one branch. Phase 3 of team turns was cherry-picked on
+  top afterwards (entry above).
 - **Now.** The herdr line's 16 commits (its loopback fix is already in the base) and the bridge line's
   12 bridge-only commits, in order. Conflicts: `herdr_open.rs` takes the herdr line's version
   (`find_open_pane(panes, ident, tag)`), with `argv_carries` kept for the bridge; bridge tab labels pass
-  an empty tag. Invariant numbers: team turns keeps 27, context fit is 28.
+  an empty tag. Invariant numbers: team turns keeps 27, context fit is 28, the divergence guard is 29.
 - **Pairing.** `sesync bridge pair` prints and encodes `agenthub://pair?code=` (the QR carries it). The
   phone registers `agenthub` and reads `orca://` offers printed before this change.
 - **Suites** (sandboxed `build-test.sh`): lock 22, sesync 978 (1 ignored), sesync-conv 109,

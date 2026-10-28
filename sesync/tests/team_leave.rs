@@ -68,6 +68,7 @@ fn copy(space: &str, conversation: &str, seq: u64, title: &str) -> TeamCopy {
         seq,
         text: format!("{{\"type\":\"session\",\"id\":\"{conversation}\",\"title\":\"{title}\"}}\n").into_bytes(),
         mine: false,
+        by: String::new(),
     }
 }
 

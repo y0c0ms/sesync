@@ -21,6 +21,7 @@ pub enum Action {
     Invite,
     Members,
     Leave,
+    Resolve,
 }
 
 struct Def {
@@ -46,6 +47,7 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::Members, title: "Team members", key: "", event: Ev::OpenMembers },
     Def { action: Action::Invite, title: "Invite a member", key: "", event: Ev::OpenInvite },
     Def { action: Action::Leave, title: "Leave a team", key: "", event: Ev::OpenLeave },
+    Def { action: Action::Resolve, title: "Resolve this conversation", key: "enter", event: Ev::OpenResolve },
 ];
 
 /// What a command can see when deciding whether it may run.
@@ -65,6 +67,8 @@ pub struct Ctx {
     pub teams_here: bool,
     /// Whether this machine holds the team's admin key.
     pub admin: bool,
+    /// Whether the selected Team row can be resolved now (behind or diverged, held here), or why not.
+    pub resolve: Result<(), &'static str>,
 }
 
 /// Ok, or the reason the action cannot run right now, shown beside it in the list.
@@ -105,6 +109,7 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
             Ok(())
         },
         Action::Leave => if ctx.teams_here { Ok(()) } else { Err("no team on this machine") },
+        Action::Resolve => ctx.resolve,
         Action::SwitchView | Action::Quit | Action::Theme | Action::Enroll | Action::Register => Ok(()),
     }
 }

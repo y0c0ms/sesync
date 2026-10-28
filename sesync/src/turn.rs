@@ -166,6 +166,13 @@ pub fn promote_changed(state: &mut State, store_rows: &StoreRows, prompt_of: Pro
             eprintln!("turn: answered in {} of {} ({}) at {:.3}", e.path, e.source_key, e.target, e.mtime);
         }
     }
+    // An answer typed at or before "Take theirs" replaced this conversation's local copy was typed in
+    // the copy the user chose to replace. It is superseded: it is never promoted back over the team's
+    // copy that replaced it. Answers typed after the replacement are still turns.
+    edits.retain(|e| {
+        let conv = state.team_id_of(&e.source_key);
+        !state.superseded_at(&conv).is_some_and(|at| e.mtime <= at)
+    });
     // The newest answer wins; an exact tie breaks by harness name, so the outcome is stable.
     edits.sort_by(|a, b| b.mtime.total_cmp(&a.mtime).then_with(|| a.target.cmp(&b.target)));
     let mut turned: BTreeSet<String> = BTreeSet::new();

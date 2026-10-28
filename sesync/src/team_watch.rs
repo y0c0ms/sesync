@@ -39,6 +39,8 @@ pub struct TeamCopy {
     pub text: Vec<u8>,
     /// Written by this device (see `team_pull_verified::PulledRecord::mine`).
     pub mine: bool,
+    /// The device that wrote it, as the verified list's fingerprint (`PulledRecord::by`); empty when unnamed.
+    pub by: String,
 }
 
 /// One entry per conversation from verified copies: the highest sequence wins, so the newest copy
@@ -111,6 +113,7 @@ impl TeamWatch {
             seq: p.out.accepted.get(&r.conversation).copied().unwrap_or(0),
             text: r.text.clone(),
             mine: r.mine,
+            by: r.by.clone(),
         })).collect()
     }
 

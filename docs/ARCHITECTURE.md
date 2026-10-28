@@ -868,15 +868,36 @@ flowchart TD
    line and on the team's card, and the pull never reads as an empty team. "Leave a team"
    (`team_actions::leave`) removes the credential, which is the only way out of a declined join:
    the server answers a declined key as it answers a pending one.
-8. The TUI's Team tab has two parts. "Shared from this machine" lists the sessions shared here,
-   per team: waiting for the daemon (never pushed), on the team (pushed when), or changed since
-   its push. "On the team" lists the pulled copies: title and short id, who wrote the copy shown
-   ("this machine" when the record's signature is this device's key, `PulledRecord::mine`, else
-   "teammate"; member names stay admin-only), when its newest turn happened, and whether the
-   conversation is already a session here. The TUI pulls without a ctrl+r: at start, on opening
-   the tab when its last pull is over 30 s old (`TEAM_LIST_FRESH`), and when the daemon's state
-   shows a push newer than any it had (`App::absorb_daemon_state`). The daemon runs its team step
-   on the next tick, not after the backed-off interval, when the set of shared sessions changes.
+8. The TUI's Team tab is one list: one row per conversation this machine shares or the team holds
+   (`app/team_tab.rs`). Each row's state comes from the completed turns the comparison read
+   (`team_compare`, a worker; the TUI never reads a conversation itself), and is drawn as one marker:
+   `=` in step, `↑` waiting to push (this machine has completed turns the team lacks), `↓` behind (the
+   team has more) or not here (the team holds it and this machine does not), `≠` diverged (neither copy
+   is a prefix), `•` shared by this machine with nothing to send yet, or still being compared. A `•`
+   before the marker means this machine shares it. Columns: title, state, harness, project folder, LATEST
+   BY (`this machine`; a teammate's device fingerprint from the verified list; `member@machine` for the
+   admin when a roster read this run maps it), and UPDATED. The title takes the remaining width and
+   carries the short id only when two titles are equal. The TUI pulls without a ctrl+r: at start, on
+   opening the tab when its last pull is over 30 s old (`TEAM_LIST_FRESH`), and when the daemon's state
+   shows a push newer than any it had (`App::absorb_daemon_state`).
+9. Enter on a `≠` or `↓` (held here) row opens the divergence dialog: both copies' new turns after
+   their common history, side by side when wide and stacked when narrow. Five choices. Every choice but
+   "decide later" keeps both histories: the continued side keeps the conversation id, and the other side
+   is a fork, a new omp session (forks install into omp, the first native journal harness).
+   - Take theirs, keep mine here: the team copy replaces the session (the old copy is archived and read
+     back first; `State::superseded` is written before the file changes); this machine's version is a
+     fork titled "<title> (mine, forked)", not shared.
+   - Take theirs, keep mine on team: as above, and that fork is shared with the team as its own conversation.
+   - Keep mine, keep theirs here: this machine's copy is pushed over the team copy (`State::team_force`,
+     for the exact turns and team record reviewed); the team's version is a fork titled
+     "<title> (<who>, forked)", not shared.
+   - Keep mine, keep theirs on team: as above, and the team's fork is shared with the team as its own conversation.
+   - Decide later (or esc): nothing moves; pushes stay paused until the turns change.
+   Take theirs needs a file-backed omp or Pi journal as the local copy. The bin runs the replacement after
+   the key, with the state saved first and under the conversation's claim (`App::run_pending_replace`).
+   A turn-taking mirror of the replaced copy cannot undo it: a copy's answer typed at or before the
+   replacement is superseded and dropped by `turn::promote_changed`; answers after it still count.
+10. Pulls the TUI makes on its own and the daemon's push are unchanged.
 
 ```mermaid
 sequenceDiagram
@@ -1003,6 +1024,7 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 | `team` | per session: `{hash, pushed_at, list, turns}`. `hash`: the canonical bytes at the last push, or at the last check that found the turns unchanged (used only to skip re-parsing). `pushed_at`: the last successful push. `list`: the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once). `turns`: the turn fingerprint the team copy agreed with at the last push or check (`turns::fingerprint`); empty in older files, which migrate on their first pass without a push (see "Push path" step 4) |
 | `team_conflict` | daemon-written, per (space, conversation): `{local, at, kind, count, local_new, team_new, why}`. Present while a push is held back: `kind` is `behind`, `diverged` or `unverified`; `local` is the turn fingerprint when it was found, and pushes stay paused while the local turns still equal it. Cleared by a push or by a check that finds the copies identical; once the local turns change, the next guard run replaces or clears it |
 | `team_force` | user-owned, written by the TUI's "keep mine": per (space, conversation): `{local, team_seq}`. It applies only to that local fingerprint and that team sequence (`push_due`, step 6), so it goes inert once either moves. Merged like the shares: a save adds this process's new requests, and the daemon reads the file |
+| `superseded` | user-owned, written by the TUI's "take theirs": per conversation id: the time the local copy was replaced. A copy's answer typed at or before that time is dropped by `turn::promote_changed`, so a turn-taking mirror of the replaced copy never promotes back over the team's copy. Merged by the latest time and never removed, like `deleted` |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
 
 A missing state file is empty state; a corrupt one is an error (silently dropping it would

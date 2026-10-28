@@ -53,6 +53,7 @@ pub mod sealed;
 pub mod team_actions;
 pub mod team_backoff;
 pub mod team_cli;
+pub mod team_compare;
 pub mod team_conflict;
 pub mod team_import;
 pub mod team_join;

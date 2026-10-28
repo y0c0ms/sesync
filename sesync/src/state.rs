@@ -201,6 +201,11 @@ pub struct State {
     /// forget each such session whose file is gone (`forget_deleted`), so it is not listed as
     /// missing ever after. Kept for a day, which any running daemon outlasts.
     pub deleted: BTreeMap<String, f64>,
+    /// Conversations whose local copy "Take theirs" replaced, by conversation id, with when. A
+    /// turn-taking answer typed in a copy at or before that time was the copy the user chose to
+    /// replace, so it is never promoted back over the team's copy. User-owned, merged by the latest
+    /// time (never removed), like `deleted`.
+    pub superseded: BTreeMap<String, f64>,
     /// Per (space, conversation) team push record: what was last sent and when. A conversation
     /// shared into two teams keeps one record per team.
     pub team: std::collections::BTreeMap<String, TeamPush>,
@@ -360,6 +365,18 @@ impl State {
         let f = TeamForce { local: local.to_string(), team_seq };
         self.team_force.insert(key.clone(), f.clone());
         self.team_force_asked.insert(key, f);
+    }
+
+    /// Record that "Take theirs" replaced this conversation's local copy at `at` (seconds since the
+    /// epoch). Only ever raised: an earlier replacement never moves back.
+    pub fn supersede(&mut self, conversation: &str, at: f64) {
+        let e = self.superseded.entry(conversation.to_string()).or_insert(at);
+        *e = e.max(at);
+    }
+
+    /// When "Take theirs" last replaced this conversation's local copy, if it ever did.
+    pub fn superseded_at(&self, conversation: &str) -> Option<f64> {
+        self.superseded.get(conversation).copied()
     }
 
     /// When the last successful push for this team happened, if any.
@@ -703,6 +720,14 @@ impl State {
                 }
             }
         }
+        // Conversations Take theirs replaced; a state file written before it has none.
+        if let Some(superseded) = raw.get("superseded").and_then(Value::as_object) {
+            for (conv, at) in superseded {
+                if let Some(at) = at.as_f64() {
+                    st.superseded.insert(conv.clone(), at);
+                }
+            }
+        }
         st.seen_keys = st.sources.keys().cloned().collect();
         st.user_base = st.user_choices();
         Ok(st)
@@ -731,6 +756,10 @@ impl State {
         self.shares = disk.shares.clone();
         // The user's deletes are theirs too; the caller forgets them (`forget_deleted`).
         self.deleted = disk.deleted.clone();
+        for (conv, at) in &disk.superseded {
+            let e = self.superseded.entry(conv.clone()).or_insert(*at);
+            *e = e.max(*at);
+        }
         // Forced-push requests are the user's too; one this process made and has not saved yet stays.
         self.team_force = disk.team_force.clone();
         for (key, f) in &self.team_force_asked {
@@ -792,6 +821,10 @@ impl State {
             let e = self.deleted.entry(key.clone()).or_insert(*at);
             *e = e.max(*at);
         }
+        for (conv, at) in &disk.superseded {
+            let e = self.superseded.entry(conv.clone()).or_insert(*at);
+            *e = e.max(*at);
+        }
         self.user_base = base;
     }
 
@@ -812,6 +845,10 @@ impl State {
         }
         for (key, at) in &self.deleted {
             let e = disk.deleted.entry(key.clone()).or_insert(*at);
+            *e = e.max(*at);
+        }
+        for (conv, at) in &self.superseded {
+            let e = disk.superseded.entry(conv.clone()).or_insert(*at);
             *e = e.max(*at);
         }
         let none = BTreeSet::new();
@@ -842,6 +879,7 @@ impl State {
         // This process now holds what the file holds for the user's fields.
         self.shares = disk.shares.clone();
         self.deleted = disk.deleted.clone();
+        self.superseded = disk.superseded.clone();
         self.team_force = disk.team_force.clone();
         for (key, s) in self.sources.iter_mut() {
             if let Some(d) = disk.sources.get(key) {
@@ -874,6 +912,7 @@ impl State {
             "subagents": self.subagents,
             "shares": self.shares.iter().map(|(c, spaces)| (c.clone(), serde_json::json!(spaces.iter().collect::<Vec<_>>()))).collect::<serde_json::Map<_, _>>(),
             "deleted": self.deleted,
+            "superseded": self.superseded,
             "team": self.team.iter().map(|(k, v)| (k.clone(), serde_json::json!({"hash": v.hash, "pushed_at": v.pushed_at, "list": v.list, "turns": v.turns}))).collect::<serde_json::Map<_, _>>(),
             "team_seen": self.team_seen.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
             "team_conflict": self.team_conflict.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
