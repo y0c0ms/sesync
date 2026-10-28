@@ -3,6 +3,19 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-28: release line `sesync-release` (from team-turns 2e4b4e6): herdr, phone bridge, agenthub links
+
+- **Why.** One build for the phone trial and the Team tab: team turns, the herdr line (`sesync-herdr`)
+  and the phone bridge line (`sesync-bridge`) on one branch. Phase 3 of team turns is not included.
+- **Now.** The herdr line's 16 commits (its loopback fix is already in the base) and the bridge line's
+  12 bridge-only commits, in order. Conflicts: `herdr_open.rs` takes the herdr line's version
+  (`find_open_pane(panes, ident, tag)`), with `argv_carries` kept for the bridge; bridge tab labels pass
+  an empty tag. Invariant numbers: team turns keeps 27, context fit is 28.
+- **Pairing.** `sesync bridge pair` prints and encodes `agenthub://pair?code=` (the QR carries it). The
+  phone registers `agenthub` and reads `orca://` offers printed before this change.
+- **Suites** (sandboxed `build-test.sh`): lock 22, sesync 978 (1 ignored), sesync-conv 109,
+  sesync-team 199; 0 failed.
+
 ## 2026-10-28: team turns, phase 2 (branch team-turns): pushes judge turns and never write over a newer copy
 
 - **Why.** A push was due when the canonical bytes changed, and nothing read the team's copy first:
