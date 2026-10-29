@@ -164,18 +164,24 @@ fn same_dir(a: &str, b: &str) -> bool {
 }
 
 /// The conversation title a pane's terminal title shows, normalised as tab labels are (`display_safe`),
-/// for the agents that title their terminal with it. omp writes `π`, then a spinner or `>`, then the title;
-/// Claude Code writes a glyph (`✳`, or a spinner while it works), then the title; OpenCode writes `OC | `
-/// then the title. None for any other agent, or a title that does not have that shape.
+/// for the agents that title their terminal with it. omp writes `π`, one status glyph (`>` idle, a spinner while
+/// it works, `!` while a question or approval waits on the user), a space, then the title; Claude Code writes a
+/// glyph (`✳`, or a spinner while it works), then the title; OpenCode writes `OC | ` then the title. None for any
+/// other agent, or a title that does not have that shape.
+///
+/// The omp glyph is any one non-alphanumeric character: matching only `>` and spinners lost the pane while omp
+/// waited on a question (`π ! Main agent`), the phone showed the conversation as not running, and its Resume
+/// started a second omp on the same session (2026-10-29).
 pub fn pane_title_name(agent: &str, title: &str) -> Option<String> {
     let rest = match agent {
         "omp" => {
             let rest = title.strip_prefix('π')?.trim_start();
             let first = rest.chars().next()?;
-            if first != '>' && !is_spinner(first) {
+            let after = &rest[first.len_utf8()..];
+            if first.is_alphanumeric() || !after.starts_with(char::is_whitespace) {
                 return None;
             }
-            &rest[first.len_utf8()..]
+            after
         }
         "claude" => title.trim_start_matches(|c: char| c.is_whitespace() || is_claude_glyph(c)),
         "opencode" => title.strip_prefix("OC | ")?,
@@ -576,6 +582,25 @@ mod tests {
     fn a_picker_started_omp_pane_runs_the_conversation_its_title_and_directory_name() {
         let main = conv("omp", "Main agent", "uuid-1", "/home/u/SkillsOutlie");
         let mut panes = vec![titled("w3:p1", "term_p1", "omp", "π ⠴ Main agent", "/home/u/SkillsOutlie", &["omp", "--resume"])];
+        assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
+        assert_eq!(ids(&panes_of(&panes, &main)), ["term_p1"]);
+    }
+
+    #[test]
+    fn an_omp_pane_keeps_its_conversation_whatever_status_glyph_its_title_shows() {
+        for glyph in [">", "⠴", "!", "?", "✓"] {
+            assert_eq!(pane_title_name("omp", &format!("π {glyph} Main agent")).as_deref(), Some("Main agent"), "{glyph}");
+        }
+        // Not omp's shape: no glyph, or a glyph glued to the title.
+        assert_eq!(pane_title_name("omp", "π Main agent"), None);
+        assert_eq!(pane_title_name("omp", "π !Main agent"), None);
+        assert_eq!(pane_title_name("omp", "Main agent"), None);
+    }
+
+    #[test]
+    fn an_omp_pane_waiting_on_a_question_still_runs_its_conversation() {
+        let main = conv("omp", "Main agent", "uuid-1", "/home/u/SkillsOutlie");
+        let mut panes = vec![titled("w2:p1", "term_p1", "omp", "π ! Main agent", "/home/u/SkillsOutlie", &["omp", "--resume"])];
         assign_fallbacks(&mut panes, std::slice::from_ref(&main), &HashMap::new());
         assert_eq!(ids(&panes_of(&panes, &main)), ["term_p1"]);
     }
