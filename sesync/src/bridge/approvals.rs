@@ -7,7 +7,7 @@
 //! Every function is pure over screen text, so the tests run on captures from real harnesses
 //! (`tests/fixtures/approvals/`). Verified keys (herdr 0.9.1, omp 18.8.6, OpenCode 1.19.4):
 //! * omp approval (`Approve` / `Deny`, arrow-driven): Enter approves, Escape denies. `1` does nothing.
-//! * omp ask (`○` choices): Enter selects the highlighted choice. Digits do nothing.
+//! * omp ask (`○` / `☐` choices): Up/Down move, Enter selects, Space toggles in multi-select. Digits do nothing.
 //! * OpenCode permission (`Allow once` / `Allow always` / `Reject`): Enter approves, Escape rejects.
 //! * OpenCode question (numbered choices): a digit selects that choice at once.
 //! Claude Code is UNVERIFIED: no capture exists, because fake-model does not speak the Anthropic API.
@@ -43,7 +43,7 @@ struct Choice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Prompt {
     Approval { tool: String, summary: String },
-    Question { tool: String, question: String, options: Vec<Choice> },
+    Question { tool: String, question: String, multi: bool, options: Vec<Choice> },
 }
 
 /// The JSON a status row's `agentStatus.interactivePrompt` carries for the prompt `agent` is waiting on:
@@ -184,27 +184,63 @@ fn omp_approval(lines: &[&str]) -> Option<Prompt> {
 }
 
 const OMP_ASK_TOP: &str = "╭─ Ask ";
-const OMP_ASK_FOOTER: &str = "⏎ select";
+const OMP_ASK_FOOTER: &str = "⏎";
+const OMP_ASK_REVIEW: &str = "Review answers";
 const OMP_ASK_OTHER: &str = "Other (type your own)";
+const OMP_ASK_RECOMMENDED: &str = " (Recommended)";
+/// Rows of the box's key hints (`⏎ select`, `␣ toggle`, `↑/↓ move`, `⎋ cancel`): never choices or descriptions.
+const OMP_ASK_HINTS: [&str; 4] = ["⏎", "␣", "↑/↓", "⎋"];
 
-/// omp's live question box: `╭─ Ask `, the question, `○` choices, and the `⏎ select` footer. The
-/// transcript's earlier `╭─── Ask 1 questions` box has no such footer and a different top edge.
+/// omp's live question box: `╭─ Ask `, the question, its `○` (single) or `☐` (multi) choices with an optional
+/// description row under each, and the `⏎` footer. The question is the row above the first `├` separator; on a
+/// tabbed box the tab row sits above it and is never read. The Submit tab (`Review answers`) has no question.
+/// The transcript's earlier `╭─── Ask 1 questions` box has a different top edge.
 fn omp_ask(lines: &[&str]) -> Option<Prompt> {
     let top = lines.iter().rposition(|line| line.trim_start().starts_with(OMP_ASK_TOP))?;
     let rows = box_rows(&lines[top + 1..])?;
     if !rows.iter().any(|row| row.contains(OMP_ASK_FOOTER)) {
         return None;
     }
-    let question = rows.iter().find(|row| !row.is_empty() && !row.starts_with('├'))?.clone();
-    let mut options = Vec::new();
-    for row in &rows {
+    let rule = rows.iter().position(|row| row.starts_with('├'))?;
+    let question = rows[..rule].last().filter(|row| !row.is_empty())?.clone();
+    if question == OMP_ASK_REVIEW {
+        return None;
+    }
+    let mut multi = false;
+    let mut options: Vec<Choice> = Vec::new();
+    // Whether the row just read is an option, so that a plain row after it is that option's description.
+    let mut open = false;
+    for row in &rows[rule + 1..] {
+        if row.is_empty() || row.starts_with('├') || OMP_ASK_HINTS.iter().any(|hint| row.contains(*hint)) {
+            open = false;
+            continue;
+        }
         let text = row.trim_start_matches(|c: char| c == '❯' || c.is_whitespace());
-        let label = text.strip_prefix("○ ").or_else(|| text.strip_prefix("◉ ")).map(str::trim);
-        if let Some(label) = label.filter(|label| !label.is_empty() && *label != OMP_ASK_OTHER) {
-            options.push(Choice { label: label.to_string(), description: None });
+        match omp_ask_marker(text) {
+            Some((is_multi, label)) => {
+                multi |= is_multi;
+                let label = label.strip_suffix(OMP_ASK_RECOMMENDED).unwrap_or(label).trim();
+                open = label != OMP_ASK_OTHER && !label.is_empty();
+                if open {
+                    options.push(Choice { label: label.to_string(), description: None });
+                }
+            }
+            None => {
+                if let (true, Some(last)) = (open, options.last_mut()) {
+                    last.description = Some(row.clone());
+                }
+                open = false;
+            }
         }
     }
-    (!options.is_empty()).then(|| Prompt::Question { tool: "ask".into(), question, options })
+    (!options.is_empty()).then(|| Prompt::Question { tool: "ask".into(), question, multi, options })
+}
+
+/// An option row's marker and label: `○` / `◉` single-select, `☐` / `☑` multi-select.
+fn omp_ask_marker(text: &str) -> Option<(bool, &str)> {
+    [("○ ", false), ("◉ ", false), ("☐ ", true), ("☑ ", true)]
+        .into_iter()
+        .find_map(|(marker, is_multi)| text.strip_prefix(marker).map(|label| (is_multi, label.trim())))
 }
 
 const OPENCODE_PERMISSION: &str = "△ Permission required";
@@ -271,7 +307,7 @@ fn opencode_question(lines: &[&str]) -> Option<Prompt> {
             None => {}
         }
     }
-    (!options.is_empty()).then(|| Prompt::Question { tool: "question".into(), question, options })
+    (!options.is_empty()).then(|| Prompt::Question { tool: "question".into(), question, multi: false, options })
 }
 
 fn prompt_value(prompt: &Prompt) -> Value {
@@ -283,11 +319,11 @@ fn prompt_value(prompt: &Prompt) -> Value {
             }
             json!({ "approval": approval })
         }
-        Prompt::Question { tool, question, options } => {
+        Prompt::Question { tool, question, multi, options } => {
             let options: Vec<Value> = options.iter().map(choice_value).collect();
             json!({
                 "toolName": tool,
-                "questions": [{ "question": question, "multiSelect": false, "options": options }],
+                "questions": [{ "question": question, "multiSelect": multi, "options": options }],
             })
         }
     }
@@ -314,6 +350,10 @@ mod tests {
     const OPENCODE_REJECTED: &str = include_str!("../../tests/fixtures/approvals/opencode-approval-after-reject.txt");
     const OPENCODE_QUESTION: &str = include_str!("../../tests/fixtures/approvals/opencode-question.txt");
     const OPENCODE_ANSWERED: &str = include_str!("../../tests/fixtures/approvals/opencode-question-after-answer.txt");
+    const OMP_ASK_SINGLE: &str = include_str!("../../tests/fixtures/approvals/omp-ask-single.txt");
+    const OMP_ASK_MULTI: &str = include_str!("../../tests/fixtures/approvals/omp-ask-multi.txt");
+    const OMP_ASK_TABS: &str = include_str!("../../tests/fixtures/approvals/omp-ask-tabs.txt");
+    const OMP_ASK_REVIEW: &str = include_str!("../../tests/fixtures/approvals/omp-ask-review.txt");
 
     fn read(screen: &str, agent: &str) -> Value {
         let text = interactive_prompt(screen, agent).expect("the screen shows a prompt");
@@ -349,6 +389,60 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn the_omp_ask_descriptions_are_read_and_other_is_dropped() {
+        assert_eq!(
+            read(OMP_ASK_SINGLE, "omp"),
+            json!({
+                "toolName": "ask",
+                "questions": [{
+                    "question": "Which color?",
+                    "multiSelect": false,
+                    "options": [
+                        { "label": "Red", "description": "warm" },
+                        { "label": "Green" },
+                        { "label": "Blue" }
+                    ]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn a_multi_select_ask_reads_multi_select_and_its_choices() {
+        assert_eq!(
+            read(OMP_ASK_MULTI, "omp"),
+            json!({
+                "toolName": "ask",
+                "questions": [{
+                    "question": "Pick toppings",
+                    "multiSelect": true,
+                    "options": [{ "label": "Ham" }, { "label": "Olives" }, { "label": "Basil" }]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn a_tabbed_ask_reads_the_current_tab_question_not_the_tab_row() {
+        assert_eq!(
+            read(OMP_ASK_TABS, "omp"),
+            json!({
+                "toolName": "ask",
+                "questions": [{
+                    "question": "Which size?",
+                    "multiSelect": false,
+                    "options": [{ "label": "Small" }, { "label": "Large" }]
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn the_submit_tab_has_no_question() {
+        assert_eq!(interactive_prompt(OMP_ASK_REVIEW, "omp"), None);
     }
 
     #[test]
