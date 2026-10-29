@@ -186,18 +186,11 @@ impl Herdr {
         Ok(tabs.iter().filter_map(|t| Some((text(t, "tab_id")?, text(t, "label").unwrap_or_default()))).collect())
     }
 
-    /// The argument lists of a pane's foreground processes.
+    /// The argument lists of a pane's foreground processes, with a stale session-file argument replaced by the file
+    /// the process has open (see `bridge::herdr::live_process_argvs`).
     pub fn foreground_argvs(&self, pane_id: &str) -> Result<Vec<Vec<String>>, String> {
         let v = self.call(&["pane", "process-info", "--pane", pane_id])?;
-        let procs = v["result"]["process_info"]["foreground_processes"]
-            .as_array()
-            .ok_or("herdr's process info has no foreground processes")?;
-        Ok(procs
-            .iter()
-            .filter_map(|p| p["argv"].as_array())
-            .map(|argv| argv.iter().filter_map(|a| a.as_str().map(str::to_string)).collect::<Vec<String>>())
-            .filter(|argv| !argv.is_empty())
-            .collect())
+        crate::bridge::herdr::live_process_argvs(&v["result"])
     }
 
     /// The pid of a pane's shell, when herdr reports it.

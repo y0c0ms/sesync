@@ -235,17 +235,113 @@ pub fn parse_panes(result: &Value) -> Result<Vec<Pane>, String> {
 }
 
 /// The argument lists of the foreground processes in a `pane_process_info` result. Empty argument
-/// lists are dropped.
-pub fn parse_process_argvs(result: &Value) -> Result<Vec<Vec<String>>, String> {
+/// lists are dropped. A session-file argument (`*.jsonl`) is replaced by the one top-level session file the process
+/// has open when they differ (`open_session`, given the pid and herdr's argv): omp started with `--resume <file>`
+/// moves to a new file when the session is open elsewhere, and keeps its argv. Matching by the stale argv attached the
+/// pane to the abandoned copy and left the live conversation without a pane (2026-10-29).
+fn parse_process_argvs_with(
+    result: &Value,
+    open_session: impl Fn(u64, &[String]) -> Option<String>,
+) -> Result<Vec<Vec<String>>, String> {
     let procs = result["process_info"]["foreground_processes"]
         .as_array()
         .ok_or("herdr's process info has no foreground processes")?;
     Ok(procs
         .iter()
-        .filter_map(|p| p["argv"].as_array())
-        .map(|argv| argv.iter().filter_map(|a| a.as_str().map(str::to_string)).collect::<Vec<String>>())
-        .filter(|argv| !argv.is_empty())
+        .filter_map(|p| {
+            let argv: Vec<String> = p["argv"].as_array()?.iter().filter_map(|a| a.as_str().map(str::to_string)).collect();
+            if argv.is_empty() {
+                return None;
+            }
+            let open = argv
+                .iter()
+                .any(|a| a.ends_with(".jsonl"))
+                .then(|| p["pid"].as_u64().and_then(|pid| open_session(pid, &argv)))
+                .flatten();
+            Some(match open {
+                Some(open) => argv.into_iter().map(|a| if a.ends_with(".jsonl") { open.clone() } else { a }).collect(),
+                None => argv,
+            })
+        })
         .collect())
+}
+
+/// The session file local process `pid` runs when herdr shows it started with a session file in `argv`: omp, asked to
+/// resume a session another omp already has, moves it to a new file whose header names the old session as
+/// `parentSession`, and keeps its argv. So the process runs the earliest such copy created after the process started,
+/// or the argv's file when there is none. The process must be the one herdr described (its command line equals
+/// `argv`), so a pid from another machine's herdr never reads an unrelated local process. None when nothing moved.
+#[cfg(target_os = "linux")]
+fn open_session_file(pid: u64, argv: &[String]) -> Option<String> {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let cmdline = std::fs::read(proc.join("cmdline")).ok()?;
+    let local: Vec<&[u8]> = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+    if local.len() != argv.len() || local.iter().zip(argv).any(|(l, a)| *l != a.as_bytes()) {
+        return None;
+    }
+    let file = argv.iter().find(|a| a.ends_with(".jsonl"))?;
+    moved_copy(Path::new(file), process_start(&proc)?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_session_file(_pid: u64, _argv: &[String]) -> Option<String> {
+    None
+}
+
+/// When the process at `proc` (a `/proc/<pid>` directory) started, in Unix seconds.
+#[cfg(target_os = "linux")]
+fn process_start(proc: &Path) -> Option<f64> {
+    let stat = std::fs::read_to_string(proc.join("stat")).ok()?;
+    // Field 22, counted after the parenthesised command name, which may itself hold spaces.
+    let ticks: f64 = stat[stat.rfind(')')? + 2..].split_whitespace().nth(19)?.parse().ok()?;
+    let btime: f64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // USER_HZ is 100 on every Linux the bridge runs on.
+    Some(btime + ticks / 100.0)
+}
+
+/// The session record of an omp session file: its id, `parentSession` and creation time. It follows an optional
+/// title record, within the file's first few kilobytes.
+fn session_header(path: &Path) -> Option<(String, Option<String>, f64)> {
+    use std::io::Read;
+    let mut head = vec![0u8; 16 * 1024];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let text = String::from_utf8_lossy(&head[..n]);
+    text.lines().take(3).find_map(|line| {
+        let v: Value = serde_json::from_str(line).ok()?;
+        (v["type"] == "session").then(|| {
+            let ts = crate::prompts::parse_rfc3339(v["timestamp"].as_str().unwrap_or(""))?;
+            Some((v["id"].as_str()?.to_string(), v["parentSession"].as_str().map(str::to_string), ts))
+        })?
+    })
+}
+
+/// The earliest session file next to `file` whose header names `file`'s session as its parent and was created at or
+/// after `started` (Unix seconds; one second of slack for clock rounding). Its path, or None.
+fn moved_copy(file: &Path, started: f64) -> Option<String> {
+    let (id, _, _) = session_header(file)?;
+    let mut best: Option<(f64, PathBuf)> = None;
+    for entry in std::fs::read_dir(file.parent()?).ok()?.flatten() {
+        let path = entry.path();
+        if path == file || path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        // A copy made after the process started was written since then: skip reading every older file's header.
+        let modified = entry.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        if modified.is_none_or(|m| m.as_secs_f64() + 1.0 < started) {
+            continue;
+        }
+        let Some((_, Some(parent), created)) = session_header(&path) else { continue };
+        if parent == id && created + 1.0 >= started && best.as_ref().is_none_or(|(t, _)| created < *t) {
+            best = Some((created, path));
+        }
+    }
+    best.and_then(|(_, p)| p.to_str().map(str::to_string))
 }
 
 /// The text of a `pane_read` result.
@@ -285,7 +381,13 @@ pub fn parse_pane_size(result: &Value, pane_id: &str) -> Option<(u32, u32)> {
 }
 
 pub fn foreground_argvs(h: &dyn Herdr, pane_id: &str) -> Result<Vec<Vec<String>>, String> {
-    parse_process_argvs(&h.call("pane.process_info", json!({ "pane_id": pane_id }))?)
+    live_process_argvs(&h.call("pane.process_info", json!({ "pane_id": pane_id }))?)
+}
+
+/// `parse_process_argvs` for a live local herdr: each stale session-file argument is replaced by the session file
+/// the process has open. Used by the bridge and by "open in herdr", so both find the same pane for a conversation.
+pub fn live_process_argvs(result: &Value) -> Result<Vec<Vec<String>>, String> {
+    parse_process_argvs_with(result, open_session_file)
 }
 
 /// The pane's visible screen with its colour codes, every row as herdr rendered it.
@@ -370,8 +472,59 @@ mod tests {
             { "pid": 2, "name": "x", "argv": [] },
             { "pid": 3, "name": "y" }
         ]}});
-        assert_eq!(parse_process_argvs(&result).unwrap(), vec![vec!["claude", "--resume", "abc"]]);
-        assert!(parse_process_argvs(&json!({"process_info": {}})).is_err());
+        let none = |_: u64, _: &[String]| None;
+        assert_eq!(parse_process_argvs_with(&result, none).unwrap(), vec![vec!["claude", "--resume", "abc"]]);
+        assert!(parse_process_argvs_with(&json!({"process_info": {}}), none).is_err());
+    }
+
+    #[test]
+    fn a_stale_resume_file_is_replaced_by_the_session_file_the_process_has_open() {
+        let result = json!({ "process_info": { "foreground_processes": [
+            { "pid": 7, "name": "omp", "argv": ["omp", "--resume", "/s/-p/old.jsonl"] },
+            { "pid": 8, "name": "claude", "argv": ["claude", "--resume", "abc"] }
+        ]}});
+        let open = |pid: u64, _: &[String]| (pid == 7).then(|| "/s/-p/new.jsonl".to_string());
+        assert_eq!(
+            parse_process_argvs_with(&result, open).unwrap(),
+            vec![vec!["omp", "--resume", "/s/-p/new.jsonl"], vec!["claude", "--resume", "abc"]]
+        );
+        // Nothing open (or another machine's pid): herdr's argv stands.
+        assert_eq!(parse_process_argvs_with(&result, |_, _| None).unwrap()[0], vec!["omp", "--resume", "/s/-p/old.jsonl"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_command_line_differs_from_herdrs_is_not_read() {
+        let me = std::process::id() as u64;
+        assert_eq!(open_session_file(me, &["not".into(), "this".into(), "x.jsonl".into()]), None);
+    }
+
+    #[test]
+    fn a_process_runs_the_copy_its_session_was_moved_to_after_it_started() {
+        let dir = std::env::temp_dir().join(format!("sesync-moved-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, id: &str, parent: Option<&str>, ts: &str| {
+            let parent = parent.map_or(String::new(), |p| format!(",\"parentSession\":\"{p}\""));
+            std::fs::write(
+                dir.join(name),
+                format!("{{\"type\":\"title\",\"title\":\"Main agent\"}}\n{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"{ts}\"{parent}}}\n"),
+            )
+            .unwrap();
+        };
+        // The 2026-10-29 chain: root, moved at 10:52:33 by an omp started 10:51:51, moved again at 12:47:15 by an omp
+        // started 12:46:28 with the first copy in its argv.
+        write("root.jsonl", "root", None, "2026-07-17T21:39:39.522Z");
+        write("one.jsonl", "one", Some("root"), "2026-10-29T10:52:33.075Z");
+        write("two.jsonl", "two", Some("one"), "2026-10-29T12:47:15.385Z");
+        let at = |s: &str| crate::prompts::parse_rfc3339(s).unwrap();
+        let path = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        assert_eq!(moved_copy(&dir.join("root.jsonl"), at("2026-10-29T10:51:51Z")), Some(path("one.jsonl")));
+        assert_eq!(moved_copy(&dir.join("one.jsonl"), at("2026-10-29T12:46:28Z")), Some(path("two.jsonl")));
+        // A process started after the last move runs its argv's file.
+        assert_eq!(moved_copy(&dir.join("two.jsonl"), at("2026-10-29T13:00:00Z")), None);
+        // A copy made before the process started is someone else's: the process still runs its argv's file.
+        assert_eq!(moved_copy(&dir.join("root.jsonl"), at("2026-10-29T12:00:00Z")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
