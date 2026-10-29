@@ -567,6 +567,41 @@ async fn a_phone_lists_subscribes_types_into_and_watches_a_live_herdr_pane() {
     }
     assert!(snapshot.contains("hello"), "the snapshot shows the pane: {snapshot:?}");
 
+    // The announced size is the pane's real size, from herdr's layout, in desktop mode.
+    let (cols, rows) = herdr::pane_size(&api, &root).expect("herdr lays the pane out");
+    assert_eq!((subscribed["result"]["cols"].as_u64(), subscribed["result"]["rows"].as_u64()), (Some(cols as u64), Some(rows as u64)), "{subscribed}");
+    assert_eq!(subscribed["result"]["displayMode"], "desktop", "{subscribed}");
+
+    // Splitting the pane halves its width: one resized snapshot follows, at the width herdr now lays out.
+    server.cli(&["pane", "split", &root, "--direction", "right"]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let resized = loop {
+        assert!(std::time::Instant::now() < deadline, "no resized snapshot after the split");
+        if let Frame::Binary(bytes) = phone.next_frame().await {
+            let (opcode, id, payload) = frame_parts(&bytes);
+            assert_eq!(id, stream_id, "frames carry the announced stream id");
+            if opcode == 2 {
+                let meta: Value = serde_json::from_slice(&payload).unwrap();
+                if meta["kind"] == "resized" {
+                    break meta;
+                }
+            }
+        }
+    };
+    let (new_cols, new_rows) = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let size = herdr::pane_size(&api, &root).expect("herdr lays the pane out");
+            if size.0 != cols || std::time::Instant::now() >= deadline {
+                break size;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    assert!(new_cols < cols, "the split narrows the pane: {cols} -> {new_cols}");
+    assert_eq!((resized["cols"].as_u64(), resized["rows"].as_u64()), (Some(new_cols as u64), Some(new_rows as u64)), "{resized}");
+    assert_eq!(resized["displayMode"], "desktop", "{resized}");
+
     // Typing a prompt: the text and Enter reach the pane, and the output comes back as Output frames.
     // The send's reply and the output frames may interleave, so read until both have arrived.
     phone.request(&token, "s", "terminal.send", json!({
@@ -821,7 +856,9 @@ impl World {
             if reply["result"]["send"]["accepted"] == true {
                 return;
             }
-            assert!(reply["error"]["code"] == "conversation_locked" && std::time::Instant::now() < deadline, "{reply}");
+            // A turn's end and herdr's status can differ by a moment: a conversation still held, or a pane herdr still reports blocked, is retried.
+            let busy = matches!(reply["error"]["code"].as_str(), Some("conversation_locked" | "agent_waiting_on_prompt"));
+            assert!(busy && std::time::Instant::now() < deadline, "{reply}");
             self.pump(Duration::from_millis(200)).await;
         }
     }
