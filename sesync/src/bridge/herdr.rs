@@ -322,9 +322,14 @@ fn session_header(path: &Path) -> Option<(String, Option<String>, f64)> {
 }
 
 /// The earliest session file next to `file` whose header names `file`'s session as its parent and was created at or
-/// after `started` (Unix seconds; one second of slack for clock rounding). Its path, or None.
+/// after `started` (Unix seconds; one second of slack for clock rounding). Its path, or None. `file` itself may be
+/// gone (an abandoned copy deleted while the agent that moved away from it still runs): its id then comes from the
+/// file name, which omp writes as `<created>_<id>.jsonl`.
 fn moved_copy(file: &Path, started: f64) -> Option<String> {
-    let (id, _, _) = session_header(file)?;
+    let id = match session_header(file) {
+        Some((id, _, _)) => id,
+        None => file.file_stem()?.to_str()?.rsplit_once('_')?.1.to_string(),
+    };
     let mut best: Option<(f64, PathBuf)> = None;
     for entry in std::fs::read_dir(file.parent()?).ok()?.flatten() {
         let path = entry.path();
@@ -342,6 +347,50 @@ fn moved_copy(file: &Path, started: f64) -> Option<String> {
         }
     }
     best.and_then(|(_, p)| p.to_str().map(str::to_string))
+}
+
+/// A local process already running the session `ident` (a resume argument such as omp's session file), herdr pane or
+/// not: its command line, with a stale session file replaced by the copy it moved to (`open_session_file`), carries
+/// `ident` as a flag's value. Every start of an agent checks this first: a second agent on one session splits it, and
+/// omp answers a second open by forking the session into another file (three copies of one conversation on
+/// 2026-10-29). The pid, or None. Never this process; off Linux always None.
+pub fn agent_running(ident: &str) -> Option<u64> {
+    if ident.is_empty() {
+        return None;
+    }
+    local_argvs().into_iter().find_map(|(pid, argv)| {
+        let argv = match open_session_file(pid, &argv) {
+            Some(open) => argv.into_iter().map(|a| if a.ends_with(".jsonl") { open.clone() } else { a }).collect(),
+            None => argv,
+        };
+        crate::herdr_open::argv_carries(&[argv], ident).then_some(pid)
+    })
+}
+
+/// Every other local process's command line that names a session: a `*.jsonl` file or a flag value equal to an
+/// identifier is checked by the caller; processes without arguments are skipped.
+#[cfg(target_os = "linux")]
+fn local_argvs() -> Vec<(u64, Vec<String>)> {
+    let me = std::process::id() as u64;
+    let Ok(procs) = std::fs::read_dir("/proc") else { return Vec::new() };
+    procs
+        .flatten()
+        .filter_map(|e| {
+            let pid: u64 = e.file_name().to_str()?.parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            let raw = std::fs::read(e.path().join("cmdline")).ok()?;
+            let argv: Vec<String> =
+                raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            (argv.len() > 1).then_some((pid, argv))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_argvs() -> Vec<(u64, Vec<String>)> {
+    Vec::new()
 }
 
 /// The text of a `pane_read` result.
@@ -499,6 +548,28 @@ mod tests {
         assert_eq!(open_session_file(me, &["not".into(), "this".into(), "x.jsonl".into()]), None);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_another_local_process_runs_is_reported_until_that_process_ends() {
+        let ident = format!("/nowhere/sesync-guard-{}.jsonl", std::process::id());
+        assert_eq!(agent_running(&ident), None);
+        // A stand-in agent: its argv carries the session as a flag's value, as `omp --resume <file>` does.
+        let mut agent = std::process::Command::new("sh")
+            // Two commands, so `sh` does not exec into `sleep` and drop its arguments.
+            .args(["-c", "sleep 30; :", "sh", "--resume", &ident])
+            .spawn()
+            .unwrap();
+        let pid = agent.id() as u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while agent_running(&ident).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(agent_running(&ident), Some(pid));
+        agent.kill().unwrap();
+        agent.wait().unwrap();
+        assert_eq!(agent_running(&ident), None);
+    }
+
     #[test]
     fn a_process_runs_the_copy_its_session_was_moved_to_after_it_started() {
         let dir = std::env::temp_dir().join(format!("sesync-moved-{}", std::process::id()));
@@ -524,6 +595,12 @@ mod tests {
         assert_eq!(moved_copy(&dir.join("two.jsonl"), at("2026-10-29T13:00:00Z")), None);
         // A copy made before the process started is someone else's: the process still runs its argv's file.
         assert_eq!(moved_copy(&dir.join("root.jsonl"), at("2026-10-29T12:00:00Z")), None);
+        // The file in the argv was deleted after the move: its id comes from omp's `<created>_<id>.jsonl` name.
+        write("2026-10-29T12-47-15-385Z_kid.jsonl", "kid", Some("gone"), "2026-10-29T12:47:15.385Z");
+        assert_eq!(
+            moved_copy(&dir.join("2026-10-29T10-52-33-075Z_gone.jsonl"), at("2026-10-29T12:46:28Z")),
+            Some(path("2026-10-29T12-47-15-385Z_kid.jsonl"))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

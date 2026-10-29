@@ -601,6 +601,7 @@ pub fn open_with_focus(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Det
                     }
                 }
                 if let Some(pane_id) = idle {
+                    refuse_second_agent(plan)?;
                     herdr
                         .run_in_pane(&pane_id, &command)
                         .map_err(|e| format!("could not start the resume command in herdr: {e}"))?;
@@ -612,6 +613,7 @@ pub fn open_with_focus(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Det
             }
         }
     }
+    refuse_second_agent(plan)?;
     let (tab_id, pane_id) = herdr.create_tab(&plan.cwd, &plan.label)?;
     if let Err(e) = herdr.run_in_pane(&pane_id, &command) {
         let _ = herdr.close_tab(&tab_id);
@@ -623,4 +625,16 @@ pub fn open_with_focus(herdr: &Herdr, plan: &Plan, shell: PaneShell, detect: Det
             .map_err(|e| format!("opened '{}' in a new herdr tab, but could not switch to it ({e})", plan.label))?;
     }
     Ok(Opened::Created { tab_id })
+}
+
+/// Refuse to start `plan`'s agent while a local process already runs its session, in herdr or not: a second agent
+/// splits the conversation (omp forks the session into a new file). Reached only when no herdr pane was found for it.
+pub fn refuse_second_agent(plan: &Plan) -> Result<(), String> {
+    match crate::bridge::herdr::agent_running(plan.ident()) {
+        Some(pid) => Err(format!(
+            "'{}' is already running (pid {pid}) outside a herdr tab sesync can see; switch to that terminal, or quit it there before opening it again",
+            plan.label
+        )),
+        None => Ok(()),
+    }
 }

@@ -209,6 +209,7 @@ fn resume_conversation(
     // A tab herdr still shows for the conversation whose agent has quit: its shell is idle, so the resume command is
     // typed into it again rather than waiting for an agent that will not come.
     if matches!(opened, herdr_open::Opened::Focused { .. }) && !listed_in_tab(ctx, conversations, conv, tab_id)? {
+        herdr_open::refuse_second_agent(&plan).map_err(|m| ("conversation_running_elsewhere", m))?;
         rerun_in_idle_shell(ctx, &resume.herdr, tab_id, &command)?;
     }
     match wait_until_listed(ctx, conversations, conv, tab_id, resume.start_wait)? {
