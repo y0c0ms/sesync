@@ -6,7 +6,7 @@ use super::herdr::{self, Herdr};
 use super::offer::{self, Offer};
 use super::rpc::{self, Ctx};
 use super::turns::{LockTools, Turns};
-use super::{devices, keys, net, notify, ntfy, server, start, uploads, usage, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
+use super::{dictation, devices, keys, net, notify, ntfy, server, start, uploads, usage, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
 use crate::qr;
 use qrcodegen::QrCode;
 use std::collections::HashMap;
@@ -136,6 +136,8 @@ fn serve(args: &[String], dir: &Path, sessions: Sessions, locks: LockTools) -> R
     let paired = devices::list(dir).map_err(Fail::Failed)?.len();
     let push = push_config(&opts);
     let Sessions { catalog, locations, home } = sessions;
+    let whisper = dictation::Whisper::from_env();
+    eprintln!("bridge: phone dictation through {} ({})", whisper.url, whisper.model);
     let ctx = Ctx {
         catalog,
         herdr: Arc::new(herdr::Socket::new(herdr_socket.clone())) as Arc<dyn Herdr>,
@@ -146,6 +148,7 @@ fn serve(args: &[String], dir: &Path, sessions: Sessions, locks: LockTools) -> R
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        dictation: dictation::Dictation::new(whisper),
         launch: start::Launch::from_env(locations, home, &herdr_socket),
     };
     if !opts.contains_key("no-usage") {

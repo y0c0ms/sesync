@@ -114,11 +114,16 @@ Served methods:
 | `git.history` `{worktree, limit?, baseRef?}` | `{items:[{id, parentIds, subject, displayId, author, timestamp}]}`, newest first. `timestamp` is milliseconds; `limit` defaults to 50 and tops out at 200. |
 | `git.commitCompare` `{worktree, commitId}` | `{entries:[…]}`: the files one commit changed against its first parent. |
 | `git.branchCompare` `{worktree, baseRef}` | `{summary:{baseRef, compareRef, changedFiles, status, baseOid, headOid, mergeBase, commitsAhead, errorMessage?}, entries:[…]}`. `status` is `ready`, `invalid-base`, `unborn-head`, `no-merge-base` or `error`. `compareRef` is the checked-out branch, `HEAD` when detached. |
+| `speech.models.list` | `{enabled, selectedModelId, dictationMode:"toggle", models:[{id, label, provider, status:"ready", sizeBytes, progress}]}`: the one whisper model, always ready. See Dictation. |
+| `speech.dictation.start` `{dictationId, modelId?}` | `{dictationId, modelId}`. `dictation_already_active` when this phone already holds one. See Dictation. |
+| `speech.dictation.chunk` `{dictationId, audioBase64, sampleRate}` | `{dictationId}`: 16 kHz mono PCM, s16le, at most 5 s per chunk. |
+| `speech.dictation.finish` `{dictationId}` | `{dictationId, text}`: `[TRANSCRIBED] <text>`, or `""` when nothing was heard. |
+| `speech.dictation.cancel` `{dictationId}` | `{dictationId}`. A no-op unless this phone holds that dictation. |
 
 Every other method, including the structured `agentSession.*` calls (`send`, `currentRequests`, `respondToApproval`, `respondToQuestion`, `create`, `createSupport`) and `worktree.create` and `agent.launch`, answers `error.code: "method_not_found"` with the request's `id`. Terminal-backed chat never calls them: its prompts ride `terminal.send`, its cards ride `interactivePrompt`, and new sessions ride `session.tabs.createTerminal` (the app falls through when `agentSession.create` is refused). Orca reads that as
 "not available here" (`isMobileMethodUnavailableError`) and skips the read. Errors the bridge raises:
 `bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
-reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read, or a chat's transcript cannot be converted),
+reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read, a chat's transcript cannot be converted, or the speech server cannot transcribe a dictation),
 `send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder),
 `not_running_agent` (the conversation's tab is left with a shell) and `agent_waiting_on_prompt` (the pane is blocked on a prompt), both refused before anything is typed,
 `agent_not_started` (a create's agent did not come up),
@@ -273,6 +278,18 @@ When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines a
 
 `clipboard.startImageUpload {expectedBase64Length}` returns `{uploadId}`. `appendImageUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` equals the bytes so far), at most 512 Ki base64 characters per chunk. The total is limited to 24 Mi base64 characters and 20 MB decoded. `commitImageUpload` returns the staged absolute path as a string, which the app inserts into the prompt as `@path`. omp expands that into an image input, so the model request carries an image part (fake-model counts these as `images`). `saveImageAsTempFile {contentBase64}` does the same in one call. The app's clipboard params carry no `worktree`, so uploads stage under `_unscoped`. The chat shows a staged image again in its history by reading that absolute path with `files.readPreview`.
 
+## Dictation
+
+The mic in the native chat composer (Dictate, to the right of the attachment "+") records 16 kHz mono PCM and streams it as `speech.dictation.chunk` calls. `speech.dictation.finish` wraps the recording as a WAV and posts it to the whisper server that `~/.local/bin/dictate-toggle.sh` uses: llama-swap's OpenAI-compatible `/v1/audio/transcriptions`, with the multipart fields `file`, `temperature=0.0`, `model`, `language` and `response_format=json`. The transcript comes back as `[TRANSCRIBED] <text>`; the app inserts it into the composer and never sends it.
+
+Configuration, read from the environment of `sesync bridge serve`: `SESYNC_WHISPER_URL` (default `http://10.10.20.3:11435/v1/audio/transcriptions`), `SESYNC_WHISPER_MODEL` (default `whisper-gpu`) and `SESYNC_WHISPER_LANGUAGE` (default `auto`). A transcription may take 60 s, as the script's `curl -m 60` allows.
+
+Limits and lifetime: one dictation per phone connection; a second `start` on that connection is `dictation_already_active`, and a `start` from another connection replaces the one held. A chunk is at most 5 s, and a recording at most 5 minutes: the chunk that would pass 5 minutes is refused and the app cancels. Audio stays in memory only. `finish`, `cancel` and the connection's close drop it, and nothing is written to disk.
+
+Errors: `bad_request` for malformed chunks and `No audio captured` when finish holds no audio; `unavailable` with the reason when the speech server is unreachable, answers an HTTP error, times out, or replies without `text`; `dictation_stream_not_started` and `dictation_owner_mismatch` when a chunk or finish does not match the held dictation. An empty transcript is `text: ""`, which the app reports as "No speech detected."
+
+`speech.models.list` does not probe the speech server: an unreachable server surfaces at `finish`. `speech.dictation.setup`, `speech.models.download` and `speech.models.delete` stay unserved (`method_not_found`); the mic path never calls them. Client: `mobile/src/hooks/use-mobile-dictation.ts`.
+
 ## New sessions
 
 `preflight.detectAgents` lists the agents on PATH from the table in `start.rs` (claude, omp, opencode, pi, and antigravity as `agy`). `session.tabs.createTerminal {worktree, agent}` has two cases, decided by the worktree id:
@@ -335,6 +352,7 @@ The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`,
   stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
   named and a timed release), the RPC dispatch against canned herdr answers, the pane fallback rules (the tag, the title and directory, ambiguity, and that an argv or owner match is never overridden), and the chat conversions (cached per source state, replaced when it moves, owner-only).
 - `src/bridge/pins.rs`: pins survive a reload, the file is owner-only, a damaged file fails the write and is left alone, `isPinned` must be a boolean, and no other field is accepted. `rpc.rs` tests: the pin shows on the worktree row, `terminal.clearBuffer` sends Ctrl-L and reports a missing pane, write verbs and unserved methods answer `method_not_found`, and every read method is routed. `notify.rs`: a test push reaches a live stream, is kept out of the history, and is refused with no stream.
+- `src/bridge/dictation.rs`: the WAV and multipart shapes, the owner and lifetime rules, every refusal (oversize chunk and recording included), and the whisper outcomes (success, HTTP error, no `text`, timeout, unreachable). `tests/bridge.rs`: a dictation round trip over the encrypted link, a 503 and an oversize chunk, and a timeout. One `#[ignore]`d test hits the live server with `SESYNC_LIVE_WAV`.
 - `src/bridge/confine.rs`, `files.rs`, `git.rs`: the path confinement (`..`, absolute paths, NUL, `.git`, a symlink that leaves the project or enters `.git`), the size caps, the `.gitignore`-honouring search, the git allowlist (every other verb and each unlisted option is refused before git starts, and a write verb leaves the repository unchanged), and reads of real files and a real `git init` repository in a sandbox. `rpc.rs` also runs a live repository through dispatch.
 - `src/bridge/e2ee.rs` pins the NaCl framing against a tweetnacl vector (both directions, and the
   server public key derivation).

@@ -5,6 +5,7 @@
 use super::catalog::{Catalog, Conversation};
 use super::herdr::Herdr;
 use super::rpc::Ctx;
+use super::dictation::{Dictation, Whisper};
 use super::{notify, start, uploads, usage};
 use super::turns::{LockTools, Turns};
 use crate::harness::Locations;
@@ -64,6 +65,7 @@ pub fn ctx_on(conversations: Vec<Conversation>, herdr: Arc<dyn Herdr>, launch: s
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        dictation: Dictation::new(Whisper::from_env()),
         launch,
     }
 }

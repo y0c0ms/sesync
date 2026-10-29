@@ -17,7 +17,7 @@ use super::herdr::{self, Herdr};
 use super::terminals::{self, Running};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
@@ -149,16 +149,26 @@ struct Open {
 }
 
 /// One connection's open streams. Dropping it stops them all: a stream never outlives the phone
-/// that asked for it.
+/// that asked for it. Its id is unique in the process, so a request can say which phone sent it.
 pub struct Conn {
     pub sink: Sink,
+    id: u64,
     streams: Mutex<Vec<Open>>,
     next_stream: AtomicU32,
 }
 
+/// Connections opened in this process, numbered from 1.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 impl Conn {
     pub fn new(sink: Sink) -> Conn {
-        Conn { sink, streams: Mutex::new(Vec::new()), next_stream: AtomicU32::new(0) }
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        Conn { sink, id, streams: Mutex::new(Vec::new()), next_stream: AtomicU32::new(0) }
+    }
+
+    /// This connection's id, unique in the process.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The next binary stream id on this connection, starting at 1.
