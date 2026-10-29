@@ -4,7 +4,7 @@
 //! Each stream is a thread that polls herdr on a bounded interval and sends only when something changed.
 //! Polling, not events: herdr's `pane.updated` does not fire on output, and `pane.output_matched` fires
 //! only on a matching line and takes its pane set when the connection opens (both checked against herdr
-//! 0.9.1). A screen is polled every 250 ms and the lists every second.
+//! 0.9.1). A screen is polled every 250 ms, a terminal's pane size every second, and the lists every second.
 //!
 //! A terminal stream speaks Orca's binary terminal stream when the phone asks for it with
 //! `capabilities.terminalBinaryStream`: a JSON `subscribed` reply carrying the stream id, then binary
@@ -29,6 +29,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// How often a terminal screen is read.
 pub const TERMINAL_POLL: Duration = Duration::from_millis(250);
+/// How often a terminal's pane size is read. A resize reaches the phone within about this long.
+pub const SIZE_POLL: Duration = Duration::from_secs(1);
+/// The display mode of a terminal at its pane's real size.
+pub const DESKTOP: &str = "desktop";
+/// The display mode of a terminal the bridge could not size: the phone's viewport is announced, as before.
+pub const AUTO: &str = "auto";
 /// How often the tab and status lists are read.
 pub const LIST_POLL: Duration = Duration::from_secs(1);
 /// How often the conversation list behind a stream is re-read from disk.
@@ -213,28 +219,48 @@ pub struct Terminal {
     pub binary: bool,
     pub cols: u32,
     pub rows: u32,
+    /// The display mode announced with the size: `desktop` for the pane's real size, `auto` for the phone's viewport.
+    pub display_mode: &'static str,
     pub stop: Arc<AtomicBool>,
     /// The screen already sent (in the subscribe reply, or as the binary snapshot).
     pub shown: String,
 }
 
+/// Send `screen` as a binary snapshot of `kind` (`scrollback` for a subscribe, `resized` for a size change):
+/// the start with its meta, the chunks, the end. False once the connection has gone.
+fn send_snapshot(t: &Terminal, kind: &str, seq: u64, screen: &str) -> bool {
+    let meta = json!({
+        "kind": kind, "cols": t.cols, "rows": t.rows, "displayMode": t.display_mode,
+        "truncated": false, "truncatedByByteBudget": false, "seq": seq,
+    });
+    let mut ok = t.sink.binary(&frame::encode(frame::SNAPSHOT_START, t.stream_id, seq, meta.to_string().as_bytes()));
+    for piece in frame::chunks(screen) {
+        ok = ok && t.sink.binary(&frame::encode(frame::SNAPSHOT_CHUNK, t.stream_id, seq, piece.as_bytes()));
+    }
+    ok && t.sink.binary(&frame::encode(frame::SNAPSHOT_END, t.stream_id, seq, b""))
+}
+
+/// Send `screen` as the terminal's new size: a resized snapshot in binary mode, a `resized` event in JSON mode.
+fn send_resized(t: &Terminal, seq: u64, screen: &str) -> bool {
+    if t.binary {
+        send_snapshot(t, "resized", seq, screen)
+    } else {
+        t.sink.json(&streamed(
+            &t.request_id,
+            json!({ "type": "resized", "cols": t.cols, "rows": t.rows, "displayMode": t.display_mode, "serialized": screen }),
+        ))
+    }
+}
+
 /// Send the binary snapshot of `shown`, then poll the screen until the stream stops, sending a full
-/// repaint whenever it changes.
+/// repaint whenever it changes. The pane's size is read every [`SIZE_POLL`]. A change of size sends the
+/// tick's screen as a resize and nothing else for that tick, so a size and a screen change never both go out.
 pub fn run_terminal(mut t: Terminal) {
     let mut seq = 0u64;
-    if t.binary {
-        let meta = json!({
-            "kind": "scrollback", "cols": t.cols, "rows": t.rows, "displayMode": "auto",
-            "truncated": false, "truncatedByByteBudget": false, "seq": 0,
-        });
-        let mut ok = t.sink.binary(&frame::encode(frame::SNAPSHOT_START, t.stream_id, 0, meta.to_string().as_bytes()));
-        for piece in frame::chunks(&t.shown) {
-            ok = ok && t.sink.binary(&frame::encode(frame::SNAPSHOT_CHUNK, t.stream_id, 0, piece.as_bytes()));
-        }
-        if !ok || !t.sink.binary(&frame::encode(frame::SNAPSHOT_END, t.stream_id, 0, b"")) {
-            return;
-        }
+    if t.binary && !send_snapshot(&t, "scrollback", 0, &t.shown) {
+        return;
     }
+    let mut size_checked = Instant::now();
     loop {
         thread::sleep(TERMINAL_POLL);
         if t.stop.load(Ordering::Relaxed) {
@@ -252,6 +278,22 @@ pub fn run_terminal(mut t: Terminal) {
             },
         };
         let screen = screen_text(&raw);
+        if size_checked.elapsed() >= SIZE_POLL {
+            size_checked = Instant::now();
+            if let Some((cols, rows)) = herdr::pane_size(t.herdr.as_ref(), &t.pane_id) {
+                if (cols, rows) != (t.cols, t.rows) || t.display_mode != DESKTOP {
+                    t.cols = cols;
+                    t.rows = rows;
+                    t.display_mode = DESKTOP;
+                    t.shown = screen.clone();
+                    seq += 1;
+                    if !send_resized(&t, seq, &screen) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
         if screen == t.shown {
             continue;
         }
@@ -398,6 +440,11 @@ pub fn run_status(mut t: Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::e2ee::Channel;
+    use crate::bridge::testkit::FakeHerdr;
+    use crypto_box::aead::Aead;
+    use crypto_box::{Nonce, SalsaBox, SecretKey};
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     #[test]
     fn a_frame_has_the_header_orca_reads() {
@@ -470,5 +517,200 @@ mod tests {
         let kept = conn.register("status".into(), json!("r3"));
         drop(conn);
         assert!(kept.load(Ordering::Relaxed), "dropping the connection stops its streams");
+    }
+
+    /// The channel a stream seals with, and the box that opens its binary frames: one shared key, both ways.
+    fn keys() -> (Arc<Channel>, SalsaBox) {
+        let client = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let server = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        (Arc::new(Channel::new(&client.public_key(), &server)), SalsaBox::new(&server.public_key(), &client))
+    }
+
+    /// One message a stream sent, opened: a JSON event's `result`, or a binary frame's opcode, seq and payload.
+    #[derive(Debug)]
+    enum Sent {
+        Event(Value),
+        Frame { opcode: u8, seq: u64, payload: Vec<u8> },
+    }
+
+    fn open(rx: &mut UnboundedReceiver<Message>, channel: &Channel, boxed: &SalsaBox) -> Vec<Sent> {
+        let mut sent = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                Message::Text(text) => {
+                    let plain = channel.open(text.as_str()).expect("a sealed JSON frame");
+                    let event: Value = serde_json::from_str(&plain).unwrap();
+                    sent.push(Sent::Event(event["result"].clone()));
+                }
+                Message::Binary(bytes) => {
+                    let (nonce, body) = bytes.split_at(24);
+                    let frame = boxed.decrypt(Nonce::from_slice(nonce), body).expect("a sealed binary frame");
+                    let word = |at: usize| u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+                    let seq = (u64::from(word(8)) << 32) | u64::from(word(12));
+                    sent.push(Sent::Frame { opcode: frame[2], seq, payload: frame[frame::HEADER_BYTES..].to_vec() });
+                }
+                _ => {}
+            }
+        }
+        sent
+    }
+
+    /// The meta of each snapshot start in `sent`.
+    fn starts(sent: &[Sent]) -> Vec<Value> {
+        sent.iter()
+            .filter_map(|s| match s {
+                Sent::Frame { opcode: frame::SNAPSHOT_START, payload, .. } => Some(serde_json::from_slice(payload).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The snapshot chunks in `sent`, joined.
+    fn chunk_text(sent: &[Sent]) -> String {
+        sent.iter()
+            .filter_map(|s| match s {
+                Sent::Frame { opcode: frame::SNAPSHOT_CHUNK, payload, .. } => Some(String::from_utf8(payload.clone()).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The output frames in `sent`, one text each.
+    fn outputs(sent: &[Sent]) -> Vec<String> {
+        sent.iter()
+            .filter_map(|s| match s {
+                Sent::Frame { opcode: frame::OUTPUT, payload, .. } => Some(String::from_utf8(payload.clone()).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A terminal stream running over a fake herdr: its pane, and the phone's end of the channel.
+    struct Running {
+        fake: Arc<FakeHerdr>,
+        terminal: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+        rx: UnboundedReceiver<Message>,
+        channel: Arc<Channel>,
+        boxed: SalsaBox,
+    }
+
+    impl Running {
+        fn start(binary: bool, screen: &str, size: (u32, u32), display_mode: &'static str) -> Running {
+            let fake = FakeHerdr::new();
+            let pane = fake.open_tab("w-main", "stream", "/work", &[]);
+            fake.set_pane(&pane.terminal_id, screen, size);
+            let (channel, boxed) = keys();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let t = Terminal {
+                herdr: fake.clone(),
+                sink: Sink::new(tx, Arc::clone(&channel)),
+                request_id: json!("r1"),
+                terminal_id: pane.terminal_id.clone(),
+                pane_id: pane.pane_id.clone(),
+                stream_id: 1,
+                binary,
+                cols: size.0,
+                rows: size.1,
+                display_mode,
+                stop: Arc::clone(&stop),
+                shown: screen_text(screen),
+            };
+            let thread = thread::spawn(move || run_terminal(t));
+            Running { fake, terminal: pane.terminal_id, stop, thread: Some(thread), rx, channel, boxed }
+        }
+
+        /// Set the pane's screen and size together.
+        fn set(&self, screen: &str, size: (u32, u32)) {
+            self.fake.set_pane(&self.terminal, screen, size);
+        }
+
+        /// What the stream sent during the next `wait`.
+        fn sent_within(&mut self, wait: Duration) -> Vec<Sent> {
+            thread::sleep(wait);
+            open(&mut self.rx, &self.channel, &self.boxed)
+        }
+
+        /// Stop the stream, wait for it, and return what it sent last (its end).
+        fn finish(&mut self) -> Vec<Sent> {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.take().unwrap().join().unwrap();
+            open(&mut self.rx, &self.channel, &self.boxed)
+        }
+    }
+
+    #[test]
+    fn a_size_change_sends_one_resized_snapshot_carrying_the_current_screen() {
+        let mut s = Running::start(true, "one\ntwo", (57, 27), DESKTOP);
+        let initial = s.sent_within(Duration::from_millis(100));
+        assert_eq!(starts(&initial).len(), 1, "the subscribe's snapshot: {initial:?}");
+        assert_eq!(starts(&initial)[0]["kind"], "scrollback");
+        assert_eq!(starts(&initial)[0]["cols"], 57);
+
+        // Only the size changes: one resized snapshot carrying the screen, and no repaint.
+        s.set("one\ntwo", (40, 20));
+        let resized = s.sent_within(Duration::from_millis(1800));
+        let metas = starts(&resized);
+        assert_eq!(metas.len(), 1, "one resized snapshot: {resized:?}");
+        assert_eq!(metas[0]["kind"], "resized");
+        assert_eq!((metas[0]["cols"].as_u64(), metas[0]["rows"].as_u64()), (Some(40), Some(20)));
+        assert_eq!(metas[0]["displayMode"], "desktop");
+        assert_eq!(chunk_text(&resized), "one\r\ntwo");
+        assert!(outputs(&resized).is_empty(), "a size change sends no repaint: {resized:?}");
+        assert!(resized.iter().all(|m| matches!(m, Sent::Frame { seq: 1, .. })), "the resize takes the next sequence: {resized:?}");
+
+        // Only the screen changes: a full repaint, and no resize.
+        s.set("one\ntwo\nthree", (40, 20));
+        let repaint = s.sent_within(Duration::from_millis(600));
+        assert_eq!(outputs(&repaint), vec![format!("{REPAINT}one\r\ntwo\r\nthree")]);
+        assert!(starts(&repaint).is_empty(), "a screen change alone is a repaint, not a resize");
+
+        let quiet = s.sent_within(Duration::from_millis(1800));
+        assert!(quiet.is_empty(), "an unchanged size and screen send nothing: {quiet:?}");
+
+        // Both change: one resized snapshot with the new screen. The screen may have gone out as a repaint in
+        // an earlier tick, when the stream read it before the size; the size is read once per second, so a tick
+        // sends either the repaint or the resize, never both.
+        s.set("one\ntwo\nthree\nfour", (30, 10));
+        let both = s.sent_within(Duration::from_millis(1800));
+        let metas = starts(&both);
+        assert_eq!(metas.len(), 1, "one resized snapshot for the size change: {both:?}");
+        assert_eq!((metas[0]["cols"].as_u64(), metas[0]["rows"].as_u64()), (Some(30), Some(10)));
+        assert_eq!(chunk_text(&both), "one\r\ntwo\r\nthree\r\nfour", "the resize carries the current screen");
+        assert!(outputs(&both).len() <= 1, "at most the repaint of the tick before the size was read: {both:?}");
+
+        let end = s.finish();
+        assert!(matches!(end.as_slice(), [Sent::Event(e)] if e["type"] == "end"), "{end:?}");
+    }
+
+    #[test]
+    fn a_json_stream_sends_a_resized_event_with_the_new_size_and_screen() {
+        let mut s = Running::start(false, "one\ntwo", (57, 27), DESKTOP);
+        s.set("one\ntwo", (40, 20));
+        let after = s.sent_within(Duration::from_millis(1800));
+        assert_eq!(after.len(), 1, "one resized event and no repaint: {after:?}");
+        match &after[0] {
+            Sent::Event(e) => {
+                assert_eq!(e["type"], "resized");
+                assert_eq!((e["cols"].as_u64(), e["rows"].as_u64()), (Some(40), Some(20)));
+                assert_eq!(e["displayMode"], "desktop");
+                assert_eq!(e["serialized"], "one\r\ntwo");
+            }
+            other => panic!("a JSON stream sends events: {other:?}"),
+        }
+        s.finish();
+    }
+
+    #[test]
+    fn a_pane_herdr_cannot_size_is_not_resized() {
+        let mut s = Running::start(true, "one", (80, 24), AUTO);
+        s.fake.hide_layout(&s.terminal);
+        let initial = s.sent_within(Duration::from_millis(100));
+        assert_eq!(starts(&initial)[0]["displayMode"], "auto", "{initial:?}");
+        let later = s.sent_within(Duration::from_millis(1800));
+        assert!(later.is_empty(), "no layout, no resize: {later:?}");
+        s.finish();
     }
 }

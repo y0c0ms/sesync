@@ -458,8 +458,16 @@ fn terminal_subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Res
     let client = params["client"]["id"].as_str().unwrap_or("");
     let key = if client.is_empty() { handle.clone() } else { format!("{handle}:{client}") };
     let binary = params["capabilities"]["terminalBinaryStream"].as_u64() == Some(1);
-    let cols = params["viewport"]["cols"].as_u64().unwrap_or(80).clamp(1, 1000) as u32;
-    let rows = params["viewport"]["rows"].as_u64().or(pane.rows).unwrap_or(24).clamp(1, 500) as u32;
+    // The pane's real size, as herdr lays it out: the phone shows the pane as it is. Only when herdr cannot
+    // give a size is the phone's viewport announced, in auto mode.
+    let (cols, rows, display_mode) = match herdr::pane_size(ctx.herdr.as_ref(), &pane.pane_id) {
+        Some((cols, rows)) => (cols, rows, stream::DESKTOP),
+        None => {
+            let cols = params["viewport"]["cols"].as_u64().unwrap_or(80).clamp(1, 1000) as u32;
+            let rows = params["viewport"]["rows"].as_u64().or(pane.rows).unwrap_or(24).clamp(1, 500) as u32;
+            (cols, rows, stream::AUTO)
+        }
+    };
     let shown = stream::screen_text(
         &herdr::read_visible(ctx.herdr.as_ref(), &pane.pane_id).map_err(|m| ("herdr_unavailable", m))?,
     );
@@ -467,10 +475,10 @@ fn terminal_subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Res
     let stop = conn.register(key, id.clone());
     let head = if binary {
         json!({ "type": "subscribed", "streamId": stream_id, "lines": [], "truncated": false,
-                "cols": cols, "rows": rows, "displayMode": "auto", "seq": 0 })
+                "cols": cols, "rows": rows, "displayMode": display_mode, "seq": 0 })
     } else {
         json!({ "type": "scrollback", "lines": [], "truncated": false, "serialized": shown.clone(),
-                "cols": cols, "rows": rows, "displayMode": "auto", "seq": 0 })
+                "cols": cols, "rows": rows, "displayMode": display_mode, "seq": 0 })
     };
     let _ = conn.sink.json(&stream::streamed(id, head));
     let term = stream::Terminal {
@@ -483,6 +491,7 @@ fn terminal_subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Res
         binary,
         cols,
         rows,
+        display_mode,
         stop,
         shown,
     };
@@ -561,6 +570,11 @@ mod tests {
     }
 
     fn herdr_with(pane_list: Value, argvs: Value) -> Arc<Canned> {
+        herdr_sized(pane_list, argvs, Some((57, 27)))
+    }
+
+    /// `herdr_with`, with `pane.layout` answering the pane at `size` (None: herdr has no layout for it).
+    fn herdr_sized(pane_list: Value, argvs: Value, size: Option<(u64, u64)>) -> Arc<Canned> {
         let mut answers = HashMap::new();
         answers.insert("pane.list", pane_list);
         answers.insert("pane.process_info", argvs);
@@ -569,6 +583,10 @@ mod tests {
         answers.insert("pane.send_text", json!({"type":"ok"}));
         answers.insert("pane.send_keys", json!({"type":"ok"}));
         answers.insert("agent.prompt", json!({"type":"agent_prompted"}));
+        if let Some((width, height)) = size {
+            let rect = json!({"x": 0, "y": 0, "width": width, "height": height});
+            answers.insert("pane.layout", json!({"type":"pane_layout","layout":{"focused_pane_id":"w1:p1","panes":[{"pane_id":"w1:p1","focused":true,"rect":rect}],"splits":[]}}));
+        }
         Arc::new(Canned { answers, calls: Mutex::new(Vec::new()) })
     }
 
@@ -829,6 +847,56 @@ mod tests {
         let (conn, _rx) = conn();
         let reply = dispatch(&req("c", "terminal.clearBuffer", json!({"terminal": "term_a"})), &c, &conn).unwrap();
         assert_eq!(reply["error"]["code"], "terminal_not_found");
+    }
+
+    /// The first message a connection sent, opened: the stream's head, its JSON `result`.
+    fn first_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<tokio_tungstenite::tungstenite::Message>) -> Value {
+        let tokio_tungstenite::tungstenite::Message::Text(text) = rx.try_recv().expect("the subscribe reply") else {
+            panic!("the subscribe reply is a JSON frame");
+        };
+        let channel = crate::bridge::e2ee::Channel::new(
+            &crypto_box::SecretKey::from_slice(&[1u8; 32]).unwrap().public_key(),
+            &crypto_box::SecretKey::from_slice(&[2u8; 32]).unwrap(),
+        );
+        let plain = channel.open(text.as_str()).expect("a sealed frame");
+        serde_json::from_str::<Value>(&plain).unwrap()["result"].clone()
+    }
+
+    fn one_pane() -> Value {
+        json!({"type":"pane_list","panes":[{"pane_id":"w1:p1","terminal_id":"term_a","tab_id":"w1:t1","focused":true,"agent_status":"idle"}]})
+    }
+
+    #[test]
+    fn a_subscribe_announces_the_pane_size_in_desktop_mode_not_the_phones_viewport() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_with(one_pane(), json!({"process_info":{"foreground_processes":[]}})));
+        let (conn, mut rx) = conn();
+        let _ = dispatch(&req("sub", "terminal.subscribe", json!({"terminal": "term_a", "client": {"id": "phone"}, "viewport": {"cols": 51, "rows": 30}})), &c, &conn);
+        let head = first_event(&mut rx);
+        assert_eq!(head["type"], "scrollback", "{head}");
+        assert_eq!((head["cols"].as_u64(), head["rows"].as_u64()), (Some(57), Some(27)), "{head}");
+        assert_eq!(head["displayMode"], "desktop", "{head}");
+        assert_eq!(head["serialized"], "hello\r\n");
+    }
+
+    #[test]
+    fn a_binary_subscribe_announces_the_pane_size_in_desktop_mode() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_with(one_pane(), json!({"process_info":{"foreground_processes":[]}})));
+        let (conn, mut rx) = conn();
+        let _ = dispatch(&req("sub", "terminal.subscribe", json!({"terminal": "term_a", "client": {"id": "phone"}, "viewport": {"cols": 51, "rows": 30}, "capabilities": {"terminalBinaryStream": 1}})), &c, &conn);
+        let head = first_event(&mut rx);
+        assert_eq!(head["type"], "subscribed", "{head}");
+        assert_eq!((head["cols"].as_u64(), head["rows"].as_u64()), (Some(57), Some(27)), "{head}");
+        assert_eq!(head["displayMode"], "desktop", "{head}");
+    }
+
+    #[test]
+    fn without_a_layout_the_phones_viewport_is_announced_in_auto_mode() {
+        let c = ctx(Arc::new(Fixed(vec![])), herdr_sized(one_pane(), json!({"process_info":{"foreground_processes":[]}}), None));
+        let (conn, mut rx) = conn();
+        let _ = dispatch(&req("sub", "terminal.subscribe", json!({"terminal": "term_a", "client": {"id": "phone"}, "viewport": {"cols": 51, "rows": 30}})), &c, &conn);
+        let head = first_event(&mut rx);
+        assert_eq!((head["cols"].as_u64(), head["rows"].as_u64()), (Some(51), Some(30)), "{head}");
+        assert_eq!(head["displayMode"], "auto", "{head}");
     }
 
     #[test]

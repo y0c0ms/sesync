@@ -142,8 +142,18 @@ phone accepts a host with `minCompatibleMobileVersion` 2 or lower.
 `terminal.subscribe` sends the screen as herdr renders it (`pane.read`, `source:"visible"`,
 `format:"ansi"`, `strip_ansi:false`), with every line break as CR LF.
 
+The size is the pane's real size. The bridge reads it from herdr's `pane.layout` (the rect's width and height) and
+announces it with `displayMode:"desktop"`. The phone's viewport is not used: herdr cannot fit a pane to the phone
+without changing the desktop layout, so the terminal is shown at the pane's own width and its lines do not wrap at
+the phone's width. Only when herdr gives no layout for the pane is the phone's viewport announced, with `displayMode:"auto"`.
+
+The size is read every second. A change sends the screen again as a resize: in binary mode a SnapshotStart whose meta
+has `kind:"resized"`, its chunks and a SnapshotEnd; in JSON mode `{type:"resized", cols, rows, displayMode, serialized}`.
+The stream then carries on with repaints from that screen. A screen change read in the tick before a size change still
+goes out as a repaint first; a size change never sends a repaint in the same tick.
+
 With `capabilities.terminalBinaryStream: 1` (what the app sends), the reply is a streamed JSON
-`{type:"subscribed", streamId, lines:[], truncated:false, cols, rows, displayMode:"auto", seq:0}`, then
+`{type:"subscribed", streamId, lines:[], truncated:false, cols, rows, displayMode:"desktop", seq:0}`, then
 binary frames tagged with that `streamId`. Each frame is `header ‖ payload`, 16-byte header:
 
 | Offset | Size | Field |
@@ -168,8 +178,7 @@ The stream ends with `{type:"end"}` when the pane is gone or the stream is unsub
 connection stops its streams.
 
 Orca's flow control (Ack) is for its multiplexer, which the phone does not use. Input from the phone
-goes through `terminal.send`, not binary Input frames; resize and viewport claims are not implemented
-(the pane keeps herdr's size).
+goes through `terminal.send`, not binary Input frames. The phone's viewport is not claimed: the pane keeps herdr's size, and the phone shows it at that size.
 
 ### Why polling
 
@@ -297,7 +306,7 @@ every 5 seconds).
 The bridge talks to herdr over its Unix socket: one JSON request per line, one reply line per request,
 each request on its own connection, 5 s timeout. The socket is `$HERDR_SOCKET_PATH`, else
 `$HOME/.config/herdr/herdr.sock`; `--herdr-socket` overrides it. Methods used: `pane.list`, `pane.get`,
-`pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`, and `tab.list` (tab labels, read only when an agent pane is listed, for the tag rule). The bridge never
+`pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`, `tab.list` (tab labels, read only when an agent pane is listed, for the tag rule), and `pane.layout` (the pane's size, for `terminal.subscribe` and the size checks). The bridge never
 creates, closes, or resizes panes. Verified against herdr 0.9.1 (protocol 22):
 
 - `pane.read` with `format:"ansi"` returns CRLF line endings and the colour codes herdr keeps.

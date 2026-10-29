@@ -269,6 +269,21 @@ pub fn pane_info(h: &dyn Herdr, pane_id: &str) -> Result<Pane, String> {
     parse_pane(&result["pane"]).ok_or_else(|| format!("herdr's info for pane {pane_id} is incomplete"))
 }
 
+/// The pane's size in cells: the width and height of its rect in `pane.layout`. None when herdr answers
+/// with an error or its layout has no such pane.
+pub fn pane_size(h: &dyn Herdr, pane_id: &str) -> Option<(u32, u32)> {
+    parse_pane_size(&h.call("pane.layout", json!({ "pane_id": pane_id })).ok()?, pane_id)
+}
+
+/// The size of `pane_id` in a `pane.layout` result, clamped to what a terminal shows (1..=1000 columns,
+/// 1..=500 rows). None when the layout has no such pane or its rect is empty.
+pub fn parse_pane_size(result: &Value, pane_id: &str) -> Option<(u32, u32)> {
+    let pane = result["layout"]["panes"].as_array()?.iter().find(|p| p["pane_id"].as_str() == Some(pane_id))?;
+    let cols = pane["rect"]["width"].as_u64().filter(|w| *w > 0)?;
+    let rows = pane["rect"]["height"].as_u64().filter(|h| *h > 0)?;
+    Some((cols.min(1000) as u32, rows.min(500) as u32))
+}
+
 pub fn foreground_argvs(h: &dyn Herdr, pane_id: &str) -> Result<Vec<Vec<String>>, String> {
     parse_process_argvs(&h.call("pane.process_info", json!({ "pane_id": pane_id }))?)
 }
@@ -363,6 +378,29 @@ mod tests {
     fn a_read_result_yields_its_text() {
         assert_eq!(parse_read(&json!({"read": {"text": "hello\r\n"}})).unwrap(), "hello\r\n");
         assert!(parse_read(&json!({"read": {}})).is_err());
+    }
+
+    #[test]
+    fn a_layout_gives_the_size_of_the_named_pane_only() {
+        let layout = json!({"type": "pane_layout", "layout": {
+            "focused_pane_id": "w1:p2",
+            "panes": [
+                {"pane_id": "w1:p1", "focused": false, "rect": {"x": 0, "y": 0, "width": 30, "height": 10}},
+                {"pane_id": "w1:p2", "focused": true, "rect": {"x": 30, "y": 0, "width": 57, "height": 27}}
+            ],
+            "splits": []
+        }});
+        assert_eq!(parse_pane_size(&layout, "w1:p2"), Some((57, 27)));
+        assert_eq!(parse_pane_size(&layout, "w9:p9"), None, "a pane outside the layout has no size");
+        assert_eq!(parse_pane_size(&json!({"layout": {"panes": [{"pane_id": "w1:p1", "rect": {"width": 0, "height": 5}}]}}), "w1:p1"), None);
+        assert_eq!(parse_pane_size(&json!({}), "w1:p1"), None);
+        let huge = json!({"layout": {"panes": [{"pane_id": "w1:p1", "rect": {"width": 5000, "height": 900}}]}});
+        assert_eq!(parse_pane_size(&huge, "w1:p1"), Some((1000, 500)), "clamped to a terminal's range");
+    }
+
+    #[test]
+    fn a_pane_without_a_layout_has_no_size() {
+        assert_eq!(pane_size(&crate::bridge::testkit::NoHerdr, "w1:p1"), None);
     }
 
     /// A fake herdr for one subscription. It answers `ack`, writes each chunk after a short pause, and

@@ -91,6 +91,10 @@ pub struct FakePane {
     pub status: String,
     /// Listings since the agent started, while its status is still unknown.
     pub polls: u32,
+    /// The pane's size as herdr's layout reports it; None when herdr has no layout for the pane.
+    pub size: Option<(u32, u32)>,
+    /// The visible screen `pane.read` returns.
+    pub screen: String,
 }
 
 /// Ids are unique across every fake herdr of the process: the bridge's owner records are process-wide.
@@ -203,6 +207,23 @@ impl FakeHerdr {
     pub fn sends(&self) -> Vec<(String, String)> {
         self.state.lock().sends.clone()
     }
+
+    /// Set the pane `terminal_id`'s visible screen and size in one step, so a read sees both or neither.
+    pub fn set_pane(&self, terminal_id: &str, screen: &str, size: (u32, u32)) {
+        let mut st = self.state.lock();
+        if let Some(pane) = st.panes.iter_mut().find(|p| p.terminal_id == terminal_id) {
+            pane.screen = screen.into();
+            pane.size = Some(size);
+        }
+    }
+
+    /// herdr reports no layout for the pane `terminal_id`: its `pane.layout` refuses.
+    pub fn hide_layout(&self, terminal_id: &str) {
+        let mut st = self.state.lock();
+        if let Some(pane) = st.panes.iter_mut().find(|p| p.terminal_id == terminal_id) {
+            pane.size = None;
+        }
+    }
 }
 
 /// The ids of one new pane: a number unique to the process, used in the pane, tab and terminal ids.
@@ -228,6 +249,8 @@ impl FakePane {
             agent: None,
             status: "idle".into(),
             polls: 0,
+            size: Some((80, 24)),
+            screen: String::new(),
         }
     }
 }
@@ -328,6 +351,22 @@ impl Herdr for FakeHerdr {
                 Ok(json!({ "type": "agent_prompted" }))
             }
             "pane.send_keys" => Ok(json!({ "type": "ok" })),
+            "pane.read" => {
+                let pane_id = text("pane_id");
+                let screen = st.pane(&pane_id).map(|p| p.screen.clone()).ok_or_else(|| format!("no pane {pane_id}"))?;
+                Ok(json!({ "type": "pane_read", "read": { "text": screen, "pane_id": pane_id } }))
+            }
+            "pane.layout" => {
+                let pane_id = text("pane_id");
+                let pane = st.pane(&pane_id).ok_or_else(|| format!("no pane {pane_id}"))?;
+                let (cols, rows) = pane.size.ok_or_else(|| "herdr has no layout for that pane".to_string())?;
+                let rect = json!({ "x": 0, "y": 0, "width": cols, "height": rows });
+                Ok(json!({ "type": "pane_layout", "layout": {
+                    "focused_pane_id": pane_id,
+                    "panes": [{ "pane_id": pane_id, "focused": true, "rect": rect }],
+                    "splits": [],
+                } }))
+            }
             other => Err(format!("fake herdr: no answer for {other}")),
         }
     }

@@ -363,12 +363,17 @@ sequenceDiagram
   else running in pane P
     BR-->>App: tab P (agent kind, status)
     App->>BR: terminal.subscribe P (binary stream)
+    BR->>H: pane.layout P (the pane's size, announced as desktop)
     BR->>H: pane.read P (ANSI, recent lines)
     BR-->>App: SnapshotStart / Chunk… / End
     loop every 250 ms while subscribed
       BR->>H: pane.read P
       opt screen changed
         BR-->>App: Output frame (full repaint)
+      end
+      opt every 1 s, pane size changed
+        BR->>H: pane.layout P
+        BR-->>App: resized: SnapshotStart (kind resized) / Chunk… / End
       end
     end
     Note over BR,H: polling because herdr 0.9.1 emits no output event
