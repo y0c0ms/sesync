@@ -997,7 +997,10 @@ mod tests {
     /// A context whose conversations resume through the in-memory herdr `herdr`, and whose lock tool grants
     /// every claim, so a send into a conversation's pane is not refused for a held turn.
     fn resuming_ctx(conversations: Vec<Conversation>, herdr: &Arc<crate::bridge::testkit::FakeHerdr>) -> Ctx {
-        let dir = std::env::temp_dir().join(format!("sesync-rpc-send-{}", std::process::id()));
+        // One directory per call: tests run in parallel, and two staging the same fake tool path race on its symlink.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sesync-rpc-send-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = dir.join("sesync-lock");
         crate::fake_cli::stage(&tool, "#!/bin/sh\nexit 0\n");
