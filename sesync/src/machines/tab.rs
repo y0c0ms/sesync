@@ -195,7 +195,7 @@ mod tests {
     use crate::herdr_open::{shell_line, PaneShell};
 
     fn machine(name: &str) -> Machine {
-        Machine { name: name.into(), endpoint: format!("ws://{name}:6768"), device_token: "t".into(), public_key_b64: "k".into() }
+        Machine { name: name.into(), endpoint: format!("ws://{name}:6768"), device_token: "t".into(), public_key_b64: "k".into(), grant_device_id: None }
     }
 
     #[test]

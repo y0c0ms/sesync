@@ -62,6 +62,7 @@ pub fn ctx_on(conversations: Vec<Conversation>, herdr: Arc<dyn Herdr>, launch: s
         locks: LockTools { sesync_lock: "/nonexistent/sesync-lock".into(), lock_dir: "/nonexistent".into() },
         turns: Turns::default(),
         dir: state_dir.to_path_buf(),
+        machines: state_dir.join("machines.json"),
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),

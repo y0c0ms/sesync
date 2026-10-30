@@ -8,6 +8,7 @@
 pub mod confine;
 pub mod files;
 pub mod git;
+pub mod grants;
 pub mod pins;
 #[cfg(test)]
 pub mod testkit;

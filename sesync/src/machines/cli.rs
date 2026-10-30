@@ -68,7 +68,8 @@ fn attach(path: &Path, name: &str, query: &str, open: bool) -> Result<(), Fail> 
 }
 
 fn remove(path: &Path, name: &str) -> Result<(), Fail> {
-    let machine = store::remove(path, name).map_err(Fail::Failed)?;
+    let machine = store::remove(path, name).map_err(Fail::Failed)?
+        .ok_or_else(|| Fail::Failed(format!("no machine named {name:?}")))?;
     println!("removed {}; its pairing stays valid there until `sesync bridge revoke` on {}", machine.name, machine.name);
     Ok(())
 }

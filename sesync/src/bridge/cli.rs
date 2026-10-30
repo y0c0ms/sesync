@@ -52,13 +52,13 @@ pub struct Sessions {
 
 /// Run one `sesync bridge` command. `dir` is the bridge's state directory; `sessions` is called only by `serve`, so
 /// the other commands never read a session store. `locks` says where sesync-lock is and where its claims live; `serve`
-/// uses it for prompt turns.
-pub fn run(args: &[String], dir: &Path, locks: LockTools, sessions: impl FnOnce() -> Sessions) -> i32 {
+/// uses it for prompt turns. `machines` is `machines.json`, which the `machines.*` RPCs of `serve` keep.
+pub fn run(args: &[String], dir: &Path, machines: &Path, locks: LockTools, sessions: impl FnOnce() -> Sessions) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("pair") => pair(&args[1..], dir),
         Some("devices") => list_devices(&args[1..], dir),
         Some("revoke") => revoke(&args[1..], dir),
-        Some("serve") => serve(&args[1..], dir, sessions(), locks),
+        Some("serve") => serve(&args[1..], dir, machines, sessions(), locks),
         _ => Err(Fail::Usage("expected a command".into())),
     };
     match result {
@@ -81,7 +81,7 @@ fn pair(args: &[String], dir: &Path) -> Result<(), Fail> {
     let label = opts.get("label").cloned().unwrap_or_else(|| "phone".to_string());
 
     let keys = keys::load_or_create(&dir.join("server.key")).map_err(Fail::Failed)?;
-    let (device, token) = devices::create(dir, &label, now_secs()).map_err(Fail::Failed)?;
+    let (device, token) = devices::create(dir, &label, devices::Kind::Phone, devices::now_secs()).map_err(Fail::Failed)?;
     let offer = Offer { endpoint, device_token: token, public_key_b64: keys.public_key_b64() };
 
     println!("paired {label:?} as device {}", device.id);
@@ -105,7 +105,11 @@ fn list_devices(args: &[String], dir: &Path) -> Result<(), Fail> {
         println!("no paired devices");
     }
     for d in list {
-        println!("{}  {:?}  paired at unix time {}", d.id, d.label, d.created);
+        let kind = match d.kind {
+            devices::Kind::Phone => "phone",
+            devices::Kind::Machine => "machine",
+        };
+        println!("{}  {kind}  {:?}  paired at unix time {}", d.id, d.label, d.created);
     }
     Ok(())
 }
@@ -119,7 +123,7 @@ fn revoke(args: &[String], dir: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-fn serve(args: &[String], dir: &Path, sessions: Sessions, locks: LockTools) -> Result<(), Fail> {
+fn serve(args: &[String], dir: &Path, machines: &Path, sessions: Sessions, locks: LockTools) -> Result<(), Fail> {
     let opts = options(
         args,
         &["listen", "allow", "herdr-socket", "ntfy-url", "ntfy-topic", "ntfy-token-command", "usage-every", "omp"],
@@ -145,6 +149,7 @@ fn serve(args: &[String], dir: &Path, sessions: Sessions, locks: LockTools) -> R
         locks,
         turns: Turns::default(),
         dir: dir.to_path_buf(),
+        machines: machines.to_path_buf(),
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
@@ -238,12 +243,6 @@ fn no_arguments(args: &[String]) -> Result<(), Fail> {
         Some(arg) => Err(Fail::Usage(format!("unexpected argument {arg:?}"))),
         None => Ok(()),
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// This machine's name as the phone shows it. The kernel's hostname, else the environment's

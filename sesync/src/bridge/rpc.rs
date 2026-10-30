@@ -10,6 +10,7 @@
 //!   * `files.*` and `git.*`: read-only, confined to the project directory (files.rs, git.rs);
 //!   * `notifications.testPush`: a synthetic in-app notification.
 //!   * `speech.models.list` and `speech.dictation.*`: phone dictation, transcribed by a local whisper server (dictation.rs).
+//!   * `machines.*` and `devices.revoke`: which machines see each other (grants.rs); a machine device is refused them.
 //! Every other method answers `method_not_found`. The app reads that as "not available here" and skips
 //! the read, so the rest of its screens degrade rather than fail.
 
@@ -18,6 +19,8 @@ use super::herdr::{self, Herdr};
 use super::notify;
 use super::dictation::Dictation;
 use super::{confine, files, git, pins};
+use super::devices::Kind;
+use super::grants;
 use super::start;
 use super::stream::{self, Conn};
 use super::terminals::{self, Running};
@@ -69,14 +72,18 @@ pub struct Ctx {
     pub dictation: Dictation,
     /// How this host starts agent sessions (`preflight.detectAgents`, `agentSession.create`).
     pub launch: start::Launch,
+    /// The machines this one may reach: `machines.json` in the sesync config directory, the file the `sesync machine`
+    /// commands read. The `machines.*` RPCs keep it (`grants.rs`).
+    pub machines: PathBuf,
 }
 
 /// A failed request: the error code the phone sees, and its message.
 pub type Failure = (&'static str, String);
 
-/// Answer one decrypted request frame. The reply carries the request's `id`, as the app matches on it.
+/// Answer one decrypted request frame, as a device of kind `caller`: the server passes the kind of the device the
+/// frame was authenticated with (`server.rs`). The reply carries the request's `id`, as the app matches on it.
 /// `None` means a stream took the request over: its first frame was already sent on `conn`.
-pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
+pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn, caller: Kind) -> Option<Value> {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
@@ -111,6 +118,14 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
         "worktree.set" => pins::set(&params, ctx),
         "terminal.clearBuffer" => terminal_clear(&params, ctx),
         "notifications.testPush" => notify::test_push(&params, ctx),
+        "machines.grant" | "machines.accept" | "machines.list" | "machines.forget" | "devices.revoke" if caller == Kind::Machine => {
+            return Some(error(&id, "forbidden", "a machine cannot change which machines see each other; only a phone can"));
+        }
+        "machines.grant" => grants::grant(&params, ctx),
+        "machines.accept" => grants::accept(&params, ctx),
+        "machines.list" => grants::list(ctx),
+        "machines.forget" => grants::forget(&params, ctx),
+        "devices.revoke" => grants::revoke_device(&params, ctx),
         "files.readDir" => files::read_dir(&params, ctx),
         "files.read" => files::read(&params, ctx),
         "files.readPreview" => files::read_preview(&params, ctx),
@@ -607,6 +622,7 @@ mod tests {
             locks: LockTools { sesync_lock: "/nonexistent/sesync-lock".into(), lock_dir: "/nonexistent".into() },
             turns: Turns::default(),
             dir: std::env::temp_dir().join("sesync-rpc-unit"),
+            machines: std::env::temp_dir().join("sesync-rpc-unit").join("machines.json"),
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
@@ -628,6 +644,11 @@ mod tests {
 
     fn req(id: &str, method: &str, params: Value) -> Value {
         json!({ "id": id, "deviceToken": "t", "method": method, "params": params })
+    }
+
+    /// Answers as a paired phone. The machine cases call `super::dispatch` with `Kind::Machine`.
+    fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn) -> Option<Value> {
+        super::dispatch(request, ctx, conn, Kind::Phone)
     }
 
     /// The connection a test dispatches on. Its frames go nowhere; the tests read the reply.
@@ -1075,5 +1096,37 @@ mod tests {
         let (conn, _rx) = conn();
         let reply = dispatch(&req("w", "worktree.ps", json!({})), &c, &conn).unwrap();
         assert_eq!(reply["result"]["worktrees"][0]["conversationAgent"], "omp", "{reply}");
+    }
+
+    #[test]
+    fn a_machine_device_is_refused_the_grant_methods_and_a_phone_is_not() {
+        let dir = crate::bridge::testkit::sandbox("rpc-grant-kinds");
+        let c = crate::bridge::testkit::ctx_with(vec![], &dir);
+        let (conn, _rx) = conn();
+        let key = "zo060cy2M+x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk=";
+        let calls = [
+            ("machines.grant", json!({ "label": "A" })),
+            ("machines.accept", json!({ "name": "b", "endpoint": "ws://127.0.0.1:9", "deviceToken": "t", "publicKeyB64": key, "grantDeviceId": "g" })),
+            ("machines.list", json!({})),
+            ("machines.forget", json!({ "name": "b" })),
+            ("devices.revoke", json!({ "deviceId": "x" })),
+        ];
+        for (method, params) in &calls {
+            let reply = super::dispatch(&req("m", method, params.clone()), &c, &conn, Kind::Machine).unwrap();
+            assert_eq!(reply["id"], "m");
+            assert_eq!(reply["error"]["code"], "forbidden", "{method}: {reply}");
+        }
+        // The same requests from a phone are answered by their own outcomes.
+        let granted = dispatch(&req("g", "machines.grant", json!({ "label": "A" })), &c, &conn).unwrap();
+        assert_eq!(granted["ok"], true, "{granted}");
+        let listed = dispatch(&req("l", "machines.list", json!({})), &c, &conn).unwrap();
+        assert_eq!(listed["result"], json!({ "machines": [] }), "{listed}");
+        let forgot = dispatch(&req("f", "machines.forget", json!({ "name": "b" })), &c, &conn).unwrap();
+        assert_eq!(forgot["error"]["code"], "not_found", "{forgot}");
+        let revoked = dispatch(&req("r", "devices.revoke", json!({ "deviceId": "x" })), &c, &conn).unwrap();
+        assert_eq!(revoked["error"]["code"], "not_found", "{revoked}");
+        let accepted = dispatch(&req("a", "machines.accept", json!({ "name": "b" })), &c, &conn).unwrap();
+        assert_eq!(accepted["error"]["code"], "bad_request", "{accepted}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

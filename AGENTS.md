@@ -121,12 +121,12 @@ HS_E2E=1 sh build-test.sh
   `docs/BRIDGE.md`, flows in `docs/PROCESSES.md`): `server` (WebSocket, allowlist, E2EE handshake),
   `e2ee` (the channel: Orca's NaCl framing, or AES-256-GCM after the hybrid handshake), `hybrid` (X25519 +
   ML-KEM-768 handshake for sesync clients), `net` (allowlist), `rpc` (the served methods), `catalog` (conversations
-  by project directory, read-only), `devices` (hashed device tokens), `offer` (pairing offer v2), `keys`,
+  by project directory, read-only), `devices` (hashed device tokens, each a `phone` or a `machine`), `grants` (the `machines.*` RPCs and `devices.revoke`: the phone decides which machines see each other), `offer` (pairing offer v2), `keys`,
   `herdr` (socket client), `terminals`, `stream` (live terminal screens), `transcript` (chat view),
   `turns` (prompt claims), `start` (new sessions), `approvals`, `notify`, `ntfy`, `usage`, `files`, `git`,
   `pins`, `confine`, `uploads`, `testkit`, `cli`.
 - **Machines** (`machines/`, only `sesync machine …` runs it; commands in `docs/BRIDGE.md`): this machine as a
-  client of other machines' bridges, speaking the phone's protocol. `store` (`machines.json`, owner-only),
+  client of other machines' bridges, speaking the phone's protocol. `store` (`machines.json`, owner-only; each entry's grant device id; the name rule and `sanitize_name`),
   `client` (hello, auth, sealed RPCs), `attach` (a remote pane mirrored in this terminal), `tab` (the TUI's Machines tab: rows and the refresh worker; its state is `app/machines_tab.rs`), `cli`.
 - **Test-only today** (do not wire new features to these without a decision): `team_pull`
   (superseded by `team_pull_verified`), `team_conflict`, `divergence`,

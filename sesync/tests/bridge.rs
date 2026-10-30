@@ -77,6 +77,7 @@ async fn start_with(dir: PathBuf, catalog: Arc<dyn Catalog>, herdr: Arc<dyn herd
             locks: LockTools { sesync_lock: dir.join("no-sesync-lock"), lock_dir: dir.join("locks") },
             turns: Turns::default(),
             dir: dir.clone(),
+            machines: dir.join("machines.json"),
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
@@ -174,7 +175,7 @@ async fn next_text(ws: &mut Ws) -> String {
 
 /// Pair a device in `dir` and return its token.
 fn pair(dir: &Path, label: &str) -> (devices::Device, String) {
-    devices::create(dir, label, 1_000).unwrap()
+    devices::create(dir, label, devices::Kind::Phone, 1_000).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -205,6 +206,7 @@ fn machine_for(b: &Bridge, token: &str) -> sesync::machines::store::Machine {
         endpoint: format!("ws://{}", b.addr),
         device_token: token.into(),
         public_key_b64: STANDARD.encode(b.server_public.as_bytes()),
+        grant_device_id: None,
     }
 }
 
@@ -1039,6 +1041,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
         locks: LockTools { sesync_lock: herdr.home.join("no-sesync-lock"), lock_dir: herdr.home.join("locks") },
         turns: Turns::default(),
         dir: dir.clone(),
+        machines: dir.join("machines.json"),
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
@@ -1601,6 +1604,7 @@ async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane
         locks: LockTools { sesync_lock: lock, lock_dir: fx.sb.join("locks") },
         turns: Turns::default(),
         dir: bridge_dir.clone(),
+        machines: bridge_dir.join("machines.json"),
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
@@ -1718,6 +1722,7 @@ async fn dictation_bridge(name: &str, whisper: Whisper) -> Bridge {
         locks: LockTools { sesync_lock: dir.join("no-sesync-lock"), lock_dir: dir.join("locks") },
         turns: Turns::default(),
         dir: dir.clone(),
+        machines: dir.join("machines.json"),
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
@@ -1798,4 +1803,78 @@ async fn a_slow_whisper_times_out_over_the_encrypted_link() {
     let finished = phone.rpc_params(&token, "f", "speech.dictation.finish", json!({ "dictationId": "d3" })).await;
     assert_eq!(finished["error"]["code"], "unavailable", "{finished}");
     assert!(finished["error"]["message"].as_str().unwrap_or_default().contains("timed out"), "{finished}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_phone_grants_a_machine_a_link_and_taking_it_back_stops_that_link() {
+    use sesync::machines::{client, store};
+    // Two bridges, a phone on each. The phone on B grants A a link, the phone on A accepts it, and A's machine client
+    // reads B. Taking the link back on both sides stops that same client; a machine device cannot grant anything.
+    let a = start("grant-a", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;
+    let b = start("grant-b", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;
+    let (_, phone_a) = pair(&a.dir, "phone");
+    let (phone_b_device, phone_b) = pair(&b.dir, "phone");
+    let mut on_a = Phone::hello(&a, 9).await;
+    assert_eq!(on_a.auth(&phone_a).await, json!({ "type": "e2ee_authenticated" }));
+    let mut on_b = Phone::hello(&b, 10).await;
+    assert_eq!(on_b.auth(&phone_b).await, json!({ "type": "e2ee_authenticated" }));
+
+    // A names B as B names itself: status.get's machineName, cut to the store's rule.
+    let status = on_b.rpc(&phone_b, "s", "status.get").await;
+    let name = store::sanitize_name(status["result"]["machineName"].as_str().unwrap());
+    assert_eq!(name, "test-box");
+
+    let granted = on_b.rpc_params(&phone_b, "g", "machines.grant", json!({ "label": "a-box" })).await;
+    assert_eq!(granted["ok"], true, "{granted}");
+    let grant_id = granted["result"]["deviceId"].as_str().unwrap().to_string();
+    let grant_token = granted["result"]["deviceToken"].as_str().unwrap().to_string();
+    assert_eq!(granted["result"]["publicKeyB64"], STANDARD.encode(b.server_public.as_bytes()));
+    let kind = devices::list(&b.dir).unwrap().into_iter().find(|d| d.id == grant_id).unwrap().kind;
+    assert_eq!(kind, devices::Kind::Machine);
+
+    let accepted = on_a.rpc_params(&phone_a, "acc", "machines.accept", json!({
+        "name": name,
+        "endpoint": format!("ws://{}", b.addr),
+        "deviceToken": grant_token,
+        "publicKeyB64": granted["result"]["publicKeyB64"],
+        "grantDeviceId": grant_id,
+    })).await;
+    assert_eq!(accepted["result"], json!({ "name": "test-box", "answers": true }), "{accepted}");
+
+    let listed = on_a.rpc_params(&phone_a, "l", "machines.list", json!({})).await;
+    assert_eq!(
+        listed["result"]["machines"],
+        json!([{ "name": "test-box", "endpoint": format!("ws://{}", b.addr), "grantDeviceId": grant_id }]),
+        "{listed}"
+    );
+    assert!(!listed.to_string().contains(&grant_token), "the list never carries a token");
+
+    // A's `sesync machine` client reads B with the saved entry.
+    let saved = store::load(&a.dir.join("machines.json")).unwrap().into_iter().find(|m| m.name == "test-box").unwrap();
+    assert_eq!(saved.grant_device_id.as_deref(), Some(grant_id.as_str()));
+    let (mut writer, mut reader) = client::connect(&saved).await.expect("the granted machine authenticates");
+    let rows = client::call(&mut writer, &mut reader, "worktree.ps", json!({})).await.unwrap();
+    assert_eq!(rows["worktrees"], json!([]));
+    // As a machine device it cannot mint access for another machine, over the wire.
+    let refused = client::call(&mut writer, &mut reader, "machines.grant", json!({ "label": "third" })).await.unwrap_err();
+    assert!(refused.starts_with("forbidden"), "{refused}");
+    let refused = client::call(&mut writer, &mut reader, "devices.revoke", json!({ "deviceId": phone_b_device.id })).await.unwrap_err();
+    assert!(refused.starts_with("forbidden"), "{refused}");
+
+    // The phone on B cannot revoke a phone through the grant method.
+    let not_a_grant = on_b.rpc_params(&phone_b, "rp", "devices.revoke", json!({ "deviceId": phone_b_device.id })).await;
+    assert_eq!(not_a_grant["error"]["code"], "forbidden", "{not_a_grant}");
+
+    // Taking the link back: A forgets it and returns the grant id; B revokes that device.
+    let forgot = on_a.rpc_params(&phone_a, "f", "machines.forget", json!({ "name": "test-box" })).await;
+    assert_eq!(forgot["result"], json!({ "grantDeviceId": grant_id }), "{forgot}");
+    let revoked = on_b.rpc_params(&phone_b, "r", "devices.revoke", json!({ "deviceId": grant_id })).await;
+    assert_eq!(revoked["result"], json!({ "revoked": true }), "{revoked}");
+
+    // The same client is refused on its next frame, and a new connection with the saved entry cannot authenticate.
+    let after = client::call(&mut writer, &mut reader, "worktree.ps", json!({})).await.unwrap_err();
+    assert!(after.starts_with("unauthorized"), "{after}");
+    let again = client::connect(&saved).await.err().expect("a revoked grant is refused at auth");
+    assert!(again.contains("refused"), "{again}");
+    assert!(store::load(&a.dir.join("machines.json")).unwrap().is_empty());
 }

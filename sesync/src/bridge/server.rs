@@ -6,9 +6,9 @@
 //!      stream (terminal, tabs, status); the stream's frames are sent on the same connection, through the
 //!      one writer task, so frames from streams and replies never interleave mid-frame.
 //! A peer outside the allowlist is dropped before step 1. A token is checked on every frame, so a
-//! revoked device is refused on its next frame.
+//! revoked device is refused on its next frame. A machine device may use every method but the grant ones (`grants.rs`).
 
-use super::devices;
+use super::devices::{self, Kind};
 use super::e2ee::{self, Channel, Side};
 use super::hybrid;
 use super::keys::ServerKeys;
@@ -139,9 +139,10 @@ async fn serve_requests(
     shared: &Arc<Shared>,
     peer: SocketAddr,
 ) -> Result<(), String> {
-    let mut authed = false;
+    // The kind of the device this connection authenticated with; None until it does.
+    let mut authed: Option<Kind> = None;
     loop {
-        let limit = if authed { None } else { Some(HANDSHAKE_TIMEOUT) };
+        let limit = if authed.is_some() { None } else { Some(HANDSHAKE_TIMEOUT) };
         let Some(frame) = next_text(rx, limit).await? else { return Ok(()) };
         // An undecryptable frame is dropped, not answered: it proves nothing about the peer.
         let Some(plain) = channel.open(&frame) else { continue };
@@ -156,10 +157,15 @@ async fn serve_requests(
         };
         let token = msg.get("deviceToken").and_then(Value::as_str).unwrap_or("");
 
-        if !authed {
-            if msg.get("type") == Some(&json!("e2ee_auth")) && devices::verify(&shared.dir, token) {
-                authed = true;
-                eprintln!("bridge: {peer} authenticated");
+        if authed.is_none() {
+            let kind = if msg.get("type") == Some(&json!("e2ee_auth")) {
+                devices::authenticate(&shared.dir, token)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                authed = Some(kind);
+                eprintln!("bridge: {peer} authenticated ({kind:?} device)");
                 if !sink.json(&json!({ "type": "e2ee_authenticated" })) {
                     return Ok(());
                 }
@@ -172,18 +178,22 @@ async fn serve_requests(
             return Ok(());
         }
 
-        if !devices::verify(&shared.dir, token) {
+        // The token is checked on every frame: a revoked device is refused on its next frame.
+        let Some(frame_kind) = devices::authenticate(&shared.dir, token) else {
             let id = msg.get("id").cloned().unwrap_or(Value::Null);
             sink.json(&rpc::error(&id, "unauthorized", "this device is not paired"));
             eprintln!("bridge: {peer} is no longer paired; closed");
             sink.close(UNAUTHORIZED_CLOSE, "unauthorized");
             return Ok(());
-        }
+        };
+        // A machine on the connection or on the frame makes the request a machine's: a machine cannot use another
+        // device's token to mint access (grants.rs).
+        let caller = if authed == Some(Kind::Machine) || frame_kind == Kind::Machine { Kind::Machine } else { Kind::Phone };
 
         // Catalog and herdr reads touch the disk and the socket; keep them off the reactor.
         let ctx = shared.ctx.clone();
         let conn = Arc::clone(conn);
-        let reply = tokio::task::spawn_blocking(move || rpc::dispatch(&msg, &ctx, &conn))
+        let reply = tokio::task::spawn_blocking(move || rpc::dispatch(&msg, &ctx, &conn, caller))
             .await
             .map_err(|e| e.to_string())?;
         if let Some(reply) = reply {

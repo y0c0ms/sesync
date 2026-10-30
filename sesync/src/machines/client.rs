@@ -61,7 +61,7 @@ pub async fn connect(machine: &Machine) -> Result<(Writer, Reader), String> {
     match tokio::time::timeout(STEP, reader.next()).await {
         Ok(Ok(Some(reply))) if reply["type"] == "e2ee_authenticated" => Ok((writer, reader)),
         Ok(Ok(Some(_))) | Ok(Ok(None)) => Err(format!(
-            "{} refused this machine's pairing (revoked there?); pair again with `sesync bridge pair` on it",
+            "{} refused this machine's pairing (revoked there?); pair it again there with `sesync bridge pair`, or grant it from the phone",
             machine.name
         )),
         Ok(Err(e)) => Err(e),

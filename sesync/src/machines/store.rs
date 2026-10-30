@@ -1,10 +1,18 @@
-//! The machines this one may reach: `<config>/machines.json`, one entry per name, each a pairing that the
-//! other machine's bridge made (`sesync bridge pair`). The device token is a credential, so the file is
-//! written owner-only and atomically, as the bridge's own key files are.
+//! The machines this one may reach: `<config>/machines.json`, one entry per name, each a pairing that the other
+//! machine's bridge made: by hand (`sesync bridge pair`, then `sesync machine add`), or granted by the phone
+//! (`machines.grant` there, `machines.accept` here, which also keeps the grant's device id). The device token is a
+//! credential, so the file is written owner-only and atomically, as the bridge's own key files are. Writes made in
+//! this process are serialised: the bridge's connections run on blocking threads at once.
 
 use crate::bridge::offer::Offer;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// The longest machine name.
+const NAME_MAX: usize = 32;
+/// What a machine is called when its own name leaves nothing usable.
+const FALLBACK_NAME: &str = "machine";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -13,11 +21,22 @@ pub struct Machine {
     pub endpoint: String,
     pub device_token: String,
     pub public_key_b64: String,
+    /// The id of the `machine` device the other bridge granted for this entry (`machines.grant`), so the phone can
+    /// revoke it there. None for a pairing added by hand, and for a file written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_device_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct File {
     machines: Vec<Machine>,
+}
+
+/// Serialises this process's read-modify-write of `machines.json`.
+static WRITES: Mutex<()> = Mutex::new(());
+
+fn writing() -> MutexGuard<'static, ()> {
+    WRITES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Every machine saved. A missing file is an empty list.
@@ -36,41 +55,70 @@ fn save(path: &Path, machines: Vec<Machine>) -> Result<(), String> {
     crate::bridge::write_owner_only(path, text.as_bytes())
 }
 
-/// Save `offer` under `name`, replacing a machine of that name. True when one was replaced.
-pub fn add(path: &Path, name: &str, offer: &Offer) -> Result<bool, String> {
-    check_name(name)?;
+/// Save `machine` under its name, replacing a machine of that name. True when one was replaced. The name must be
+/// one `check_name` accepts.
+pub fn put(path: &Path, machine: Machine) -> Result<bool, String> {
+    check_name(&machine.name)?;
+    let _writing = writing();
     let mut machines = load(path)?;
     let before = machines.len();
-    machines.retain(|m| m.name != name);
+    machines.retain(|m| m.name != machine.name);
     let replaced = machines.len() != before;
-    machines.push(Machine {
-        name: name.to_string(),
-        endpoint: offer.endpoint.clone(),
-        device_token: offer.device_token.clone(),
-        public_key_b64: offer.public_key_b64.clone(),
-    });
+    machines.push(machine);
     save(path, machines)?;
     Ok(replaced)
 }
 
-/// Forget `name`; returns what was removed. Its device stays paired on the other machine until revoked there.
-pub fn remove(path: &Path, name: &str) -> Result<Machine, String> {
-    let mut machines = load(path)?;
-    let index = machines.iter().position(|m| m.name == name).ok_or_else(|| format!("no machine named {name:?}"))?;
-    let removed = machines.remove(index);
-    save(path, machines)?;
-    Ok(removed)
+/// Save `offer` under `name` as a pairing made by hand, replacing a machine of that name. True when one was replaced.
+pub fn add(path: &Path, name: &str, offer: &Offer) -> Result<bool, String> {
+    put(path, Machine {
+        name: name.to_string(),
+        endpoint: offer.endpoint.clone(),
+        device_token: offer.device_token.clone(),
+        public_key_b64: offer.public_key_b64.clone(),
+        grant_device_id: None,
+    })
 }
 
-/// A name is what the commands and the TUI show: 1 to 32 of letters, digits, `-`, `_` and `.`.
-fn check_name(name: &str) -> Result<(), String> {
+/// Forget the machine called `name` and return it, or None when no machine has that name. Its device stays paired on
+/// the other machine until it is revoked there.
+pub fn remove(path: &Path, name: &str) -> Result<Option<Machine>, String> {
+    let _writing = writing();
+    let mut machines = load(path)?;
+    let Some(index) = machines.iter().position(|m| m.name == name) else {
+        return Ok(None);
+    };
+    let removed = machines.remove(index);
+    save(path, machines)?;
+    Ok(Some(removed))
+}
+
+/// A machine name is what the commands, the TUI and the phone show: 1 to 32 of letters, digits, `-`, `_` and `.`.
+pub fn check_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
-        && name.len() <= 32
+        && name.len() <= NAME_MAX
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if ok {
         Ok(())
     } else {
         Err(format!("{name:?}: a machine name is 1 to 32 letters, digits, '-', '_' or '.'"))
+    }
+}
+
+/// The name a machine has for another, from the first machine's `machineName` (`status.get`). Each character outside
+/// `[A-Za-z0-9._-]` becomes `-`; the result is cut to 32 characters, then its leading and trailing `-` are trimmed; a
+/// name with nothing left is `machine`. The result always passes `check_name`. The phone mirrors this rule in TS.
+pub fn sanitize_name(machine_name: &str) -> String {
+    let mapped: String = machine_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .take(NAME_MAX)
+        .collect();
+    let trimmed = mapped.trim_matches('-');
+    if trimmed.is_empty() {
+        FALLBACK_NAME.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -97,8 +145,8 @@ mod tests {
         assert!(add(&path, "work-pc", &offer("ws://10.10.20.9:6768")).unwrap(), "same name replaces");
         let names: Vec<_> = load(&path).unwrap().into_iter().map(|m| (m.name, m.endpoint)).collect();
         assert_eq!(names, [("laptop".to_string(), "ws://10.10.20.6:6768".to_string()), ("work-pc".into(), "ws://10.10.20.9:6768".into())]);
-        assert_eq!(remove(&path, "laptop").unwrap().name, "laptop");
-        assert!(remove(&path, "laptop").is_err());
+        assert_eq!(remove(&path, "laptop").unwrap().unwrap().name, "laptop");
+        assert!(remove(&path, "laptop").unwrap().is_none());
         assert_eq!(load(&path).unwrap().len(), 1);
         #[cfg(unix)]
         {
@@ -115,5 +163,49 @@ mod tests {
         for bad in ["", "has space", "a/b", &"x".repeat(33)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_grant_id_is_kept_and_an_older_file_without_one_loads() {
+        let dir = std::env::temp_dir().join(format!("sesync-machines-grant-{}", std::process::id()));
+        let path = dir.join("machines.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"machines":[{"name":"old","endpoint":"ws://h:6768","deviceToken":"t","publicKeyB64":"k"}]}"#).unwrap();
+        assert_eq!(load(&path).unwrap()[0].grant_device_id, None, "no field is a hand-made pairing");
+        put(&path, Machine {
+            name: "granted".into(),
+            endpoint: "ws://g:6768".into(),
+            device_token: "t2".into(),
+            public_key_b64: "k2".into(),
+            grant_device_id: Some("0a1b2c".into()),
+        })
+        .unwrap();
+        let granted = load(&path).unwrap().into_iter().find(|m| m.name == "granted").unwrap();
+        assert_eq!(granted.grant_device_id.as_deref(), Some("0a1b2c"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"grantDeviceId\": \"0a1b2c\""), "{text}");
+        assert!(!text.contains("\"grantDeviceId\": null"), "a hand-made entry writes no grant field: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sanitised_name_always_passes_the_name_rule() {
+        let cases = [
+            ("work-pc", "work-pc"),
+            ("  my laptop  ", "my-laptop"),
+            ("héllo wörld", "h-llo-w-rld"),
+            ("", "machine"),
+            ("---", "machine"),
+            ("ok.name_1", "ok.name_1"),
+        ];
+        for (raw, want) in cases {
+            let got = sanitize_name(raw);
+            assert_eq!(got, want, "{raw:?}");
+            assert!(check_name(&got).is_ok(), "{got:?}");
+        }
+        let long = sanitize_name(&format!("{}-tail", "x".repeat(31)));
+        assert_eq!(long, "x".repeat(31), "cut to 32, then the trailing '-' is trimmed");
+        assert!(check_name(&sanitize_name(&"é".repeat(40))).is_ok());
     }
 }

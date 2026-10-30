@@ -17,7 +17,7 @@ Orca is MIT-licensed (stablyai/orca). Its protocol is read from the source at th
 |---|---|
 | `sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]` | Pairs a new device. Prints the pairing offer (v2 JSON), the `agenthub://pair?code=` URL and a terminal QR. The device token is in that output and nowhere else. |
 | `sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,…] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]` | Serves in the foreground until Ctrl-C. Defaults: `0.0.0.0:6768`, allowed networks `10.10.20.0/24,192.168.1.0/24,127.0.0.0/8`, herdr socket `$HERDR_SOCKET_PATH` else `$HOME/.config/herdr/herdr.sock`, ntfy `http://192.168.100.178:30181` topic `agents`, plan usage every 600 s from `omp`. |
-| `sesync bridge devices` | Lists paired devices: id, label, creation time. Never prints tokens. |
+| `sesync bridge devices` | Lists paired devices: id, kind (`phone` or `machine`), label, creation time. Never prints tokens. |
 | `sesync bridge revoke <device-id>` | Removes a device. Its token is refused on the next frame, with no restart. |
 
 `--endpoint` defaults to `ws://10.10.20.3:6768`, this machine's WireGuard mesh address. The phone
@@ -46,7 +46,7 @@ conversations of the others. Plan for the TUI tab and for the phone deciding whi
 | `sesync machine remove <name>` | Forgets the machine here. Its device stays paired there until `sesync bridge revoke` on it. |
 
 `machines.json` sits in `$SESYNC_CONFIG_DIR` (default `~/.config/sesync/`), `0600`, written atomically: it holds
-each machine's endpoint, public key and device token. Attach reads the JSON terminal stream (full repaints), draws
+each machine's endpoint, public key and device token, and for a granted link the id of its grant (`grantDeviceId`; null for a pairing made by hand). Attach reads the JSON terminal stream (full repaints), draws
 each repaint cut to the window with the bottom rows kept and autowrap off (the remote pane keeps its own size, as on
 the phone), and sends keys as `terminal.send` text, as the phone's terminal keyboard does: Enter there is typing,
 not a prompt turn, so it takes no conversation claim. A machine connects with the hybrid handshake (Framing below):
@@ -61,13 +61,26 @@ says that `o` opens it, and `o` runs the same tab with `--open`. herdr starts a 
 is given this run's `SESYNC_CONFIG_DIR` (the machines it reads are the same). With no herdr answering, the status line
 says so and no tab starts.
 
+### Machines the phone grants
+
+The phone decides which machines see each other (`~/projects/agent-hub-notes/machines-plan-2026-10-30.md`, step 3). In the phone's Settings → Machines, each paired host A has an "A can see" section with one switch per other host B. Switching it on:
+
+1. On B: `machines.grant {label: <A's name>}` → `{deviceId, deviceToken, publicKeyB64}`. B makes a `machine` device labelled with A's name.
+2. On A: `machines.accept {name: <B's name>, endpoint, deviceToken, publicKeyB64, grantDeviceId: deviceId}`, with the endpoint the phone dials for B. A saves B in `machines.json` with the grant id, then asks B for `status.get`. `answers` says whether B answered and `error` why not; the phone shows both under the switch. The save stands either way.
+
+Switching it off: `machines.forget {name: <B's name>}` on A (it returns `grantDeviceId`), then `devices.revoke {deviceId: grantDeviceId}` on B when that is not null. A's client is refused on its next frame. A host that is offline shows its section disabled. A bridge that answers `method_not_found` for these methods is one that predates them: the phone says to update sesync on that machine.
+
+A machine's name for another is that machine's `machineName` from `status.get`, cut to the store's rule (`machines::store::sanitize_name`, which the phone mirrors): each character outside `[A-Za-z0-9._-]` becomes `-`, the result is cut to 32 characters, its leading and trailing `-` are trimmed, and an empty result is `machine`. `machines.accept` checks a name against the same rule (`bad_request` otherwise) and does not trust the phone's copy.
+
+A granted machine connects and authenticates as a phone does, with the hybrid handshake and the token in `machines.json`, and reads and drives the bridge the same way. It is refused the five grant methods (`forbidden`): a machine cannot grant or forget a link. Granting a machine a name it already has replaces that entry on A; the earlier grant's device stays on B until the phone revokes it there.
+
 ## Files
 
 Under `$SESYNC_CONFIG_DIR/bridge/` (default `~/.config/sesync/bridge/`). The directory is `0700`.
 
 - `server.key`: `0600`. The bridge's X25519 secret, base64. Created on first use, never replaced
   silently (a new key would strand every paired phone). The public key is derived from it.
-- `devices.json`: `0600`. Per device: `id`, `label`, `created` (unix seconds), `token_sha256`.
+- `devices.json`: `0600`. Per device: `id`, `label`, `created` (unix seconds), `token_sha256`, and `kind`: `phone` (paired by `sesync bridge pair`) or `machine` (granted by `machines.grant`). A record without `kind` is a phone, so a store written before the field still loads.
   The token itself is never stored: it is 256 random bits, and only its SHA-256 is kept.
 - `pins.json`: `0600`. The pinned conversations (`worktree.set`) as `{"pinned":["<worktree id>", …]}`. A
   damaged file fails the next pin write rather than being replaced.
@@ -149,12 +162,18 @@ Served methods:
 | `speech.dictation.chunk` `{dictationId, audioBase64, sampleRate}` | `{dictationId}`: 16 kHz mono PCM, s16le, at most 5 s per chunk. |
 | `speech.dictation.finish` `{dictationId}` | `{dictationId, text}`: `[TRANSCRIBED] <text>`, or `""` when nothing was heard. |
 | `speech.dictation.cancel` `{dictationId}` | `{dictationId}`. A no-op unless this phone holds that dictation. |
+| `machines.grant` `{label}` | `{deviceId, deviceToken, publicKeyB64}`: a new `machine` device labelled `label` (the granted machine's name for this one), and this bridge's public key. See Machines the phone grants. |
+| `machines.accept` `{name, endpoint, deviceToken, publicKeyB64, grantDeviceId}` | `{name, answers, error?}`: saves that machine in this machine's `machines.json`, replacing one of the same name, then asks it for `status.get` over the hybrid handshake (10 s at most). `answers` is false, with `error`, when it does not answer; the save stands. `bad_request` for an invalid name, endpoint or key. |
+| `machines.list` | `{machines:[{name, endpoint, grantDeviceId}]}`: the saved machines, never their tokens. `grantDeviceId` is null for a pairing made by hand. |
+| `machines.forget` `{name}` | `{grantDeviceId}`: removes that machine; `not_found` for an unknown name. |
+| `devices.revoke` `{deviceId}` | `{revoked:true}`: removes a `machine` device; `forbidden` for a phone device, `not_found` for an unknown id. |
 
 Every other method, including the structured `agentSession.*` calls (`send`, `currentRequests`, `respondToApproval`, `respondToQuestion`, `create`, `createSupport`) and `worktree.create` and `agent.launch`, answers `error.code: "method_not_found"` with the request's `id`. Terminal-backed chat never calls them: its prompts ride `terminal.send`, its cards ride `interactivePrompt`, and new sessions ride `session.tabs.createTerminal` (the app falls through when `agentSession.create` is refused). Orca reads that as
 "not available here" (`isMobileMethodUnavailableError`) and skips the read. Errors the bridge raises:
 `bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
 reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read, a chat's transcript cannot be converted, or the speech server cannot transcribe a dictation),
 `send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder),
+`forbidden` (a machine device calls a grant method, or `devices.revoke` names a phone), and `not_found` for an unknown machine name or device id.
 `not_running_agent` (the conversation's tab is left with a shell) and `agent_waiting_on_prompt` (the pane is blocked on a prompt), both refused before anything is typed,
 `agent_not_started` (a create's agent did not come up),
 `invalid_relative_path`, `not_found`, `binary_file`, `file_too_large`, `not_a_file`, `not_a_directory` and
@@ -289,12 +308,13 @@ The client refuses an `e2ee_ready` without the ciphertext (a bridge that speaks 
   read the files under each conversation's project directory and that repository's git status, diffs,
   history and branch comparisons (see Files and source control), and any PNG, JPEG, GIF or WebP image on the
   host by its absolute path (see Images). Nothing else from the session stores is
-  sent. Its only writes are `server.key`, `devices.json`, `pins.json`, the sesync-lock claims for prompt
-  turns, and the upload staging.
+  sent. Its only writes are `server.key`, `devices.json`, `pins.json`, `machines.json` (the grants, see Machines the phone grants),
+  the sesync-lock claims for prompt turns, and the upload staging.
 - **Notifications and push.** The ntfy publish token is read once at startup and held in memory; it is never logged or written. Publishing is best effort on a detached thread: a failure is logged without the token and never blocks a notification.
 - **Uploads.** Staged images live under `$SESYNC_CONFIG_DIR/bridge/uploads/<conversation>/` (directory `0700`, files `0600`), at most 20 MB decoded per image, and must start with a PNG, JPEG, GIF or WEBP signature. An upload that is refused or idle for 5 minutes is removed.
 - **Approval keys.** A paired phone can answer an approval by typing its key into the pane (`terminal.send` with `enter:false`): the same reach as typing into the pane.
-- **Not done yet:** per-device permissions (a paired phone has every method above), rate limiting,
+- **A paired phone decides which machines see each other.** `machines.grant`, `machines.accept`, `machines.forget` and `devices.revoke` link this machine to another machine's bridge, or take the link back. A granted link is a `machine` device on this bridge: the other machine reads and drives this bridge as the phone does (every method but the grant ones), and its token stops working on its next frame when the phone takes the link back. A machine device is refused the grant methods (`forbidden`), so a granted machine cannot give access to a third. Only a phone's `machines.accept` writes a machine's entry into `machines.json`.
+- **Not done yet:** per-device permissions beyond the device kind (a phone has every method above; a machine device has them all but the grant methods), rate limiting,
   audit logging beyond connect/refuse lines, a revocation UI, key rotation for `server.key`, and a
   read-only mode.
 
@@ -398,6 +418,7 @@ The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`,
   stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
   named and a timed release), the RPC dispatch against canned herdr answers, the pane fallback rules (the tag, the title and directory, ambiguity, and that an argv or owner match is never overridden), and the chat conversions (cached per source state, replaced when it moves, owner-only).
 - `src/bridge/pins.rs`: pins survive a reload, the file is owner-only, a damaged file fails the write and is left alone, `isPinned` must be a boolean, and no other field is accepted. `rpc.rs` tests: the pin shows on the worktree row, `terminal.clearBuffer` sends Ctrl-L and reports a missing pane, write verbs and unserved methods answer `method_not_found`, and every read method is routed. `notify.rs`: a test push reaches a live stream, is kept out of the history, and is refused with no stream.
+- `src/bridge/devices.rs`: a token's kind, a record without `kind` loads as a phone, an unknown kind denies every token, the machine-only revoke refuses a phone and an unknown id. `src/bridge/grants.rs`: grant, accept (saved even when the machine does not answer), forget (returns the grant id), list (no tokens), refusals of bad names, endpoints and keys. `rpc.rs`: a machine device is refused the five grant methods and a phone is not. `machines/store.rs`: the grant id round-trips and an older `machines.json` loads, and `sanitize_name` always passes the name rule. `tests/bridge.rs` `a_phone_grants_a_machine_a_link_and_taking_it_back_stops_that_link`: two in-process bridges, grant, accept, A's machine client reads B, a machine device is refused over the wire, forget and revoke, and the same client is refused.
 - `src/bridge/dictation.rs`: the WAV and multipart shapes, the owner and lifetime rules, every refusal (oversize chunk and recording included), and the whisper outcomes (success, HTTP error, no `text`, timeout, unreachable). `tests/bridge.rs`: a dictation round trip over the encrypted link, a 503 and an oversize chunk, and a timeout. One `#[ignore]`d test hits the live server with `SESYNC_LIVE_WAV`.
 - `src/bridge/confine.rs`, `files.rs`, `git.rs`: the path confinement (`..`, absolute paths, NUL, `.git`, a symlink that leaves the project or enters `.git`), the size caps, the `.gitignore`-honouring search, the git allowlist (every other verb and each unlisted option is refused before git starts, and a write verb leaves the repository unchanged), and reads of real files and a real `git init` repository in a sandbox. `rpc.rs` also runs a live repository through dispatch.
 - `src/bridge/e2ee.rs` pins the NaCl framing against a tweetnacl vector (both directions, and the
