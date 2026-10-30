@@ -323,6 +323,7 @@ fn the_last_tab_and_theme_come_back_on_the_next_run() {
     assert!(a.take_prefs_dirty(), "switching the tab is a taste change");
     assert!(sesync::app::prefs::save(&config, "textual (dark)", a.view()).is_ok(),
         "the caller persists the taste");
+    a.handle(Ev::Tab, Instant::now()); // on to the machines
     a.handle(Ev::Tab, Instant::now()); // back to sessions
     assert_eq!(a.view(), View::Sessions);
     a.restore_prefs(None, Some(View::Team));

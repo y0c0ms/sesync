@@ -3,6 +3,15 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-30: Machines tab in the TUI (branch machines-tui, step 2 of machines-plan-2026-10-30)
+
+- **Why.** The TUI shows every saved machine and its conversations, and opens one of them in a herdr tab, as the phone does.
+- **What changed.** A third tab, Machines: tab cycles Sessions, Team, Machines; `tui.json` keeps `machines`. `machines/tab.rs` builds the rows (a header per machine: `loading…` or `unreachable: <reason>`, then its conversations; state is the first open pane's, else `closed`) and runs the refresh worker (each machine asked at once, 8 s timeout, every 5 s while the tab is shown, ctrl+r now). `app/machines_tab.rs`: Enter opens a herdr tab labelled `<machine> · <title>` running `sesync machine attach <machine> <worktree id>`; on a closed row Enter says `o` opens it, and `o` adds `--open`. `herdr_open::Herdr::create_tab_with_env` passes `SESYNC_CONFIG_DIR` with the tab, because herdr does not give a new tab the caller's environment (without it the attach read `~/.config/sesync`).
+- **Tests.** `machines::tab` unit tests: rows (first pane's state, closed rows, unreachable and loading headers), attach argv for Enter and `o`, quoted for Posix and PowerShell. `tests/machines_tab.rs`: the chosen tab is remembered. The tab cycle is in `tests/tui_views.rs`. Tests that toggled two tabs now walk three (`tests/app.rs`, `tests/team_tab.rs`, `tests/tui_views.rs`). `build-test.sh` passes in the sandbox.
+- **Smoke** (throwaway bridge on 127.0.0.1:17768, config and state in /tmp). The Machines tab listed `local` with its conversations. Enter on `Main agent` opened a herdr tab whose pane mirrored it with the status `local · Main agent — Ctrl-] detaches`; Ctrl-] detached it. Enter on a closed row said `o` opens it. With the bridge stopped the header read `unreachable: … Connection refused`.
+- **Not verified.** `o` on a real closed conversation (its argv is tested, not run). Windows attach. The palette's "Refresh team" entry keeps its name (tests assert it) and on the Machines tab refreshes the machines.
+- **Next.** Step 3 (the phone grants machine-to-machine links) and the hybrid handshake (agent-hub #6) before machines link without a hand-made pairing.
+
 ## 2026-10-28: phone "create a tab" resumes the conversation (branch sesync-release)
 
 - **Why.** On a real phone, closing a conversation's herdr tab and creating one from the session screen started a fresh omp; the bridge bound that pane to the conversation, so the phone showed the old history while "Hi" went into a new session.

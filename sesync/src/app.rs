@@ -17,6 +17,7 @@ use crate::team_compare::Compared;
 use crate::team_watch::TeamCopy;
 
 mod team_tab;
+mod machines_tab;
 pub use team_tab::{Choice, PendingReplace, Resolve, RowState, Side, TeamRow};
 
 /// How long an informational status message stays before the view fades it. Failures stay.
@@ -46,6 +47,7 @@ pub mod prefs {
             view: match v.get("view").and_then(|t| t.as_str()) {
                 Some("team") => Some(View::Team),
                 Some("sessions") => Some(View::Sessions),
+                Some("machines") => Some(View::Machines),
                 _ => None,
             },
         }
@@ -58,7 +60,7 @@ pub mod prefs {
         }
         let v = json!({
             "theme": theme_name,
-            "view": match view { View::Sessions => "sessions", View::Team => "team" },
+            "view": match view { View::Sessions => "sessions", View::Team => "team", View::Machines => "machines" },
         });
         std::fs::write(&file, serde_json::to_vec_pretty(&v)?)?;
         Ok(())
@@ -151,11 +153,12 @@ impl FormView {
     }
 }
 
-/// Which list the main pane shows. The two tabs have separate cursors.
+/// Which list the main pane shows. Each tab keeps its own cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Sessions,
     Team,
+    Machines,
 }
 
 /// The `f` cycle on the Sessions tab: which subset of sessions is listed.
@@ -377,6 +380,8 @@ pub struct App {
     leave_cursor: usize,
     leave_armed: Option<usize>,
     leave_request: Option<LeaveRequest>,
+    /// The Machines tab: the saved machines, their last answers, the cursor and an attach waiting to run.
+    machines_tab: machines_tab::MachinesTab,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -485,6 +490,7 @@ impl App {
             leave_cursor: 0,
             leave_armed: None,
             leave_request: None,
+            machines_tab: Default::default(),
         }
     }
 
@@ -761,7 +767,8 @@ impl App {
                     }
                     f
                 }
-                View::Team => "i import · enter resolve · ctrl+r pull · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
+                View::Team => "i import · enter resolve · ctrl+r pull · ? help · ctrl+p cmds · tab machines · q quit".to_string(),
+                View::Machines => "enter attach · o attach, opening a closed one · ctrl+r refresh · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
             },
         }
     }
@@ -1470,13 +1477,11 @@ impl App {
         match ev {
             // Local refresh needs no network: re-list the files so a rename made in the harness
             // itself appears. The team refresh needs the server client, which the caller supplies.
-            Ev::CtrlR => {
-                if self.view == View::Sessions {
-                    self.refresh_local();
-                } else {
-                    self.refresh_requested = true;
-                }
-            }
+            Ev::CtrlR => match self.view {
+                View::Sessions => self.refresh_local(),
+                View::Team => self.refresh_requested = true,
+                View::Machines => self.refresh_machines_now(),
+            },
             Ev::OpenEnroll => self.open_form(Kind::Enroll, &[]),
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
             Ev::OpenInvite => self.open_invite(),
@@ -1515,10 +1520,11 @@ impl App {
             // Tab switches the pane.
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
             Ev::Enter if self.view == View::Team => self.enter_team(),
+            Ev::Enter if self.view == View::Machines => self.enter_machine(false),
             Ev::Enter | Ev::CtrlP => self.open_palette(),
             Ev::Tab => self.switch_view(),
             Ev::Char('i') => match self.view {
-                View::Sessions => self.say("team sessions are on the Team tab; press tab"),
+                View::Sessions | View::Machines => self.say("team sessions are on the Team tab; press tab"),
                 View::Team => self.ask_import(),
             },
             Ev::Char('m') => {
@@ -1528,6 +1534,7 @@ impl App {
                 }
                 self.toggle_mark();
             }
+            Ev::Char('o') if self.view == View::Machines => self.enter_machine(true),
             // o opens the selected session in herdr: its tab if one runs it, else a new tab that resumes it.
             Ev::Char('o') => self.open_in_herdr(),
             // s opens the share picker (explicit team choice); u stops sharing everywhere.
@@ -1618,6 +1625,7 @@ impl App {
         match self.view {
             View::Sessions => self.move_selection(delta),
             View::Team => self.move_team(delta),
+            View::Machines => self.move_machines(delta),
         }
     }
 
@@ -1761,7 +1769,15 @@ impl App {
                 ("enter", "resolve the selected behind or diverged conversation: keep mine, take theirs, or fork"),
                 ("i", "import the team copy of a conversation this machine does not hold"),
                 ("ctrl+r", "pull the team's verified sessions from the server"),
-                ("tab", "back to the local sessions"),
+                ("tab", "switch to the machines list"),
+                ("ctrl+p", "open the command list"),
+                ("q / esc", "quit"),
+            ],
+            View::Machines => vec![
+                ("enter", "attach to the selected conversation in a new herdr tab (a closed one stays closed)"),
+                ("o", "attach to it, and open a closed conversation there"),
+                ("ctrl+r", "refresh every machine's conversation list now"),
+                ("tab", "switch to the sessions list"),
                 ("ctrl+p", "open the command list"),
                 ("q / esc", "quit"),
             ],
@@ -1772,7 +1788,8 @@ impl App {
     fn switch_view(&mut self) {
         self.view = match self.view {
             View::Sessions => View::Team,
-            View::Team => View::Sessions,
+            View::Team => View::Machines,
+            View::Machines => View::Sessions,
         };
         self.prefs_dirty = true;
         // Opening the Team tab shows what the team holds now, not what this run saw a while ago.

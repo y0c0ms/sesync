@@ -127,7 +127,7 @@ HS_E2E=1 sh build-test.sh
   `pins`, `confine`, `uploads`, `testkit`, `cli`.
 - **Machines** (`machines/`, only `sesync machine …` runs it; commands in `docs/BRIDGE.md`): this machine as a
   client of other machines' bridges, speaking the phone's protocol. `store` (`machines.json`, owner-only),
-  `client` (hello, auth, sealed RPCs), `attach` (a remote pane mirrored in this terminal), `cli`.
+  `client` (hello, auth, sealed RPCs), `attach` (a remote pane mirrored in this terminal), `tab` (the TUI's Machines tab: rows and the refresh worker; its state is `app/machines_tab.rs`), `cli`.
 - **Test-only today** (do not wire new features to these without a decision): `team_pull`
   (superseded by `team_pull_verified`), `team_conflict`, `divergence`,
   `harness::claude::compaction`.

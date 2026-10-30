@@ -1211,12 +1211,16 @@ fn run_tui(
     // worker reads the rest, rows on screen first. Opening never waits on every session file.
     let titles_file = state_file.with_file_name("titles.json");
     let title_worker = sesync::title_worker::Worker::start();
+    // The Machines tab lists each saved machine's conversations on a worker: the TUI never waits on a machine.
+    let machines_worker = sesync::machines::tab::Worker::start(config_dir.join("machines.json"));
     let mut app = App::new_deferred(roots, state, lock_dir, sesync_lock,
         sesync::manage::TitleCache::load(&titles_file));
     tr("app built", &mut trace);
     app.migrate_legacy_team_state(&teams);
     // "Take theirs" keeps the replaced copy in the daemon's archive, the same folder.
     app.set_archive_dir(state_file.with_file_name("archive"));
+    // The Machines tab's attach tabs read this run's configuration, so they are given its directory.
+    app.set_config_dir(config_dir.clone());
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
     app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
@@ -1281,6 +1285,13 @@ fn run_tui(
         if let Some(loaded) = preview.take() {
             app.apply_preview(loaded);
         }
+        // The Machines tab asks each machine for its conversations while the tab is shown: at most every few seconds,
+        // and at once for ctrl+r. The worker answers on its own thread; the answers are applied here, between frames.
+        if app.machines_due(Instant::now()) {
+            machines_worker.request();
+            app.machines_asked(Instant::now());
+        }
+        app.apply_machine_updates(machines_worker.take());
         term.draw(|f| sesync::ui::draw(f, &app))?;
         tr("drawn", &mut trace);
         if !event::poll(Duration::from_millis(200))? {
@@ -1330,10 +1341,11 @@ fn run_tui(
         // Every key goes through the app, so every key cancels a pending delete the same way.
         // Ctrl+R on the Team tab asks for a network refresh; the local list refreshes in the app.
         app.handle(ev, Instant::now());
-        // "Open in herdr" takes a few herdr calls: show that it started before making them.
-        if app.has_pending_open() {
+        // Opening a herdr tab takes a few herdr calls: show that it started before making them.
+        if app.has_pending_open() || app.has_pending_attach() {
             term.draw(|f| sesync::ui::draw(f, &app))?;
             app.run_pending_open();
+            app.run_pending_attach();
         }
         // A team the user chose to leave goes now (a few local files), and the team records are
         // read again, so neither the share picker nor the Team tab offers it any more.

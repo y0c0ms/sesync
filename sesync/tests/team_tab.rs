@@ -123,8 +123,9 @@ fn opening_the_team_tab_pulls_only_when_the_list_is_stale() {
     assert_eq!(a.view(), View::Team);
     assert!(a.take_refresh_request(), "never pulled this run: opening the tab pulls");
     a.set_pull_result(vec![], 0);
-    a.handle(Ev::Tab, Instant::now());
-    a.handle(Ev::Tab, Instant::now());
+    a.handle(Ev::Tab, Instant::now()); // machines
+    a.handle(Ev::Tab, Instant::now()); // sessions
+    a.handle(Ev::Tab, Instant::now()); // team again, pulled a moment ago
     assert!(!a.take_refresh_request(), "pulled a moment ago: no new pull");
 
     let mut unconfigured = App::new(Roots::under(&sb, sb.join("no-sesync-conv")), State::default(),

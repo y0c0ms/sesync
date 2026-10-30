@@ -34,6 +34,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.view() {
         View::Sessions => draw_sessions(f, app, th, chunks[1]),
         View::Team => draw_team(f, app, th, chunks[1]),
+        View::Machines => draw_machines(f, app, th, chunks[1]),
     }
 
     let status_line = match app.mode() {
@@ -102,10 +103,7 @@ fn scrub_unsafe_glyphs(buf: &mut ratatui::buffer::Buffer) {
 fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let selected = Style::default().fg(th.text).bg(th.accent);
     let unselected = Style::default().fg(th.dim);
-    let (s_style, t_style) = match app.view() {
-        View::Sessions => (selected, unselected),
-        View::Team => (unselected, selected),
-    };
+    let style = |tab: View| if app.view() == tab { selected } else { unselected };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     // The daemon saves the state file at the end of every pass (every SESYNC_POLL, 5 s by
@@ -117,9 +115,11 @@ fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     };
     let (ok, failing) = app.sync_counts();
     let bar = Line::from(vec![
-        Span::styled(" Sessions ", s_style),
+        Span::styled(" Sessions ", style(View::Sessions)),
         Span::styled("│", Style::default().fg(th.dim)),
-        Span::styled(format!(" Team ({}) ", app.team_rows().len()), t_style),
+        Span::styled(format!(" Team ({}) ", app.team_rows().len()), style(View::Team)),
+        Span::styled("│", Style::default().fg(th.dim)),
+        Span::styled(format!(" Machines ({}) ", app.machine_count()), style(View::Machines)),
         Span::styled(format!("   {daemon}"), Style::default().fg(daemon_color)),
         Span::styled(format!(" · {ok} copies in place, {failing} failing"),
             Style::default().fg(if failing > 0 { th.error } else { th.dim })),
@@ -577,6 +577,69 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
+/// The Machines tab's fixed columns: the state, harness and project widths, the gaps after the first three, and the
+/// highlight symbol. The title takes what the row has left.
+const MACHINE_STATE_W: usize = 9;
+const MACHINE_HARNESS_W: usize = 11;
+const MACHINE_PROJECT_W: usize = 40;
+const MACHINE_FIXED_W: usize = MACHINE_STATE_W + MACHINE_HARNESS_W + MACHINE_PROJECT_W + 6 + 2;
+
+/// The Machines tab: each saved machine with its address and status, then the conversations its last refresh listed,
+/// with their state, title, harness and project. Enter attaches the conversation under the cursor.
+fn draw_machines(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::machines::tab::{Row, Status};
+    use crate::session_cols::{display_safe, fit};
+    let rows = app.machine_rows();
+    if rows.is_empty() {
+        let (msg, color) = match app.machines_error() {
+            Some(why) => (display_safe(why), th.error),
+            None => ("No machines saved; add one with `sesync machine add <name> <pairing link>`.".to_string(), th.dim),
+        };
+        f.render_widget(Paragraph::new(msg).style(Style::default().fg(color)).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let title_w = (area.width as usize).saturating_sub(MACHINE_FIXED_W).max(12);
+    let head = format!("  {}  {}  {}  PROJECT", fit("STATE", MACHINE_STATE_W), fit("TITLE", title_w), fit("HARNESS", MACHINE_HARNESS_W));
+    f.render_widget(Paragraph::new(head).style(Style::default().fg(th.dim)), parts[0]);
+    let selected = rows.iter().enumerate()
+        .filter(|(_, r)| matches!(r, Row::Conversation(_)))
+        .nth(app.machine_index())
+        .map(|(i, _)| i);
+    let height = parts[1].height as usize;
+    let offset = selected.unwrap_or(0).saturating_sub(height.saturating_sub(1));
+    let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
+    let items: Vec<ListItem> = rows.iter().map(|row| match row {
+        Row::Machine { name, endpoint, status } => {
+            let (text, color) = match status {
+                Status::Loading => ("loading…".to_string(), th.dim),
+                Status::Unreachable(why) => (format!("unreachable: {}", display_safe(why)), th.error),
+                Status::Listed => (String::new(), th.dim),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}  ", display_safe(name)), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}  ", display_safe(endpoint)), Style::default().fg(th.dim)),
+                Span::styled(text, Style::default().fg(color)),
+            ]))
+        }
+        Row::Conversation(c) => {
+            let state_color = match c.state.as_str() {
+                "blocked" | "waiting" => th.warn,
+                "working" => th.text,
+                _ => th.dim,
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}  ", fit(&c.state, MACHINE_STATE_W)), Style::default().fg(state_color)),
+                Span::styled(format!("{}  ", fit(&display_safe(&c.title), title_w)), Style::default().fg(th.text)),
+                Span::styled(format!("{}  ", fit(&c.harness, MACHINE_HARNESS_W)), Style::default().fg(th.dim)),
+                Span::styled(fit(&display_safe(&c.path), MACHINE_PROJECT_W), Style::default().fg(th.dim)),
+            ]))
+        }
+    }).collect();
+    let list = List::new(items).highlight_style(Style::default().bg(th.accent)).highlight_symbol("> ");
+    f.render_stateful_widget(list, parts[1], &mut list_state);
+}
+
 /// The Team list's fixed columns. The title takes what the row has left (see `TEAM_FIXED_W`).
 const TEAM_STATE_W: usize = 18;
 const TEAM_HARNESS_W: usize = 8;
@@ -911,7 +974,12 @@ fn tail_fit(text: &str, width: usize) -> String {
 fn draw_help(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let lines = app.help_lines();
     let height = lines.len() as u16 + 4;
-    let inner = dialog(f, if app.view() == View::Team { "Keys: team" } else { "Keys: sessions" }, th,
+    let title = match app.view() {
+        View::Sessions => "Keys: sessions",
+        View::Team => "Keys: team",
+        View::Machines => "Keys: machines",
+    };
+    let inner = dialog(f, title, th,
         centered(74, height, area));
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let items: Vec<ListItem> = lines.iter().map(|(keys, what)| {

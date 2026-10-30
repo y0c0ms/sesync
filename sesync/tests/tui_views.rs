@@ -1,6 +1,6 @@
 //! The command palette, the Team view, and the screen that shows them. Enter and Ctrl+P open the
 //! palette, which lists every action with the key that runs it and whether it can run here. Tab
-//! switches between the local Sessions and the verified Team sessions.
+//! cycles through the local Sessions, the verified Team sessions and the Machines.
 
 use ratatui::{backend::TestBackend, Terminal};
 use sesync::app::{App, Ev, Mode, View};
@@ -150,12 +150,14 @@ fn esc_closes_the_palette() {
 }
 
 #[test]
-fn tab_switches_between_sessions_and_team() {
+fn tab_cycles_sessions_team_and_machines() {
     let sb = sandbox("tab");
     let mut a = app(&sb);
     assert_eq!(a.view(), View::Sessions);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Team);
+    a.handle(Ev::Tab, Instant::now());
+    assert_eq!(a.view(), View::Machines);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Sessions);
     let _ = fs::remove_dir_all(&sb);

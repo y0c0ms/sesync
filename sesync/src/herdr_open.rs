@@ -201,8 +201,18 @@ impl Herdr {
 
     /// Open a tab in `cwd` without switching to it. Returns the tab's id and its root pane's id.
     pub fn create_tab(&self, cwd: &Path, label: &str) -> Result<(String, String), String> {
+        self.create_tab_with_env(cwd, label, &[])
+    }
+
+    /// [`Herdr::create_tab`], with `env` set for the tab's process. herdr starts a tab with its own environment, not
+    /// the caller's, so a tab that must read this sesync's configuration is given it here.
+    pub fn create_tab_with_env(&self, cwd: &Path, label: &str, env: &[(&str, &str)]) -> Result<(String, String), String> {
         let cwd = cwd.display().to_string();
+        let assignments: Vec<String> = env.iter().map(|(key, value)| format!("{key}={value}")).collect();
         let mut args = vec!["tab", "create", "--cwd", cwd.as_str(), "--label", label, "--no-focus"];
+        for assignment in &assignments {
+            args.extend(["--env", assignment.as_str()]);
+        }
         if let Some(workspace) = &self.workspace {
             args.extend(["--workspace", workspace.as_str()]);
         }

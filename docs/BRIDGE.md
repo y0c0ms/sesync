@@ -52,6 +52,15 @@ the phone), and sends keys as `terminal.send` text, as the phone's terminal keyb
 not a prompt turn, so it takes no conversation claim. A machine connects with the hybrid handshake (Framing below):
 X25519 + ML-KEM-768, AES-256-GCM frames. A bridge that answers with only the phone's legacy channel is refused.
 
+The TUI's Machines tab (`sesync --tui`, reached with tab from Team) lists each saved machine: a header with its endpoint
+and either `loading…` or `unreachable: <reason>`, then its conversations (state, title, harness, project). A worker asks
+every machine's bridge for `worktree.ps` at once, each with an 8 s timeout, while the tab is shown: every 5 s, and at
+once on ctrl+r. The TUI never waits on it. Enter on a conversation opens a herdr tab labelled `<machine> · <title>` that
+runs `sesync machine attach <machine> <worktree id>` on it. A closed conversation is not opened by Enter; the status line
+says that `o` opens it, and `o` runs the same tab with `--open`. herdr starts a tab with its own environment, so the tab
+is given this run's `SESYNC_CONFIG_DIR` (the machines it reads are the same). With no herdr answering, the status line
+says so and no tab starts.
+
 ## Files
 
 Under `$SESYNC_CONFIG_DIR/bridge/` (default `~/.config/sesync/bridge/`). The directory is `0700`.
