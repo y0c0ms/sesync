@@ -3,7 +3,6 @@
 
 use super::confine::{self, IMAGE_CAP, TEXT_CAP};
 use super::rpc::{self, Ctx, Failure};
-use super::uploads;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -111,12 +110,12 @@ pub fn read(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     }))
 }
 
-/// `files.readPreview {worktree, relativePath}`: an image as base64. An absolute `relativePath` names a staged phone
-/// upload instead, served from the uploads root only (see `read_upload_preview`).
+/// `files.readPreview {worktree, relativePath}`: an image as base64. An absolute `relativePath` names an image anywhere
+/// on the host instead (see `read_absolute_preview`).
 pub fn read_preview(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     let relative = relative_param(params);
     if Path::new(relative).is_absolute() {
-        return read_upload_preview(params, ctx);
+        return read_absolute_preview(params);
     }
     let root = rpc::project_root(ctx, params)?;
     let clean = confine::lexical(relative)?;
@@ -125,18 +124,13 @@ pub fn read_preview(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     preview_reply(params, mime, &path)
 }
 
-/// An image the bridge staged from a phone upload, named by its absolute path. Only a file directly inside
-/// `<bridge dir>/uploads/<conversation>/` is served: the path is canonicalised first, so a `..` or a symlink that
-/// leaves the uploads root is refused, and a file nested deeper is not an upload.
-fn read_upload_preview(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
-    let root = std::fs::canonicalize(uploads::staging_root(&ctx.dir))
-        .map_err(|_| ("not_found", "file not found".to_string()))?;
+/// An image named by its absolute path: a staged phone upload, or a picture an agent made outside the project and
+/// showed in its reply (`![shot](/tmp/shot.png)`). The paired phone already drives shells on this host, so reading an
+/// image anywhere adds no reach. What stays refused is everything that is not an image: the name must carry an
+/// image extension and the bytes must start with that format's signature, so this cannot read other files.
+fn read_absolute_preview(params: &Value) -> Result<Value, Failure> {
     let path = std::fs::canonicalize(relative_param(params))
         .map_err(|_| ("not_found", "file not found".to_string()))?;
-    let inside = path.strip_prefix(&root).map_err(|_| confine::invalid())?;
-    if inside.components().count() != 2 {
-        return Err(confine::invalid());
-    }
     let mime = image_mime(&path).ok_or_else(|| refuse("binary_file"))?;
     preview_reply(params, mime, &path)
 }
@@ -146,6 +140,9 @@ fn preview_reply(params: &Value, mime: &'static str, path: &Path) -> Result<Valu
         return Err(refuse("file_too_large"));
     }
     let bytes = std::fs::read(path).map_err(|_| unreadable())?;
+    if !has_image_signature(mime, &bytes) {
+        return Err(refuse("binary_file"));
+    }
     Ok(json!({
         "worktree": params["worktree"],
         "relativePath": relative_param(params),
@@ -154,6 +151,17 @@ fn preview_reply(params: &Value, mime: &'static str, path: &Path) -> Result<Valu
         "isImage": true,
         "mimeType": mime,
     }))
+}
+
+/// Whether `bytes` open with the signature of the format `mime` names.
+fn has_image_signature(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
 }
 
 /// `files.resolveTerminalPath {worktree, pathText, cwd?, crossWorkspace?, …}`: where a path in a pane points.
@@ -608,29 +616,29 @@ mod tests {
     }
 
     #[test]
-    fn read_preview_refuses_an_absolute_path_that_leaves_the_uploads_root() {
-        let (ctx, state) = staged("preview-upload-escape");
-        put(&state, "secret.png", b"\x89PNG\r\n\x1a\n");
-        put(&state, "uploads/_unscoped/ok.png", b"\x89PNG\r\n\x1a\n");
-        for bad in [
-            state.join("secret.png"),
-            state.join("uploads/../secret.png"),
-            state.join("uploads/_unscoped/../../secret.png"),
-        ] {
-            assert_eq!(code(read_preview(&upload_at(&bad), &ctx)), "invalid_relative_path", "{bad:?}");
+    fn read_preview_serves_an_agent_image_anywhere_by_its_absolute_path() {
+        let (ctx, state) = staged("preview-absolute");
+        let png = b"\x89PNG\r\n\x1a\n-body-";
+        put(&state, "made/by/agent/shot.png", png);
+        put(&state, "made/photo.jpeg", b"\xff\xd8\xff\xe0-jfif-");
+        put(&state, "uploads/_unscoped/.keep", b"");
+        for path in [state.join("made/by/agent/shot.png"), state.join("uploads/../made/by/agent/shot.png")] {
+            let result = read_preview(&upload_at(&path), &ctx).unwrap();
+            assert_eq!(result["mimeType"], "image/png", "{path:?}");
         }
+        assert_eq!(read_preview(&upload_at(&state.join("made/photo.jpeg")), &ctx).unwrap()["mimeType"], "image/jpeg");
     }
 
     #[test]
-    fn read_preview_refuses_an_upload_symlink_out_of_the_root_and_a_nested_file() {
-        let (ctx, state) = staged("preview-upload-links");
-        put(&state, "secret.png", b"\x89PNG\r\n\x1a\n");
-        put(&state, "uploads/_unscoped/deep/nested.png", b"\x89PNG\r\n\x1a\n");
-        symlink(state.join("secret.png"), state.join("uploads/_unscoped/link.png")).unwrap();
-        let link = state.join("uploads/_unscoped/link.png");
-        let nested = state.join("uploads/_unscoped/deep/nested.png");
-        assert_eq!(code(read_preview(&upload_at(&link), &ctx)), "invalid_relative_path");
-        assert_eq!(code(read_preview(&upload_at(&nested), &ctx)), "invalid_relative_path");
+    fn read_preview_refuses_an_absolute_path_that_is_not_an_image() {
+        let (ctx, state) = staged("preview-absolute-refused");
+        put(&state, "secret.txt", b"token=abc");
+        put(&state, "secret-named.png", b"token=abc");
+        put(&state, "jpeg-named.png", b"\xff\xd8\xff\xe0");
+        symlink(state.join("secret.txt"), state.join("link.png")).unwrap();
+        for bad in ["secret.txt", "secret-named.png", "jpeg-named.png", "link.png"] {
+            assert_eq!(code(read_preview(&upload_at(&state.join(bad)), &ctx)), "binary_file", "{bad}");
+        }
     }
 
     #[test]

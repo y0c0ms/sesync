@@ -341,7 +341,7 @@ fn staging_dir(state_dir: &Path, params: &Value) -> Result<PathBuf, Failure> {
 }
 
 /// `<state_dir>/uploads`: the root every staged image sits under, one directory per conversation.
-pub fn staging_root(state_dir: &Path) -> PathBuf {
+fn staging_root(state_dir: &Path) -> PathBuf {
     state_dir.join("uploads")
 }
 
