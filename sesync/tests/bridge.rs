@@ -199,6 +199,46 @@ async fn a_paired_phone_authenticates_and_reads_status() {
     assert_eq!(result["minCompatibleMobileVersion"], 2);
 }
 
+fn machine_for(b: &Bridge, token: &str) -> sesync::machines::store::Machine {
+    sesync::machines::store::Machine {
+        name: "it".into(),
+        endpoint: format!("ws://{}", b.addr),
+        device_token: token.into(),
+        public_key_b64: STANDARD.encode(b.server_public.as_bytes()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sesync_client_connects_over_the_hybrid_handshake_and_a_phone_still_over_the_legacy_one() {
+    use sesync::machines::client;
+    let b = start("hybrid", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;
+    let (_, token) = pair(&b.dir, "machine");
+    let (mut writer, mut reader) = client::connect(&machine_for(&b, &token)).await.expect("hybrid handshake and auth");
+    let status = client::call(&mut writer, &mut reader, "status.get", json!({})).await.unwrap();
+    assert_eq!(status["protocolVersion"], 3);
+    let list = client::call(&mut writer, &mut reader, "worktree.ps", json!({})).await.unwrap();
+    assert_eq!(list["worktrees"], json!([]));
+
+    // The same bridge still serves the phone's legacy hello.
+    let mut phone = Phone::hello(&b, 9).await;
+    assert_eq!(phone.auth(&token).await, json!({ "type": "e2ee_authenticated" }));
+
+    // A wrong token is refused after the hybrid handshake as after the legacy one.
+    let refused = client::connect(&machine_for(&b, "not-a-paired-token")).await.err().expect("refused");
+    assert!(refused.contains("refused this machine's pairing"), "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hybrid_hello_with_a_broken_ml_kem_key_gets_an_error_and_no_ready() {
+    let b = start("hybrid-broken", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;
+    let (mut ws, _) = connect_async(format!("ws://{}", b.addr)).await.unwrap();
+    let public = SecretKey::from_slice(&[9; 32]).unwrap().public_key();
+    let hello = json!({ "type": "e2ee_hello", "v": 3, "publicKeyB64": STANDARD.encode(public.as_bytes()), "mlkemEncapsulationKeyB64": STANDARD.encode([1u8; 64]) });
+    ws.send(Message::Text(hello.to_string().into())).await.unwrap();
+    let reply: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+    assert_eq!(reply["type"], "e2ee_error", "{reply}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wrong_token_gets_unauthorized_and_a_4001_close() {
     let b = start("bad-token", Arc::new(FixedCatalog(vec![])), LOOPBACK).await;

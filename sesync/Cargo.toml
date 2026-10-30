@@ -31,6 +31,10 @@ base64 = "0.22"
 ignore = "0.4"
 # Mutexes the bridge holds for one short section each; parking_lot's guards need no poison handling.
 parking_lot = "0.12"
+# The bridge's hybrid handshake for sesync clients (`bridge::hybrid`): ML-KEM-768 (FIPS 203, pure Rust) beside
+# X25519. curve25519-dalek gives the raw X25519 secret the HKDF needs; it is in the lock file through crypto_box.
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+curve25519-dalek = "4"
 
 [target.'cfg(windows)'.dependencies]
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's

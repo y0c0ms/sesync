@@ -1,18 +1,13 @@
-//! A client of another machine's phone bridge, speaking what the phone speaks (docs/BRIDGE.md): the plaintext
-//! hello, the sealed auth with the paired device token, then sealed RPCs that each carry the token.
-//!
-//! Crypto note: this is the bridge's legacy channel, X25519 + XSalsa20-Poly1305, classical. It is accepted
-//! only because every machine link runs inside WireGuard (also classical). The hybrid X25519 + ML-KEM-768
-//! handshake (agent-hub #6) must exist before machines are linked without a hand-made pairing.
+//! A client of another machine's phone bridge: the hybrid hello (`bridge::hybrid`, X25519 + ML-KEM-768, AES-256-GCM
+//! frames), the sealed auth with the paired device token, then sealed RPCs that each carry the token. The RPCs are
+//! the phone's (docs/BRIDGE.md), so a machine sees what the phone sees. A bridge that answers with the phone's
+//! legacy channel is refused: there is no fallback to classical-only keys.
 
 use super::store::Machine;
-use crate::bridge::e2ee::{self, Channel};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use crypto_box::SecretKey;
+use crate::bridge::e2ee::{self, Channel, Side};
+use crate::bridge::hybrid;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,21 +46,15 @@ pub async fn connect(machine: &Machine) -> Result<(Writer, Reader), String> {
         .map_err(|e| format!("cannot reach {} at {}: {e}", machine.name, machine.endpoint))?;
     let (mut tx, mut rx) = ws.split();
 
-    let mut secret = [0u8; 32];
-    SystemRandom::new().fill(&mut secret).map_err(|_| "no randomness for a key".to_string())?;
-    let secret = SecretKey::from_slice(&secret).map_err(|_| "cannot make a key".to_string())?;
-    let hello = json!({ "type": "e2ee_hello", "publicKeyB64": STANDARD.encode(secret.public_key().as_bytes()) });
+    let (hello, pending) = hybrid::begin()?;
     tx.send(Message::Text(hello.to_string().into())).await.map_err(|e| e.to_string())?;
     let ready = next_text(&mut rx, Some(STEP))
         .await?
         .ok_or_else(|| format!("{} closed the connection during the hello", machine.name))?;
-    if serde_json::from_str::<Value>(&ready).ok().and_then(|v| v["type"].as_str().map(str::to_string)).as_deref()
-        != Some("e2ee_ready")
-    {
-        return Err(format!("{} answered the hello with {ready}", machine.name));
-    }
+    let ready: Value = serde_json::from_str(&ready).map_err(|_| format!("{} answered the hello with {ready}", machine.name))?;
+    let keys = hybrid::finish(pending, &server, &ready).map_err(|e| format!("{}: {e}", machine.name))?;
 
-    let channel = Arc::new(Channel::new(&server, &secret));
+    let channel = Arc::new(Channel::hybrid(&keys, Side::Client));
     let mut writer = Writer { tx, channel: Arc::clone(&channel), token: machine.device_token.clone(), next: 0 };
     let mut reader = Reader { rx, channel };
     writer.sealed(&json!({ "type": "e2ee_auth", "deviceToken": writer.token })).await?;

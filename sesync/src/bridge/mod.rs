@@ -17,6 +17,7 @@ pub mod cli;
 pub mod devices;
 pub mod dictation;
 pub mod e2ee;
+pub mod hybrid;
 pub mod herdr;
 pub mod keys;
 pub mod net;

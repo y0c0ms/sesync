@@ -13,6 +13,8 @@
 
 use super::catalog::{Catalog, Conversation};
 use super::e2ee::Channel;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use super::herdr::{self, Herdr};
 use super::terminals::{self, Running};
 use serde_json::{json, Value};
@@ -108,20 +110,17 @@ impl Sink {
         Sink { tx, channel }
     }
 
-    /// Seal one JSON value into an encrypted text frame. False once the connection has gone.
+    /// Seal one JSON value into an encrypted text frame. False once the connection has gone. The frame is queued
+    /// while the channel's counter is held, so frames from several streams leave in the order they were sealed.
     pub fn json(&self, value: &Value) -> bool {
-        match self.channel.seal(&value.to_string()) {
-            Ok(frame) => self.tx.send(Message::Text(frame.into())).is_ok(),
-            Err(_) => false,
-        }
+        self.channel
+            .seal_then(value.to_string().as_bytes(), |frame| self.tx.send(Message::Text(STANDARD.encode(frame).into())).is_ok())
+            .unwrap_or(false)
     }
 
     /// Seal raw bytes into an encrypted binary frame. False once the connection has gone.
     pub fn binary(&self, bytes: &[u8]) -> bool {
-        match self.channel.seal_bytes(bytes) {
-            Ok(frame) => self.tx.send(Message::Binary(frame.into())).is_ok(),
-            Err(_) => false,
-        }
+        self.channel.seal_then(bytes, |frame| self.tx.send(Message::Binary(frame.into())).is_ok()).unwrap_or(false)
     }
 
     /// Send a close frame with `code` and `reason`. The writer stops after it.

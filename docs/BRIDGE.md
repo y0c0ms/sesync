@@ -49,8 +49,8 @@ conversations of the others. Plan for the TUI tab and for the phone deciding whi
 each machine's endpoint, public key and device token. Attach reads the JSON terminal stream (full repaints), draws
 each repaint cut to the window with the bottom rows kept and autowrap off (the remote pane keeps its own size, as on
 the phone), and sends keys as `terminal.send` text, as the phone's terminal keyboard does: Enter there is typing,
-not a prompt turn, so it takes no conversation claim. The channel is the legacy one below (classical, inside
-WireGuard); the hybrid ML-KEM handshake (agent-hub #6) comes before machines are linked without a hand-made pairing.
+not a prompt turn, so it takes no conversation claim. A machine connects with the hybrid handshake (Framing below):
+X25519 + ML-KEM-768, AES-256-GCM frames. A bridge that answers with only the phone's legacy channel is refused.
 
 ## Files
 
@@ -87,7 +87,8 @@ Frames are WebSocket messages. A plaintext frame is JSON. An encrypted text fram
 **binary** frame is the same `nonce ‖ box` without base64: the layout Orca's legacy channel reads with
 `openLegacyBinary`, which the direct transport routes to its terminal stream router.
 
-1. Client → `{"type":"e2ee_hello","publicKeyB64":…}` (plaintext). Bridge → `{"type":"e2ee_ready"}`.
+1. Client → `{"type":"e2ee_hello","publicKeyB64":…}` (plaintext). Bridge → `{"type":"e2ee_ready"}`. A sesync
+   client sends the hybrid hello instead (`"v":3`, see Framing); later frames then use that channel's layout.
 2. Client → encrypted `{"type":"e2ee_auth","deviceToken":…}`. Bridge → encrypted
    `{"type":"e2ee_authenticated"}`, or encrypted `{"type":"e2ee_error","error":{"code":"unauthorized"}}`
    and close `4001`.
@@ -232,7 +233,7 @@ does, so the TUI, the daemon and the other harnesses cannot write the same conve
 Other input (`text` without `enter`, `interrupt`, `clearBuffer`) is not a turn and is not claimed. `interrupt` sends
 `ctrl+c`; `terminal.clearBuffer` sends `ctrl+l`.
 
-## Framing: legacy only, and a correction
+## Framing: legacy for the phone, hybrid for sesync clients, and a correction
 
 The brief said v2 framing (`e2ee_hello` with `v:2`, transcript hash) is needed only for relay. That is
 not what the source shows. For direct connections, `rpc-client-socket-session.ts` dials **v2 first**
@@ -243,11 +244,24 @@ So this bridge implements legacy framing and answers any v2 hello with close `40
 app then redials with the legacy hello. Cost: one refused dial on first pairing. Implementing v2 is
 deferred; the interop check below covers this path.
 
+**Hybrid (`v:3`, `hybrid.rs`), for sesync clients (`sesync machine`).** The hello carries a fresh X25519 key and a
+fresh ML-KEM-768 encapsulation key: `{"type":"e2ee_hello","v":3,"publicKeyB64":…,"mlkemEncapsulationKeyB64":…}`.
+The bridge encapsulates and answers `{"type":"e2ee_ready","v":3,"mlkemCiphertextB64":…}`, or `e2ee_error` and
+a close for a key that is not ML-KEM-768. Both sides run HKDF-SHA384 over the X25519 secret (the client's key with
+the bridge's pinned key, the one the offer carries) and the ML-KEM shared key, salted with the protocol's label and
+bound to a SHA-384 of the transcript (both X25519 keys, the encapsulation key, the ciphertext). That gives one
+AES-256-GCM key per direction. Every later frame is `base64(counter ‖ ciphertext ‖ tag)` (binary frames without
+base64): an 8-byte big-endian counter from 1, which is also the nonce, and a frame whose counter is not above the
+last one opened is dropped, so frames cannot be replayed or reordered. Auth and RPCs are then as for the phone.
+The client refuses an `e2ee_ready` without the ciphertext (a bridge that speaks only legacy): no fallback.
+
 ## Security
 
-- **Crypto is classical.** X25519 plus XSalsa20-Poly1305 is what Orca's legacy channel uses. It is
-  acceptable here only because it runs inside WireGuard, which is itself classical. The post-quantum
-  hybrid (ML-KEM) is agent-hub #6, and the homelab policy requires it for any new key exchange.
+- **Crypto: hybrid for machines, classical for the phone.** A recorded `sesync machine` session needs both the
+  X25519 and the ML-KEM secret to read, and the ML-KEM one is fresh per connection. The bridge is still
+  authenticated only by its pinned X25519 key; resisting an attacker who breaks X25519 during a live connection
+  would need an ML-DSA signature. The phone's channel is Orca's legacy X25519 + XSalsa20-Poly1305, classical,
+  acceptable only because it runs inside WireGuard (also classical) until the app speaks the hybrid hello.
 - **Pairing is the trust decision.** Whoever can read the offer can pair. Show the QR only to the
   phone being paired. Revoke with `sesync bridge revoke`.
 - **A paired phone can type into your agents.** `terminal.send` writes text and Enter into the herdr

@@ -1,5 +1,6 @@
 //! The WebSocket server. A connection is a fixed sequence:
-//!   1. plaintext `e2ee_hello` → plaintext `e2ee_ready` (a v2 hello is closed with 4001 instead);
+//!   1. plaintext `e2ee_hello` → plaintext `e2ee_ready` (a v2 hello is closed with 4001 instead; a v3 hello from a
+//!      sesync client gets the hybrid handshake, `hybrid.rs`);
 //!   2. encrypted `e2ee_auth` with a paired device token → encrypted `e2ee_authenticated`;
 //!   3. encrypted RPC requests, each carrying the device token, answered in order. A request may open a
 //!      stream (terminal, tabs, status); the stream's frames are sent on the same connection, through the
@@ -8,7 +9,8 @@
 //! revoked device is refused on its next frame.
 
 use super::devices;
-use super::e2ee::{self, Channel};
+use super::e2ee::{self, Channel, Side};
+use super::hybrid;
 use super::keys::ServerKeys;
 use super::net::{self, Cidr};
 use super::rpc::{self, Ctx};
@@ -95,8 +97,23 @@ async fn connection(stream: TcpStream, peer: SocketAddr, shared: Arc<Shared>) ->
         send_text(&mut tx, json!({ "type": "e2ee_error", "message": "Invalid public key" }).to_string()).await?;
         return close(&mut tx, None, "").await;
     };
-    send_text(&mut tx, json!({ "type": "e2ee_ready" }).to_string()).await?;
-    let channel = Arc::new(Channel::new(&client, &shared.keys.secret));
+    // A sesync client asks for the hybrid (ML-KEM) handshake; the phone sends the legacy hello.
+    let channel = if hello.get("v").and_then(Value::as_u64) == Some(hybrid::VERSION) {
+        let ek = hello.get("mlkemEncapsulationKeyB64").and_then(Value::as_str).unwrap_or("");
+        match hybrid::accept(&shared.keys.secret, &client, ek) {
+            Ok((ready, keys)) => {
+                send_text(&mut tx, ready.to_string()).await?;
+                Arc::new(Channel::hybrid(&keys, Side::Bridge))
+            }
+            Err(message) => {
+                send_text(&mut tx, json!({ "type": "e2ee_error", "message": message }).to_string()).await?;
+                return close(&mut tx, None, "").await;
+            }
+        }
+    } else {
+        send_text(&mut tx, json!({ "type": "e2ee_ready" }).to_string()).await?;
+        Arc::new(Channel::new(&client, &shared.keys.secret))
+    };
 
     // From here on every frame leaves through the writer, so replies and stream frames are ordered.
     let (out_tx, out_rx) = unbounded_channel::<Message>();

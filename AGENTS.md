@@ -119,7 +119,8 @@ HS_E2E=1 sh build-test.sh
   `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`, `turns` (completed turns and the comparison).
 - **Phone bridge** (`bridge/`, only `sesync bridge …` runs it; protocol, pairing and security in
   `docs/BRIDGE.md`, flows in `docs/PROCESSES.md`): `server` (WebSocket, allowlist, E2EE handshake),
-  `e2ee` (Orca's NaCl framing), `net` (allowlist), `rpc` (the served methods), `catalog` (conversations
+  `e2ee` (the channel: Orca's NaCl framing, or AES-256-GCM after the hybrid handshake), `hybrid` (X25519 +
+  ML-KEM-768 handshake for sesync clients), `net` (allowlist), `rpc` (the served methods), `catalog` (conversations
   by project directory, read-only), `devices` (hashed device tokens), `offer` (pairing offer v2), `keys`,
   `herdr` (socket client), `terminals`, `stream` (live terminal screens), `transcript` (chat view),
   `turns` (prompt claims), `start` (new sessions), `approvals`, `notify`, `ntfy`, `usage`, `files`, `git`,
