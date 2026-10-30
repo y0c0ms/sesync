@@ -99,8 +99,10 @@ fn enable_vt_input() {
 fn enable_vt_input() {}
 
 /// Attach to the conversation `query` names on `machine` until Ctrl-], or until the pane or the connection ends.
-/// A conversation not open in the machine's herdr is opened there first, as the phone's Resume does.
-pub async fn run(machine: &Machine, query: &str) -> Result<String, String> {
+/// A conversation not open in the machine's herdr is opened there first only with `open`, as the phone's Resume
+/// does: a bridge that misses an open pane (an older one, or a pane it cannot place) would otherwise start a
+/// second agent on a running conversation.
+pub async fn run(machine: &Machine, query: &str, open: bool) -> Result<String, String> {
     let (mut writer, mut reader) = client::connect(machine).await?;
     let list = client::call(&mut writer, &mut reader, "worktree.ps", json!({})).await?;
     let rows = list["worktrees"].as_array().cloned().unwrap_or_default();
@@ -109,6 +111,12 @@ pub async fn run(machine: &Machine, query: &str) -> Result<String, String> {
     let worktree = row["worktreeId"].as_str().unwrap_or("").to_string();
     let terminal = match row["agents"][0]["paneKey"].as_str() {
         Some(handle) => handle.to_string(),
+        None if !open => {
+            return Err(format!(
+                "{title} is not open on {}; add --open to resume it in that machine's herdr (only if it is not running there)",
+                machine.name
+            ))
+        }
         None => {
             let opened = client::call(
                 &mut writer,

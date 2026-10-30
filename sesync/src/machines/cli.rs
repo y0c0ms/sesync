@@ -10,7 +10,7 @@ use std::path::Path;
 
 const USAGE: &str = "usage: sesync machine add <name> <pairing link>   (from `sesync bridge pair --label <this machine>` there)
        sesync machine list [<name>]
-       sesync machine attach <name> <conversation title or id>   (Ctrl-] detaches)
+       sesync machine attach <name> <conversation title or id> [--open]   (Ctrl-] detaches)
        sesync machine remove <name>";
 
 enum Fail {
@@ -25,7 +25,8 @@ pub fn run(args: &[String], path: &Path) -> i32 {
         ["add", name, link] => add(path, name, link),
         ["list"] => list(path, None),
         ["list", name] => list(path, Some(name)),
-        ["attach", name, query] => attach(path, name, query),
+        ["attach", name, query] => attach(path, name, query, false),
+        ["attach", name, query, "--open"] => attach(path, name, query, true),
         ["remove", name] => remove(path, name),
         _ => Err(Fail::Usage("expected add, list, attach or remove with their arguments".into())),
     };
@@ -59,9 +60,9 @@ fn add(path: &Path, name: &str, link: &str) -> Result<(), Fail> {
     Ok(())
 }
 
-fn attach(path: &Path, name: &str, query: &str) -> Result<(), Fail> {
+fn attach(path: &Path, name: &str, query: &str, open: bool) -> Result<(), Fail> {
     let machine = named(path, name)?;
-    let message = runtime()?.block_on(attach::run(&machine, query)).map_err(Fail::Failed)?;
+    let message = runtime()?.block_on(attach::run(&machine, query, open)).map_err(Fail::Failed)?;
     println!("{message}");
     Ok(())
 }
