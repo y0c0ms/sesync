@@ -68,6 +68,8 @@ pub mod turns;
 
 // Phone bridge: `sesync bridge`, the WebSocket server the Orca app pairs with. Only that subcommand runs it.
 pub mod bridge;
+// Other machines' bridges, as their client: `sesync machine`. Only that subcommand runs it.
+pub mod machines;
 
 // Test-only: the shared staging helper for fake CLIs (the same file the integration tests include).
 #[cfg(all(test, unix))]

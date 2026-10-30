@@ -42,6 +42,36 @@ impl Offer {
     pub fn url(&self) -> String {
         format!("{PAIR_LINK}{}", URL_SAFE_NO_PAD.encode(self.to_json()))
     }
+
+    /// Read a pairing link (`agenthub://pair?code=…`, or the older `orca://` form) or the offer's JSON, as
+    /// `sesync bridge pair` prints them. The endpoint must be one a client can dial, and the key 32 bytes.
+    pub fn parse(text: &str) -> Result<Offer, String> {
+        let text = text.trim();
+        let json = match text.split_once("://pair?code=") {
+            Some((_, code)) => {
+                let bytes = URL_SAFE_NO_PAD.decode(code.trim_end_matches('='))
+                    .map_err(|_| "the pairing link's code is not base64url".to_string())?;
+                String::from_utf8(bytes).map_err(|_| "the pairing link's code is not text".to_string())?
+            }
+            None => text.to_string(),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| "not a pairing link or offer".to_string())?;
+        let field = |name: &str| {
+            value[name].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+                .ok_or_else(|| format!("the offer has no {name}"))
+        };
+        let offer = Offer {
+            endpoint: field("endpoint")?,
+            device_token: field("deviceToken")?,
+            public_key_b64: field("publicKeyB64")?,
+        };
+        check_endpoint(&offer.endpoint)?;
+        if super::e2ee::parse_client_key(&offer.public_key_b64).is_none() {
+            return Err("the offer's public key is not 32 bytes of base64".into());
+        }
+        Ok(offer)
+    }
 }
 
 /// Refuse an endpoint the phone could not dial. A malformed endpoint would otherwise print an offer
@@ -109,5 +139,18 @@ mod tests {
         assert!(check_endpoint("ws://").is_err());
         assert!(check_endpoint("ws:///path").is_err());
         assert!(check_endpoint("ws://a b:1").is_err());
+    }
+
+    #[test]
+    fn a_printed_link_or_offer_parses_back_and_a_damaged_one_is_refused() {
+        let offer = sample();
+        assert_eq!(Offer::parse(&offer.url()).unwrap(), offer);
+        assert_eq!(Offer::parse(&format!("  {}\n", offer.to_json())).unwrap(), offer);
+        let orca = offer.url().replace("agenthub://", "orca://");
+        assert_eq!(Offer::parse(&orca).unwrap(), offer, "links printed before the rename still read");
+        assert!(Offer::parse("agenthub://pair?code=!!").is_err());
+        assert!(Offer::parse(&offer.to_json().replace("ws://", "http://")).is_err());
+        assert!(Offer::parse(&offer.to_json().replace("zo060cy2M+x7", "zo0")).is_err());
+        assert!(Offer::parse(r#"{"v":2,"endpoint":"ws://h:1"}"#).is_err());
     }
 }

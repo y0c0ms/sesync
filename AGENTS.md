@@ -124,6 +124,9 @@ HS_E2E=1 sh build-test.sh
   `herdr` (socket client), `terminals`, `stream` (live terminal screens), `transcript` (chat view),
   `turns` (prompt claims), `start` (new sessions), `approvals`, `notify`, `ntfy`, `usage`, `files`, `git`,
   `pins`, `confine`, `uploads`, `testkit`, `cli`.
+- **Machines** (`machines/`, only `sesync machine …` runs it; commands in `docs/BRIDGE.md`): this machine as a
+  client of other machines' bridges, speaking the phone's protocol. `store` (`machines.json`, owner-only),
+  `client` (hello, auth, sealed RPCs), `attach` (a remote pane mirrored in this terminal), `cli`.
 - **Test-only today** (do not wire new features to these without a decision): `team_pull`
   (superseded by `team_pull_verified`), `team_conflict`, `divergence`,
   `harness::claude::compaction`.

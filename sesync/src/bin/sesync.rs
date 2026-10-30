@@ -650,6 +650,10 @@ fn main() {
     if args.first().map(String::as_str) == Some("herdr") {
         std::process::exit(run_herdr(&args[1..]));
     }
+    // Pairings with other machines' bridges; no session state is read.
+    if args.first().map(String::as_str) == Some("machine") {
+        std::process::exit(sesync::machines::cli::run(&args[1..], &team_config_dir().join("machines.json")));
+    }
     // The phone bridge reads sessions but never saves state, so it too runs before the state is loaded.
     if args.first().map(String::as_str) == Some("bridge") {
         let env = Env::from_env();

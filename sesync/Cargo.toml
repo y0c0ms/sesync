@@ -36,7 +36,8 @@ parking_lot = "0.12"
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's
 # shell. Already in the lock file through other crates.
 # The phone bridge talks to herdr over its named pipe (`bridge::herdr`, `PeekNamedPipe`).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes"] }
+# `sesync machine attach` turns on virtual-terminal input so keys arrive as escape sequences (Console).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes", "Win32_System_Console"] }
 
 [dev-dependencies]
 proptest = "1"

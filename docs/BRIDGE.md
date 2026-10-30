@@ -32,6 +32,26 @@ the lock binary is not installed, prompts are sent without a claim, as the daemo
 
 Exit codes: 0 success, 2 usage, 1 failure (as in `sesync team`).
 
+### Machines: this machine as another machine's client
+
+`sesync machine` uses another machine's bridge the way the phone does, so a machine sees and drives the
+conversations of the others. Plan for the TUI tab and for the phone deciding which machines see each other:
+`~/projects/agent-hub-notes/machines-plan-2026-10-30.md`.
+
+| Command | What it does |
+|---|---|
+| `sesync machine add <name> <pairing link>` | Saves a pairing made on the other machine with `sesync bridge pair --endpoint ws://ITS-ADDRESS:6768 --label <this machine>` (the `agenthub://pair?code=` link or the offer JSON), then checks that it answers. A name is 1 to 32 letters, digits, `-`, `_` or `.`; adding it again replaces it. |
+| `sesync machine list [<name>]` | For each machine, its conversations as its bridge lists them: state (the open pane's, else `closed`), title, harness, project directory, worktree id. |
+| `sesync machine attach <name> <conversation>` | Mirrors the conversation's pane in this terminal and types into it. The conversation is named by its worktree id, its title (any case), or a part of the title that fits only one; two that fit list their ids. One not open there is opened in that machine's herdr first, as the phone's Resume. Ctrl-] detaches. Run inside a herdr tab, this is a remote terminal tab. |
+| `sesync machine remove <name>` | Forgets the machine here. Its device stays paired there until `sesync bridge revoke` on it. |
+
+`machines.json` sits in `$SESYNC_CONFIG_DIR` (default `~/.config/sesync/`), `0600`, written atomically: it holds
+each machine's endpoint, public key and device token. Attach reads the JSON terminal stream (full repaints), draws
+each repaint cut to the window with the bottom rows kept and autowrap off (the remote pane keeps its own size, as on
+the phone), and sends keys as `terminal.send` text, as the phone's terminal keyboard does: Enter there is typing,
+not a prompt turn, so it takes no conversation claim. The channel is the legacy one below (classical, inside
+WireGuard); the hybrid ML-KEM handshake (agent-hub #6) comes before machines are linked without a hand-made pairing.
+
 ## Files
 
 Under `$SESYNC_CONFIG_DIR/bridge/` (default `~/.config/sesync/bridge/`). The directory is `0700`.
