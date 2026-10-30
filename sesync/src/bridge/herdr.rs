@@ -538,6 +538,62 @@ pub fn live_process_argvs(result: &Value) -> Result<Vec<Vec<String>>, String> {
     parse_process_argvs_with(result, open_session_file)
 }
 
+/// The session each agent pane reported to herdr through its integration, by pane id: the `value` of
+/// `agent.list`'s `agent_session` (a session file path for omp and Pi, a session id for Claude and OpenCode).
+pub fn agent_sessions(h: &dyn Herdr) -> Result<HashMap<String, String>, String> {
+    Ok(parse_agent_sessions(&h.call("agent.list", json!({}))?))
+}
+
+/// The pane-to-session map of an `agent_list` result. Agents without a reported session are skipped.
+pub fn parse_agent_sessions(result: &Value) -> HashMap<String, String> {
+    result["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let pane = a["pane_id"].as_str()?;
+            let session = a["agent_session"]["value"].as_str().filter(|s| !s.is_empty())?;
+            Some((pane.to_string(), session.to_string()))
+        })
+        .collect()
+}
+
+/// `argvs` with each session-file argument replaced by the session file the pane's agent reported to herdr, when that
+/// is another file in the same directory: the move `open_session_file` follows through `/proc` on Linux, found on
+/// every platform. The argument keeps its own spelling of the directory (on Windows sesync's resume path mixes `/` and
+/// `\`, herdr's does not), so it still equals the path a conversation resumes. Unchanged when nothing was reported, the
+/// report is not a file in that directory, or it names the same file.
+pub fn with_reported_session(argvs: Vec<Vec<String>>, reported: Option<&str>) -> Vec<Vec<String>> {
+    let Some(reported) = reported.filter(|r| r.ends_with(".jsonl")) else { return argvs };
+    let reported = Path::new(reported);
+    let (Some(dir), Some(name)) = (reported.parent(), reported.file_name()) else { return argvs };
+    argvs
+        .into_iter()
+        .map(|argv| {
+            argv.into_iter()
+                .map(|arg| {
+                    let current = Path::new(&arg);
+                    let moved = arg.ends_with(".jsonl")
+                        && current.parent().is_some_and(|d| same_path(d, dir))
+                        && current.file_name().is_some_and(|n| !same_path(Path::new(n), Path::new(name)));
+                    if moved { current.with_file_name(name).to_string_lossy().into_owned() } else { arg }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Two paths name the same file: equal as written, or, on Windows, equal once `/` and `\` are unified and case is ignored.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    cfg!(windows) && {
+        let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+        norm(a) == norm(b)
+    }
+}
+
 /// The pane's visible screen with its colour codes, every row as herdr rendered it.
 pub fn read_visible(h: &dyn Herdr, pane_id: &str) -> Result<String, String> {
     let result = h.call(
@@ -623,6 +679,48 @@ mod tests {
         let none = |_: u64, _: &[String]| None;
         assert_eq!(parse_process_argvs_with(&result, none).unwrap(), vec![vec!["claude", "--resume", "abc"]]);
         assert!(parse_process_argvs_with(&json!({"process_info": {}}), none).is_err());
+    }
+
+    #[test]
+    fn agent_sessions_map_each_pane_to_the_session_its_agent_reported() {
+        let result = json!({ "type": "agent_list", "agents": [
+            { "pane_id": "w6:p3", "agent": "omp", "agent_session": { "source": "herdr:omp", "kind": "path", "value": "/s/-p/new.jsonl" } },
+            { "pane_id": "w1:pD", "agent": "claude", "agent_session": { "kind": "id", "value": "uuid-1" } },
+            { "pane_id": "w5:p7", "agent": "omp" },
+            { "pane_id": "w3:p2", "agent": "omp", "agent_session": { "kind": "path", "value": "" } }
+        ]});
+        let sessions = parse_agent_sessions(&result);
+        assert_eq!(sessions.len(), 2, "panes without a reported session are skipped: {sessions:?}");
+        assert_eq!(sessions["w6:p3"], "/s/-p/new.jsonl");
+        assert_eq!(sessions["w1:pD"], "uuid-1");
+        assert!(parse_agent_sessions(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_session_file_the_agent_moved_to_replaces_the_stale_argument_in_its_spelling() {
+        let argvs = || vec![vec!["omp".to_string(), "--resume".to_string(), "/s/-p/old.jsonl".to_string()]];
+        assert_eq!(
+            with_reported_session(argvs(), Some("/s/-p/new.jsonl")),
+            vec![vec!["omp", "--resume", "/s/-p/new.jsonl"]],
+            "the move omp makes: same directory, new file"
+        );
+        assert_eq!(with_reported_session(argvs(), Some("/s/-p/old.jsonl")), argvs(), "the same file stays");
+        assert_eq!(with_reported_session(argvs(), Some("/s/-other/new.jsonl")), argvs(), "another directory is not a move");
+        assert_eq!(with_reported_session(argvs(), Some("uuid-1")), argvs(), "an id is not a session file");
+        assert_eq!(with_reported_session(argvs(), None), argvs());
+        let claude = vec![vec!["claude".to_string(), "--resume".to_string(), "abc".to_string()]];
+        assert_eq!(with_reported_session(claude.clone(), Some("/s/-p/new.jsonl")), claude, "only session-file arguments change");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_moved_file_keeps_the_arguments_mixed_separators() {
+        let argvs = vec![vec!["omp.exe".to_string(), "--resume".to_string(), r"C:\Users\u\.omp/agent\sessions\-P\old.jsonl".to_string()]];
+        assert_eq!(
+            with_reported_session(argvs.clone(), Some(r"c:\users\u\.omp\agent\sessions\-P\new.jsonl")),
+            vec![vec!["omp.exe", "--resume", r"C:\Users\u\.omp/agent\sessions\-P\new.jsonl"]]
+        );
+        assert_eq!(with_reported_session(argvs.clone(), Some(r"C:\Users\u\.omp\agent\sessions\-P\OLD.jsonl")), argvs);
     }
 
     #[test]

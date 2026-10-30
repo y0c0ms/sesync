@@ -832,7 +832,10 @@ mod tests {
         assert_eq!(reply["error"]["code"], "conversation_locked");
         assert!(reply["error"]["message"].as_str().unwrap().contains("claude 4242"));
         let sent: Vec<String> = h.calls.lock().iter().map(|(m, _)| m.clone()).collect();
-        assert!(!sent.iter().any(|m| m.starts_with("agent.") || m == "pane.send_text"), "nothing is typed into a locked conversation");
+        assert!(
+            !sent.iter().any(|m| matches!(m.as_str(), "agent.prompt" | "pane.send_text" | "pane.send_keys")),
+            "nothing is typed into a locked conversation: {sent:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

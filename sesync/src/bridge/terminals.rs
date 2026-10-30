@@ -75,11 +75,19 @@ pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Ve
             .map(|((_, terminal), worktree)| (terminal.clone(), worktree.clone()))
             .collect()
     };
+    // The session each agent reported to herdr: places a pane whose agent moved its session to a new file on every
+    // platform (`herdr::with_reported_session`). Best effort, and read only when some pane runs an agent.
+    let reported = if panes.iter().any(|p| p.agent.is_some()) {
+        herdr::agent_sessions(h).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
     let mut running: Vec<Running> = panes
         .into_iter()
         .map(|pane| {
             let argvs = herdr::foreground_argvs(h, &pane.pane_id)
                 .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
+            let argvs = herdr::with_reported_session(argvs, reported.get(&pane.pane_id).map(String::as_str));
             let prompt = blocked_prompt(h, &pane);
             let owner = owners.get(&pane.terminal_id).cloned();
             Ok(Running { pane, argvs, prompt, owner, fallback: None })
