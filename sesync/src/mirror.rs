@@ -106,12 +106,23 @@ pub fn copy_stat(fmt: &str, path: &std::path::Path) -> CopyStat {
             Ok(m) => {
                 let since = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
                 mtime = mtime.max(since.map_or(0.0, |d| d.as_secs_f64()));
-                parts.push(format!("{}:{}:{}", m.len(), since.map_or(0, |d| d.as_nanos()), inode(&m)));
+                parts.push(identity_of(&m));
             }
             Err(_) => parts.push("missing".to_string()),
         }
     }
     CopyStat { mtime, identity: parts.join("+") }
+}
+
+/// The identity of one file: size, modification time in nanoseconds and inode, as `copy_stat`
+/// records it. None when the file cannot be read.
+pub fn file_identity(path: &std::path::Path) -> Option<String> {
+    std::fs::metadata(path).ok().map(|m| identity_of(&m))
+}
+
+fn identity_of(m: &std::fs::Metadata) -> String {
+    let nanos = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    format!("{}:{nanos}:{}", m.len(), inode(m))
 }
 
 #[cfg(unix)]
@@ -168,4 +179,89 @@ pub fn remove_copy(fmt: &str, path: &std::path::Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sesync-mirror-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Hash through the cache, the way the scan does: the identity is taken first, from this pass's stat.
+    fn hash(cache: &mut CopyHashes, path: &Path) -> String {
+        let id = copy_stat("omp", path).identity;
+        cache.hash("omp", path, &id).unwrap()
+    }
+
+    #[test]
+    fn a_copy_is_read_again_only_when_its_size_mtime_or_inode_moves() {
+        let d = scratch("identity");
+        let f = d.join("a.jsonl");
+        std::fs::write(&f, b"abc").unwrap();
+        let at = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(at).unwrap();
+        let mut cache = CopyHashes::default();
+        let first = hash(&mut cache, &f);
+        assert_eq!(first, file_hash(&f).unwrap());
+        cache.end_pass();
+
+        // Same size and mtime: the stored hash is returned without reading the file again.
+        std::fs::write(&f, b"xyz").unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(at).unwrap();
+        assert_eq!(hash(&mut cache, &f), first);
+        cache.end_pass();
+
+        // A size change is read again.
+        std::fs::write(&f, b"abcdef").unwrap();
+        assert_eq!(hash(&mut cache, &f), file_hash(&f).unwrap());
+        cache.end_pass();
+
+        // An mtime change with the same size is read again.
+        std::fs::write(&f, b"uvwxyz").unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(at + Duration::from_secs(5)).unwrap();
+        assert_eq!(hash(&mut cache, &f), file_hash(&f).unwrap());
+        cache.end_pass();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_file_with_the_same_size_and_mtime_is_read_again() {
+        let d = scratch("inode");
+        let f = d.join("a.jsonl");
+        let next = d.join("next.jsonl");
+        std::fs::write(&f, b"abc").unwrap();
+        std::fs::write(&next, b"xyz").unwrap();
+        let at = SystemTime::now() - Duration::from_secs(3600);
+        for p in [&f, &next] {
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(at).unwrap();
+        }
+        let mut cache = CopyHashes::default();
+        assert_eq!(hash(&mut cache, &f), file_hash(&f).unwrap());
+        cache.end_pass();
+        // An atomic replace keeps size and mtime; only the inode moves.
+        std::fs::rename(&next, &f).unwrap();
+        assert_eq!(hash(&mut cache, &f), file_hash(&f).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_copy_the_pass_did_not_see_is_forgotten() {
+        let d = scratch("forget");
+        let f = d.join("a.jsonl");
+        std::fs::write(&f, b"abc").unwrap();
+        let mut cache = CopyHashes::default();
+        hash(&mut cache, &f);
+        cache.end_pass();
+        assert_eq!(cache.hashed.len(), 1);
+        cache.end_pass();
+        assert!(cache.hashed.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
