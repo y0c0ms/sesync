@@ -920,6 +920,11 @@ impl State {
         // disk before the rename, then the directory entry is synced. A crash leaves the old file
         // or the new one, never a truncated one: team_seen floors must not silently reset.
         let json = serde_json::to_string_pretty(&data).map_err(invalid)?;
+        // A pass that changed nothing leaves the file as it is: the same bytes are not written again,
+        // so an idle daemon does not fsync and rename the state every few seconds.
+        if fs::read(path).is_ok_and(|held| held == json.as_bytes()) {
+            return Ok(());
+        }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos()).unwrap_or(0);
         let tmp = path.with_file_name(format!("{}.{}.{nanos}.tmp",
