@@ -307,12 +307,12 @@ pub(super) fn is_uuid(s: &str) -> bool {
 pub(super) fn one_level_down(root: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf> {
     let Ok(dirs) = fs::read_dir(root) else { return Vec::new() };
     let mut out = Vec::new();
-    for d in dirs.flatten().filter(|d| d.path().is_dir()) {
+    for d in dirs.flatten().filter(|d| is_kind(d, true)) {
         let Ok(files) = fs::read_dir(d.path()) else { continue };
         for f in files.flatten() {
             let p = f.path();
             if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if p.is_file() && keep(name) {
+                if is_kind(&f, false) && keep(name) {
                     out.push(p);
                 }
             }
@@ -320,6 +320,15 @@ pub(super) fn one_level_down(root: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf
     }
     out.sort();
     out
+}
+
+/// Whether a directory entry is a directory (`dir`) or a file, as `Path::is_dir` and `Path::is_file`
+/// say, but read from the listing, so an ordinary entry costs no stat. A symlink is followed as before.
+fn is_kind(e: &fs::DirEntry, dir: bool) -> bool {
+    match e.file_type() {
+        Ok(t) if !t.is_symlink() => if dir { t.is_dir() } else { t.is_file() },
+        _ => if dir { e.path().is_dir() } else { e.path().is_file() },
+    }
 }
 
 /// omp or Pi session files under `<agent_dir>/sessions/*/`.

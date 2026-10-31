@@ -375,3 +375,63 @@ fn a_pass_dates_an_older_file_copy_from_the_file_and_leaves_an_opencode_copy_und
     assert!((pi.ok_at - 1_600_000_000.0).abs() < 1.0, "dated from the file, not the pass: {pi:?}");
     assert!(!sync.contains_key("opencode"), "an OpenCode copy waits for its next write: {sync:?}");
 }
+
+#[test]
+fn a_change_made_during_the_quiet_period_is_mirrored_once_it_ends() {
+    // The passes that wait for a session to go quiet must not leave a stale hash behind: the pass
+    // that finds the session quiet has to see the change and mirror it.
+    let sb = sandbox("quiet-change");
+    let src = omp_session(&sb);
+    fs::create_dir_all(sb.join("pi").join("sessions")).unwrap();
+    let mut child = Command::new(BIN)
+        .arg("--watch")
+        .env("SESYNC_DIR", sb.join("state"))
+        .env("OMP_AGENT_DIR", sb.join("omp"))
+        .env("PI_AGENT_DIR", sb.join("pi"))
+        .env("CLAUDE_CONFIG_DIR", sb.join("claude"))
+        .env("OPENCODE_DB", sb.join("no-opencode").join("opencode.db"))
+        .env("SESYNC_LOCK", sb.join("no-sesync_lock"))
+        .env("SESYNC_LOCK_DIR", sb.join("locks"))
+        .env("SESYNC_CONV", sesync_conv())
+        .env("SESYNC_QUIET", "2")
+        .env("SESYNC_PASSES", "600")
+        .env("SESYNC_POLL", "0.1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start the daemon");
+    let state_path = sb.join("state").join("state.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !state_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut st = sesync::state::State::load(&state_path).unwrap();
+    let key = src.display().to_string();
+    st.sources.entry(key.clone())
+        .or_insert_with(|| sesync::state::Source::new("omp", &key))
+        .chosen_targets.insert("pi".into());
+    st.save_user(&state_path).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while pi_mirrors(&sb).is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!pi_mirrors(&sb).is_empty(), "the chosen session is mirrored first");
+
+    // A turn lands now, inside the quiet period: the daemon sees it on every pass until it is quiet.
+    let turn = r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-10-01T10:05:00.000Z","message":{"role":"user","content":"quiet-period turn"}}"#;
+    let mut body = fs::read_to_string(&src).unwrap();
+    body.push_str(turn);
+    body.push('\n');
+    fs::write(&src, body).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut carried = false;
+    while std::time::Instant::now() < deadline && !carried {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        carried = pi_mirrors(&sb).iter().any(|m| fs::read_to_string(m).map_or(false, |t| t.contains("quiet-period turn")));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(carried, "the turn written during the quiet period reaches the pi copy once the session is quiet");
+}

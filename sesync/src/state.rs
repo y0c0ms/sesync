@@ -133,7 +133,6 @@ pub struct Source {
     pub conv: String,
     pub last_seen_change: f64,
     pub last_hash: String,
-    pub last_stamp: String,
     pub failures: u32,
     /// When the last attempt failed, seconds since the epoch. Retries back off from it;
     /// a source that changes is retried regardless.
@@ -631,7 +630,6 @@ impl State {
                     key: s("key"),
                     last_seen_change: v.get("last_seen_change").and_then(Value::as_f64).unwrap_or(0.0),
                     last_hash: s("last_hash"),
-                    last_stamp: s("last_stamp"),
                     failures: v.get("failures").and_then(Value::as_u64).unwrap_or(0) as u32,
                     last_failure: v.get("last_failure").and_then(Value::as_f64).unwrap_or(0.0),
                     mirrors: HashMap::new(),
@@ -899,7 +897,7 @@ impl State {
             let mirrors: BTreeMap<&String, &Mirror> = s.mirrors.iter().collect();
             (k, serde_json::json!({
                 "fmt": s.fmt, "key": s.key, "last_seen_change": s.last_seen_change,
-                "last_hash": s.last_hash, "last_stamp": s.last_stamp, "failures": s.failures,
+                "last_hash": s.last_hash, "failures": s.failures,
                 "last_failure": s.last_failure,
                 "mirrors": mirrors, "chosen_targets": s.chosen_targets.iter().collect::<Vec<_>>(),
                 "title": s.title, "turn_at": s.turn_at, "conv": s.conv,
@@ -922,6 +920,11 @@ impl State {
         // disk before the rename, then the directory entry is synced. A crash leaves the old file
         // or the new one, never a truncated one: team_seen floors must not silently reset.
         let json = serde_json::to_string_pretty(&data).map_err(invalid)?;
+        // A pass that changed nothing leaves the file as it is: the same bytes are not written again,
+        // so an idle daemon does not fsync and rename the state every few seconds.
+        if fs::read(path).is_ok_and(|held| held == json.as_bytes()) {
+            return Ok(());
+        }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos()).unwrap_or(0);
         let tmp = path.with_file_name(format!("{}.{}.{nanos}.tmp",
