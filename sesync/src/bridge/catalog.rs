@@ -5,8 +5,9 @@
 //! saves the state.
 
 use crate::harness::{self, Kind};
-use crate::manage::{self, Roots};
+use crate::manage::{self, Roots, TitleCache};
 use crate::state::State;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -112,17 +113,25 @@ pub trait Catalog: Send + Sync {
     }
 }
 
-/// The real catalog: the saved sesync state plus the harness stores under `roots`.
+/// The real catalog: the saved sesync state plus the harness stores under `roots`. The titles it has read are
+/// kept across builds, so a build re-reads only the files whose size or change time moved (`manage::TitleCache`).
 pub struct StateCatalog {
     pub roots: Roots,
     pub state_file: PathBuf,
+    titles: Mutex<TitleCache>,
+}
+
+impl StateCatalog {
+    pub fn new(roots: Roots, state_file: PathBuf) -> StateCatalog {
+        StateCatalog { roots, state_file, titles: Mutex::new(TitleCache::default()) }
+    }
 }
 
 impl Catalog for StateCatalog {
     fn conversations(&self) -> Result<Vec<Conversation>, String> {
         let state = State::load(&self.state_file)
             .map_err(|e| format!("cannot read the sesync state: {e}"))?;
-        let groups = manage::list_groups(&self.roots, &state);
+        let groups = manage::list_groups_cached(&self.roots, &state, &mut self.titles.lock());
         let store_dirs = self.store_directories();
         let mut out = Vec::new();
         for g in groups.into_iter().filter(|g| !g.orphan) {
