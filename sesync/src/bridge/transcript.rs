@@ -499,9 +499,10 @@ fn failure_text(m: &Value) -> Option<String> {
     }
     let raw = m.get("errorMessage").and_then(Value::as_str).unwrap_or("").trim();
     let status = raw.split_whitespace().next().filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()));
+    // The first JSON value after the status: omp appends lines after it (a `raw-http-request=` log path).
     let provider_message = raw
         .find('{')
-        .and_then(|at| serde_json::from_str::<Value>(&raw[at..]).ok())
+        .and_then(|at| serde_json::Deserializer::from_str(&raw[at..]).into_iter::<Value>().next()?.ok())
         .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string));
     let reason = match (provider_message, status) {
         (Some(text), Some(code)) => format!("{text} (HTTP {code})"),
@@ -942,7 +943,7 @@ mod tests {
         // As omp journalled it on 2026-10-31 after its Anthropic login was lost: no content, only the error.
         let refused = json!({
             "role": "assistant", "content": [], "provider": "anthropic", "model": "claude-opus-5-5", "stopReason": "error",
-            "errorMessage": "400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API.\"},\"request_id\":\"req_1\"}",
+            "errorMessage": "400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API.\"},\"request_id\":\"req_1\"}\nraw-http-request=/home/u/.omp/logs/http-400-requests/1.json",
         });
         let row = message_row(&refused, "e1", Some(1), 7).expect("a failed turn is not dropped");
         assert_eq!(row["role"], "system");
