@@ -467,6 +467,14 @@ impl Watcher {
         terminals::reassign_fallbacks(&mut self.panes, &self.conversations, &self.labels);
         false
     }
+
+    /// One status change as herdr reported it: applied, then observed at once, and whether the pane list must be
+    /// read again (`apply`). Observed before any re-read: a short turn's `working` is often over by the time the list
+    /// is read again, and a read that already shows `idle` would hide the turn (an e2e run missed a Finished so).
+    fn on_status(&mut self, pane_id: &str, status: &str, agent: Option<String>, title: Option<String>) -> (bool, Vec<Raised<'_>>) {
+        let read_again = self.apply(pane_id, status, agent, title);
+        (read_again, self.memory.observe(&self.panes, &self.conversations))
+    }
 }
 
 /// The panes whose status is subscribed to, sorted: those with an agent or a status herdr reports. A pane with
@@ -527,7 +535,9 @@ fn watch(ctx: &Ctx, every: Duration) {
         };
         match events.next(wait) {
             Ok(Some(Change::Status { pane_id, status, agent, title })) => {
-                if w.apply(&pane_id, &status, agent, title) {
+                let (read_again, raised) = w.on_status(&pane_id, &status, agent, title);
+                emit_raised(ctx, raised);
+                if read_again {
                     w.pending = true;
                 }
             }
@@ -660,16 +670,33 @@ mod tests {
 
     #[test]
     fn a_status_event_moves_its_pane_and_raises_the_transition() {
-        let convs = [conversation("t", "s1")];
-        let mut w = Watcher::default();
+        let convs = vec![conversation("t", "s1")];
+        let mut w = Watcher { conversations: convs, ..Watcher::default() };
         w.panes = vec![running_conversation("term_a", "working", "s1"), pane("term_b", "working")];
-        assert!(w.memory.observe(&w.panes, &convs).is_empty());
-        assert!(w.apply("p-term_a", "idle", None, None), "a status that moved asks for the panes to be read");
-        let raised = w.memory.observe(&w.panes, &convs);
+        assert!(w.memory.observe(&w.panes, &w.conversations).is_empty());
+        let (read_again, raised) = w.on_status("p-term_a", "idle", None, None);
+        assert!(read_again, "a status that moved asks for the panes to be read");
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].kind, FINISHED);
         assert_eq!(raised[0].terminal_id, "term_a");
         assert!(w.apply("p-gone", "idle", None, None), "a pane no listing has asks for the panes to be read");
+    }
+
+    #[test]
+    fn a_turn_over_before_the_list_is_read_again_still_raises_finished_once() {
+        let mut w = Watcher { conversations: vec![conversation("t", "s1")], ..Watcher::default() };
+        w.panes = vec![running_conversation("term_a", "idle", "s1")];
+        assert!(w.memory.observe(&w.panes, &w.conversations).is_empty());
+        // The prompt starts a turn: herdr reports `working`.
+        let (read_again, raised) = w.on_status("p-term_a", "working", None, None);
+        assert!(read_again && raised.is_empty());
+        // The fake model answers at once: the list read that `working` asked for already shows `idle`.
+        w.panes = vec![running_conversation("term_a", "idle", "s1")];
+        let raised = w.memory.observe(&w.panes, &w.conversations);
+        assert_eq!(raised.iter().map(|r| r.kind).collect::<Vec<_>>(), vec![FINISHED]);
+        // Then herdr's own `idle` event arrives: nothing new.
+        let (_, raised) = w.on_status("p-term_a", "idle", None, None);
+        assert!(raised.is_empty(), "one turn, one notification");
     }
 
     fn hub_with_three() -> Hub {
