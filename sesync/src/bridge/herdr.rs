@@ -8,6 +8,7 @@
 //! socket is used only in production and in the sandboxed integration test. Pane and read
 //! parsing lives here too, as pure functions over the `result` object.
 
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,12 @@ pub trait Herdr: Send + Sync {
         String::new()
     }
 
+    /// What this server's panes were read as, kept between listings (`ProcessMemo`). None when nothing is kept, as
+    /// for the canned answers of a test, so each listing reads herdr.
+    fn process_memo(&self) -> Option<&ProcessMemo> {
+        None
+    }
+
     /// A stream of changes: each status change of a pane in `pane_ids`, and every change to the pane list
     /// (`Change::Panes`). Canned answers have none, so the default refuses.
     fn status_events(&self, _pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
@@ -73,16 +80,118 @@ pub trait StatusSource: Send {
 /// herdr over its API socket.
 pub struct Socket {
     path: PathBuf,
+    memo: ProcessMemo,
 }
 
 impl Socket {
     pub fn new(path: impl Into<PathBuf>) -> Socket {
-        Socket { path: path.into() }
+        Socket { path: path.into(), memo: ProcessMemo::new(PROCESS_MAX_AGE) }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// How long a pane's processes, and the agent sessions and tab labels a listing reads, are reused while the pane
+/// list shows the same panes in the same state. A process change that shows in no listed field (a pane's title,
+/// agent, status, directory or tab) is seen within this long.
+pub const PROCESS_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// The reads of one herdr server's panes that a listing keeps for the next one: each pane's foreground processes,
+/// and the sessions its agents report and the labels of its tabs. The phone polls the pane list, and each listing
+/// used to read every pane's processes again: a call on its own connection each. A reading is reused only while the
+/// pane is listed as it was and the reading is younger than `max_age`.
+pub struct ProcessMemo {
+    max_age: Duration,
+    panes: Mutex<HashMap<String, Remembered>>,
+    /// The sessions the agents report, and the tab labels, each with the agent panes they were read for.
+    sessions: Mutex<Option<Shared>>,
+    labels: Mutex<Option<Shared>>,
+}
+
+/// The listed fields a pane's processes are read by: which pane it is, the agent in it and the directory its
+/// foreground runs in. A title or status change (a spinner's frame, a turn) does not change the processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessKey {
+    terminal_id: String,
+    tab_id: String,
+    agent: Option<String>,
+    foreground_cwd: Option<String>,
+}
+
+impl ProcessKey {
+    fn of(pane: &Pane) -> ProcessKey {
+        ProcessKey {
+            terminal_id: pane.terminal_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            agent: pane.agent.clone(),
+            foreground_cwd: pane.foreground_cwd.clone(),
+        }
+    }
+}
+
+struct Remembered {
+    key: ProcessKey,
+    argvs: Vec<Vec<String>>,
+    at: Instant,
+}
+
+struct Shared {
+    key: String,
+    at: Instant,
+    map: HashMap<String, String>,
+}
+
+impl ProcessMemo {
+    pub fn new(max_age: Duration) -> ProcessMemo {
+        ProcessMemo { max_age, panes: Mutex::new(HashMap::new()), sessions: Mutex::new(None), labels: Mutex::new(None) }
+    }
+
+    /// The argument lists of `pane`'s foreground processes: the kept reading when the pane's processes are listed as
+    /// they were (`ProcessKey`) and the reading is fresh, else what `read` reads (and keeps).
+    pub fn argvs(&self, pane: &Pane, read: impl FnOnce() -> Result<Vec<Vec<String>>, String>) -> Result<Vec<Vec<String>>, String> {
+        let key = ProcessKey::of(pane);
+        if let Some(kept) = self.panes.lock().get(&pane.pane_id) {
+            if kept.key == key && kept.at.elapsed() < self.max_age {
+                return Ok(kept.argvs.clone());
+            }
+        }
+        let argvs = read()?;
+        self.panes.lock().insert(pane.pane_id.clone(), Remembered { key, argvs: argvs.clone(), at: Instant::now() });
+        Ok(argvs)
+    }
+
+    /// The sessions the agents report (`agent_sessions`), kept while `key` (the agent panes as listed) is the same.
+    pub fn sessions(&self, key: &str, read: impl FnOnce() -> Result<HashMap<String, String>, String>) -> Result<HashMap<String, String>, String> {
+        shared(&self.sessions, self.max_age, key, read)
+    }
+
+    /// The tab labels (`tab_labels`), kept while `key` (the agent panes as listed) is the same.
+    pub fn labels(&self, key: &str, read: impl FnOnce() -> Result<HashMap<String, String>, String>) -> Result<HashMap<String, String>, String> {
+        shared(&self.labels, self.max_age, key, read)
+    }
+
+    /// Forget the panes a listing no longer has, so the memo holds only what is open.
+    pub fn retain(&self, pane_ids: &[String]) {
+        self.panes.lock().retain(|id, _| pane_ids.contains(id));
+    }
+}
+
+fn shared(
+    slot: &Mutex<Option<Shared>>,
+    max_age: Duration,
+    key: &str,
+    read: impl FnOnce() -> Result<HashMap<String, String>, String>,
+) -> Result<HashMap<String, String>, String> {
+    if let Some(kept) = slot.lock().as_ref() {
+        if kept.key == key && kept.at.elapsed() < max_age {
+            return Ok(kept.map.clone());
+        }
+    }
+    let map = read()?;
+    *slot.lock() = Some(Shared { key: key.to_string(), at: Instant::now(), map: map.clone() });
+    Ok(map)
 }
 
 /// One connection to herdr's API. On Unix it is the socket file. On Windows herdr (through the
@@ -207,6 +316,10 @@ impl Conn {
 }
 
 impl Herdr for Socket {
+    fn process_memo(&self) -> Option<&ProcessMemo> {
+        Some(&self.memo)
+    }
+
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let mut conn = Conn::open(&self.path)?;
         let request = json!({ "id": "sesync", "method": method, "params": params });
@@ -943,5 +1056,59 @@ mod tests {
             Err(e) => assert!(e.contains("no such pane"), "{e}"),
         }
         drop(release);
+    }
+
+    fn listed(id: &str, title: &str) -> Pane {
+        Pane {
+            pane_id: id.into(),
+            terminal_id: format!("term_{id}"),
+            tab_id: "t1".into(),
+            focused: false,
+            agent_status: "idle".into(),
+            agent: Some("omp".into()),
+            title: Some(title.into()),
+            foreground_cwd: None,
+            rows: None,
+        }
+    }
+
+    #[test]
+    fn a_kept_reading_serves_a_pane_whose_processes_are_listed_as_they_were() {
+        let memo = ProcessMemo::new(Duration::from_secs(60));
+        let first = vec![vec!["omp".to_string(), "--resume".to_string()]];
+        let pane = listed("w1:p1", "π > one");
+        let mut reads = 0;
+        let got = memo.argvs(&pane, || {
+            reads += 1;
+            Ok(first.clone())
+        });
+        assert_eq!(got.unwrap(), first);
+        let again = memo.argvs(&pane, || panic!("a pane listed as it was is not read again"));
+        assert_eq!(again.unwrap(), first);
+        let retitled = listed("w1:p1", "π ! one");
+        let same_processes = memo.argvs(&retitled, || panic!("a title change does not change the processes"));
+        assert_eq!(same_processes.unwrap(), first);
+        let mut moved = listed("w1:p1", "π ! one");
+        moved.agent = Some("claude".into());
+        let changed = memo.argvs(&moved, || Ok(vec![vec!["claude".to_string(), "--resume".to_string(), "x".to_string()]]));
+        assert_eq!(changed.unwrap()[0].len(), 3, "a pane whose agent changed is read again");
+        assert_eq!(reads, 1);
+
+        let stale = ProcessMemo::new(Duration::ZERO);
+        stale.argvs(&pane, || Ok(first.clone())).unwrap();
+        let mut read_again = false;
+        stale.argvs(&pane, || {
+            read_again = true;
+            Ok(first.clone())
+        }).unwrap();
+        assert!(read_again, "a reading older than the maximum age is read again");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_kept() {
+        let memo = ProcessMemo::new(Duration::from_secs(60));
+        let pane = listed("w1:p2", "π > two");
+        assert!(memo.argvs(&pane, || Err("herdr refused".into())).is_err());
+        assert_eq!(memo.argvs(&pane, || Ok(Vec::new())).unwrap(), Vec::<Vec<String>>::new());
     }
 }

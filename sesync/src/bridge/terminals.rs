@@ -89,16 +89,25 @@ pub fn running_listed(
     };
     // The session each agent reported to herdr: places a pane whose agent moved its session to a new file on every
     // platform (`herdr::with_reported_session`). Best effort, and read only when some pane runs an agent.
+    let agents = agent_key(&panes);
     let reported = if panes.iter().any(|p| p.agent.is_some()) {
-        herdr::agent_sessions(h).unwrap_or_default()
+        match h.process_memo() {
+            Some(memo) => memo.sessions(&agents, || herdr::agent_sessions(h)),
+            None => herdr::agent_sessions(h),
+        }
+        .unwrap_or_default()
     } else {
         HashMap::new()
     };
     let mut running: Vec<Running> = panes
         .into_iter()
         .map(|pane| {
-            let argvs = herdr::foreground_argvs(h, &pane.pane_id)
-                .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
+            let read = || herdr::foreground_argvs(h, &pane.pane_id);
+            let argvs = match h.process_memo() {
+                Some(memo) => memo.argvs(&pane, read),
+                None => read(),
+            }
+            .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
             let reported_session = reported.get(&pane.pane_id).map(String::as_str);
             let argvs = herdr::with_reported_session(argvs, reported_session);
             let named = conversations.iter().any(|c| c.idents.iter().any(|i| herdr_open::argv_carries(&argvs, i)));
@@ -110,12 +119,31 @@ pub fn running_listed(
         .collect::<Result<_, String>>()?;
     // Tab labels cost one herdr call, so they are read only when some pane runs an agent.
     let labels = if running.iter().any(|r| r.pane.agent.is_some()) {
-        herdr::tab_labels(h).unwrap_or_default()
+        match h.process_memo() {
+            Some(memo) => memo.labels(&agents, || herdr::tab_labels(h)),
+            None => herdr::tab_labels(h),
+        }
+        .unwrap_or_default()
     } else {
         HashMap::new()
     };
+    if let Some(memo) = h.process_memo() {
+        let ids: Vec<String> = running.iter().map(|r| r.pane.pane_id.clone()).collect();
+        memo.retain(&ids);
+    }
     assign_fallbacks(&mut running, conversations, &labels);
     Ok((running, labels))
+}
+
+/// What the agent reads of a listing depend on: the panes that run an agent, and the tab and state each is in.
+fn agent_key(panes: &[herdr::Pane]) -> String {
+    let mut parts: Vec<String> = panes
+        .iter()
+        .filter(|p| p.agent.is_some())
+        .map(|p| format!("{}|{}|{:?}|{}", p.pane_id, p.tab_id, p.agent, p.agent_status))
+        .collect();
+    parts.sort();
+    parts.join(";")
 }
 
 /// Give each pane its fallback conversation again, after a pane's title or agent changed: the same rules as
