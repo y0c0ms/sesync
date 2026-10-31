@@ -145,7 +145,12 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn, caller: Kind) -> Option
     };
     Some(match outcome {
         Ok(result) => success(&id, result),
-        Err((code, message)) => error(&id, code, &message),
+        Err((code, message)) => {
+            // A refusal the phone shows only as "Message not sent" is found here. The message is the bridge's own
+            // wording (a holder, a herdr error), never the prompt text.
+            eprintln!("bridge: {method} refused: {code}: {}", message.chars().take(200).collect::<String>());
+            error(&id, code, &message)
+        }
     })
 }
 
@@ -453,23 +458,24 @@ fn submit(ctx: &Ctx, pane: &herdr::Pane, text: &str) -> Result<(), Failure> {
     if pane.agent_status == "blocked" {
         return Err(("agent_waiting_on_prompt", "that pane is waiting on a prompt; answer it in the pane first".into()));
     }
-    if let Some(c) = &conv {
-        ctx.turns.begin(&ctx.locks, &c.lock_id(), &pane.terminal_id).map_err(|m| ("conversation_locked", m))?;
-    }
+    let turn = match &conv {
+        Some(c) => Some(ctx.turns.begin(&ctx.locks, &c.lock_id(), &pane.terminal_id).map_err(|m| ("conversation_locked", m))?),
+        None => None,
+    };
     let sent = if pane.agent.is_some() {
         herdr::agent_prompt(h, &pane.pane_id, text)
     } else {
         herdr::send_text(h, &pane.pane_id, text).and_then(|()| herdr::send_keys(h, &pane.pane_id, &["enter"]))
     };
-    match (sent, conv) {
-        (Ok(()), Some(c)) => {
-            ctx.turns.watch(ctx.locks.clone(), Arc::clone(&ctx.herdr), c.lock_id(), pane.pane_id.clone());
+    match (sent, conv.zip(turn)) {
+        (Ok(()), Some((c, turn))) => {
+            ctx.turns.watch(ctx.locks.clone(), Arc::clone(&ctx.herdr), c.lock_id(), pane.pane_id.clone(), turn);
             Ok(())
         }
         (Ok(()), None) => Ok(()),
-        (Err(message), conv) => {
-            if let Some(c) = conv {
-                ctx.turns.end(&ctx.locks, &c.lock_id());
+        (Err(message), held) => {
+            if let Some((c, turn)) = held {
+                ctx.turns.end(&ctx.locks, &c.lock_id(), turn);
             }
             Err(("send_failed", message))
         }

@@ -466,23 +466,55 @@ fn message_row(m: &Value, id: &str, at: Option<i64>, offset: u64) -> Option<Valu
     if (role == "custom" || role == "hookMessage") && !is_true(m.get("display")) {
         return None;
     }
-    let blocks = content_blocks(m.get("content"));
+    let mut blocks = content_blocks(m.get("content"));
+    let failure = (role == "assistant").then(|| failure_text(m)).flatten();
     if blocks.is_empty() {
-        // An aborted reply with no content still shows that it was interrupted.
+        // An aborted reply with no content still shows that it was interrupted, and a failed one why it failed.
         let aborted = role == "assistant" && m.get("stopReason").and_then(Value::as_str) == Some("aborted");
-        return aborted
-            .then(|| message(id, "system", vec![json!({ "type": "text", "text": INTERRUPTED })], at, offset));
+        let line = failure.or_else(|| aborted.then(|| INTERRUPTED.to_string()))?;
+        return Some(message(id, "system", vec![json!({ "type": "text", "text": line })], at, offset));
     }
     let row_role = match role {
         "user" => "user",
         "assistant" => "assistant",
         _ => "system",
     };
+    if let Some(line) = failure {
+        blocks.push(json!({ "type": "text", "text": line }));
+    }
     let mut row = message(id, row_role, blocks, at, offset);
     if row_role == "assistant" {
         serving(m, &mut row);
     }
     Some(row)
+}
+
+/// What a reply that ended in a provider error shows in the chat: the provider's own message when the error
+/// carries one (`{"error":{"message":…}}` after an HTTP status), else the error as recorded, with the model that
+/// failed. Without it a turn the provider refused (an expired login, an empty balance) shows nothing in the chat,
+/// and the phone cannot tell a dead session from a slow one. None for any other reply.
+fn failure_text(m: &Value) -> Option<String> {
+    if m.get("stopReason").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let raw = m.get("errorMessage").and_then(Value::as_str).unwrap_or("").trim();
+    let status = raw.split_whitespace().next().filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()));
+    let provider_message = raw
+        .find('{')
+        .and_then(|at| serde_json::from_str::<Value>(&raw[at..]).ok())
+        .and_then(|v| v.pointer("/error/message").and_then(Value::as_str).map(str::to_string));
+    let reason = match (provider_message, status) {
+        (Some(text), Some(code)) => format!("{text} (HTTP {code})"),
+        (Some(text), None) => text,
+        (None, _) if raw.is_empty() => "no reason given".to_string(),
+        (None, _) => clip(raw, 500),
+    };
+    let model = [m.get("provider"), m.get("model")]
+        .iter()
+        .filter_map(|v| v.and_then(Value::as_str).filter(|s| !s.is_empty()))
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(if model.is_empty() { format!("Model call failed: {reason}") } else { format!("Model call failed ({model}): {reason}") })
 }
 
 fn message(id: &str, role: &str, blocks: Vec<Value>, at: Option<i64>, offset: u64) -> Value {
@@ -903,5 +935,31 @@ mod tests {
     fn clips_cut_on_characters_and_say_so() {
         assert_eq!(clip("ééé", 2), format!("éé{CLIP_MARK}"));
         assert_eq!(clip("ééé", 3), "ééé");
+    }
+
+    #[test]
+    fn a_reply_the_provider_refused_shows_why_in_the_chat() {
+        // As omp journalled it on 2026-10-31 after its Anthropic login was lost: no content, only the error.
+        let refused = json!({
+            "role": "assistant", "content": [], "provider": "anthropic", "model": "claude-opus-5-5", "stopReason": "error",
+            "errorMessage": "400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API.\"},\"request_id\":\"req_1\"}",
+        });
+        let row = message_row(&refused, "e1", Some(1), 7).expect("a failed turn is not dropped");
+        assert_eq!(row["role"], "system");
+        assert_eq!(
+            row["blocks"][0]["text"],
+            "Model call failed (anthropic/claude-opus-5-5): Your credit balance is too low to access the Anthropic API. (HTTP 400)"
+        );
+
+        // A reply cut off by an error after some text keeps the text, then says why it stopped.
+        let partial = json!({ "role": "assistant", "content": [{ "type": "text", "text": "Half an answer" }], "stopReason": "error", "errorMessage": "socket hang up" });
+        let row = message_row(&partial, "e2", None, 8).unwrap();
+        assert_eq!(row["role"], "assistant");
+        assert_eq!(row["blocks"][1]["text"], "Model call failed: socket hang up");
+
+        let finished = json!({ "role": "assistant", "content": [{ "type": "text", "text": "done" }], "stopReason": "stop" });
+        assert_eq!(message_row(&finished, "e3", None, 9).unwrap()["blocks"].as_array().unwrap().len(), 1);
+        let aborted = json!({ "role": "assistant", "content": [], "stopReason": "aborted" });
+        assert_eq!(message_row(&aborted, "e4", None, 10).unwrap()["blocks"][0]["text"], INTERRUPTED);
     }
 }

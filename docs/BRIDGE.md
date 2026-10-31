@@ -267,7 +267,10 @@ does, so the TUI, the daemon and the other harnesses cannot write the same conve
 
 - A claim another harness holds refuses the prompt with `conversation_locked`, naming the holder
   (`claude 4242`). Nothing is typed.
-- A second prompt while the bridge's own turn runs is refused the same way.
+- A second prompt while the bridge's own turn runs (its agent has been seen `working` or `blocked`) is refused
+  the same way. One whose agent has not started (a model `/switch`, a `/login`, a turn the provider refused at
+  once) is taken over by the new prompt under the same claim; the old turn's watcher stands down. Before this, a
+  `/switch` held the conversation for 15 s and the phone's next message came back "Message not sent".
 - A pane with a detected agent gets the prompt through herdr's `agent.prompt` (text, then Enter, as one
   ordered submission). Any other pane gets the text, then `enter`.
 - The claim is released when the agent is seen `working` or `blocked` and then `idle` or `done`. A
@@ -276,6 +279,14 @@ does, so the TUI, the daemon and the other harnesses cannot write the same conve
 
 Other input (`text` without `enter`, `interrupt`, `clearBuffer`) is not a turn and is not claimed. `interrupt` sends
 `ctrl+c`; `terminal.clearBuffer` sends `ctrl+l`.
+
+Slash commands go through the same path: omp runs `/switch <model>` (fuzzy id or `provider/id`) and `/login
+<provider>` typed this way, as from its own keyboard (checked against the e2e sandbox's omp: `/switch fake/fake-32k`
+sent as the phone's chat does, `\x15` to clear the line and then the text with `enter`, changed the model).
+`/login` shows its authorization link and code prompt only on the terminal screen.
+
+Every refused request is logged as `bridge: <method> refused: <code>: <message>` (the bridge's own wording,
+never the prompt), so a "Message not sent" on the phone can be traced.
 
 ## Framing: legacy for the phone, hybrid for sesync clients, and a correction
 
@@ -347,6 +358,12 @@ Apart from pins and `terminal.clearBuffer` (Ctrl-L into the pane), none of these
 ## Chat view
 
 The chat screen for a terminal-backed agent reads the conversation's journal, not the pane. `nativeChat.readSession` and `nativeChat.subscribe` take the journal session id from the tab's `agentStatus.providerSession.id` (for omp and Pi, the session file path, which `omp --resume` takes). omp and Pi journals are read in process: the window starts at the last compaction's kept entry, and the compaction shows as a system line. Tool calls and their results are linked by call id, thinking is shown as text, and an image is a label (its bytes never go on the wire). Claude and OpenCode are converted first, by the converters the daemon uses: a Claude transcript by `sesync-conv from-claude`, an OpenCode session by `opencode export` run in the session's project directory and then `sesync-conv from-opencode`. The converted copy is kept under `<bridge state dir>/transcripts/` (owner-only), one per source state, named by the conversation and a digest of the source's stamp (a file's size and change time, or the store's own counts for the session). A read converts only when the stamp moved, and older copies are removed. A subscription rebuilds the copy once the stamp has held still for a poll (one second), or at most every five seconds while it keeps moving; conversions run one at a time. A harness whose source cannot be stamped answers `unavailable`. Paging uses a row cursor: `beforeOffset` is a record's position in the file. A subscription checks the file's length and modification time each second; a grown window is `appended`, a moved one is `replacement`.
+
+A reply that ended in a provider error (`stopReason:"error"`) shows why: `Model call failed (<provider>/<model>):
+<the provider's message> (HTTP <status>)`, as a system line when the reply has no content, or after its text. Before
+this, such replies were dropped, so a session whose login had expired showed nothing in the chat while every
+prompt failed (2026-10-31: `invalid_grant` on refresh, then "Your credit balance is too low" from the API-key
+fallback, three times, visible only in the terminal).
 
 Composer prompts are `terminal.send` (see Prompt turns). The app sends them with bracketed paste already applied.
 
