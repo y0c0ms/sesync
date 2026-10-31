@@ -98,6 +98,8 @@ pub struct FakePane {
     pub size: Option<(u32, u32)>,
     /// The visible screen `pane.read` returns.
     pub screen: String,
+    /// The rows above the screen: `pane.read` "recent" returns them, then the screen.
+    pub history: Vec<String>,
 }
 
 /// Ids are unique across every fake herdr of the process: the bridge's owner records are process-wide.
@@ -220,6 +222,14 @@ impl FakeHerdr {
         }
     }
 
+    /// Set the rows above the screen of the pane `terminal_id`, oldest first.
+    pub fn set_history(&self, terminal_id: &str, history: &[&str]) {
+        let mut st = self.state.lock();
+        if let Some(pane) = st.panes.iter_mut().find(|p| p.terminal_id == terminal_id) {
+            pane.history = history.iter().map(|r| r.to_string()).collect();
+        }
+    }
+
     /// herdr reports no layout for the pane `terminal_id`: its `pane.layout` refuses.
     pub fn hide_layout(&self, terminal_id: &str) {
         let mut st = self.state.lock();
@@ -254,6 +264,7 @@ impl FakePane {
             polls: 0,
             size: Some((80, 24)),
             screen: String::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -356,7 +367,14 @@ impl Herdr for FakeHerdr {
             "pane.send_keys" => Ok(json!({ "type": "ok" })),
             "pane.read" => {
                 let pane_id = text("pane_id");
-                let screen = st.pane(&pane_id).map(|p| p.screen.clone()).ok_or_else(|| format!("no pane {pane_id}"))?;
+                let pane = st.pane(&pane_id).ok_or_else(|| format!("no pane {pane_id}"))?;
+                let screen = if params["source"] == "recent" {
+                    let rows: Vec<&str> = pane.history.iter().map(String::as_str).chain(pane.screen.split('\n')).collect();
+                    let lines = params["lines"].as_u64().map_or(rows.len(), |n| n as usize);
+                    rows[rows.len().saturating_sub(lines)..].join("\n")
+                } else {
+                    pane.screen.clone()
+                };
                 Ok(json!({ "type": "pane_read", "read": { "text": screen, "pane_id": pane_id } }))
             }
             "pane.layout" => {

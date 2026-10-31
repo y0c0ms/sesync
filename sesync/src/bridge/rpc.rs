@@ -41,10 +41,8 @@ pub const RUNTIME_ID: &str = "sesync-bridge";
 pub const PROTOCOL_VERSION: u64 = 3;
 /// The oldest phone protocol this host supports. The app enforces its own floor of 2 on hosts.
 pub const MIN_COMPATIBLE_MOBILE_VERSION: u64 = 2;
-/// The rows a `terminal.read` returns when it names none (the phone's read).
+/// The rows a `terminal.read` returns.
 const READ_LINES: u32 = 200;
-/// The most rows a `terminal.read` returns: herdr keeps 1000 rows of a pane (measured with herdr 0.9.1).
-const READ_LINES_MAX: u32 = 1000;
 
 /// This host's identity, as `status.get` reports it.
 #[derive(Debug, Clone)]
@@ -384,13 +382,10 @@ fn terminal_list(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     Ok(json!({ "terminals": rows, "totalCount": rows.len(), "truncated": false }))
 }
 
-/// `terminal.read {terminal, lines?}`: the pane's last rows as text, `lines` of them (200 when not given, at most
-/// 1000). `sesync machine attach` reads its scrollback this way.
 fn terminal_read(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     let handle = handle_param(params)?;
     let pane = find_terminal(ctx, &handle)?;
-    let lines = params["lines"].as_u64().map_or(READ_LINES, |n| n.clamp(1, u64::from(READ_LINES_MAX)) as u32);
-    let text = herdr::read_recent_text(ctx.herdr.as_ref(), &pane.pane_id, lines)
+    let text = herdr::read_recent_text(ctx.herdr.as_ref(), &pane.pane_id, READ_LINES)
         .map_err(|m| ("herdr_unavailable", m))?;
     let tail: Vec<&str> = text.lines().collect();
     Ok(json!({ "terminal": {
@@ -500,6 +495,13 @@ fn terminal_subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Res
     let shown = stream::screen_text(
         &herdr::read_visible(ctx.herdr.as_ref(), &pane.pane_id).map_err(|m| ("herdr_unavailable", m))?,
     );
+    // The history above the screen, so the client can scroll back. Best effort, and only at the pane's real size.
+    let history = if display_mode == stream::DESKTOP {
+        stream::read_history(ctx.herdr.as_ref(), &pane.pane_id, rows, stream::HISTORY_ROWS).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mark = stream::HistoryMark::after(&history);
     let stream_id = conn.next_stream_id();
     let stop = conn.register(key, id.clone());
     let head = if binary {
@@ -523,6 +525,8 @@ fn terminal_subscribe(params: &Value, ctx: &Ctx, conn: &Conn, id: &Value) -> Res
         display_mode,
         stop,
         shown,
+        history,
+        mark,
     };
     thread::spawn(move || stream::run_terminal(term));
     Ok(())
@@ -878,22 +882,6 @@ mod tests {
         assert_eq!(reply["result"]["terminal"]["cleared"], true);
         let keys: Vec<Value> = h.calls.lock().iter().filter(|(m, _)| m == "pane.send_keys").map(|(_, p)| p["keys"].clone()).collect();
         assert_eq!(keys, vec![json!(["ctrl+l"])]);
-    }
-
-    #[test]
-    fn a_read_returns_the_rows_it_asks_for_up_to_what_herdr_keeps() {
-        let panes = json!({"type":"pane_list","panes":[
-            {"pane_id":"w1:p1","terminal_id":"term_a","tab_id":"w1:t1","focused":true,"agent_status":"idle"}
-        ]});
-        let h = herdr_with(panes, json!({"process_info":{"foreground_processes":[]}}));
-        let c = ctx(Arc::new(Fixed(vec![])), h.clone());
-        let (conn, _rx) = conn();
-        for params in [json!({"terminal": "term_a"}), json!({"terminal": "term_a", "lines": 600}), json!({"terminal": "term_a", "lines": 99999}), json!({"terminal": "term_a", "lines": 0})] {
-            let reply = dispatch(&req("r", "terminal.read", params), &c, &conn).unwrap();
-            assert_eq!(reply["result"]["terminal"]["tail"], json!(["hello"]));
-        }
-        let asked: Vec<Value> = h.calls.lock().iter().filter(|(m, _)| m == "pane.read").map(|(_, p)| p["lines"].clone()).collect();
-        assert_eq!(asked, vec![json!(200), json!(600), json!(1000), json!(1)], "the phone's default, as asked, capped, at least one");
     }
 
     #[test]

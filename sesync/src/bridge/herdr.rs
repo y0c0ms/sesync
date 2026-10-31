@@ -619,6 +619,16 @@ pub fn read_recent_text(h: &dyn Herdr, pane_id: &str, lines: u32) -> Result<Stri
     parse_read(&result)
 }
 
+/// The pane's last `lines` rows with their colour codes: its history above the screen, then the screen (herdr keeps
+/// 1000 rows of a pane).
+pub fn read_recent_ansi(h: &dyn Herdr, pane_id: &str, lines: u32) -> Result<String, String> {
+    let result = h.call(
+        "pane.read",
+        json!({ "pane_id": pane_id, "source": "recent", "lines": lines, "format": "ansi", "strip_ansi": false }),
+    )?;
+    parse_read(&result)
+}
+
 /// Type `text` into the pane without pressing Enter.
 pub fn send_text(h: &dyn Herdr, pane_id: &str, text: &str) -> Result<(), String> {
     h.call("pane.send_text", json!({ "pane_id": pane_id, "text": text })).map(|_| ())

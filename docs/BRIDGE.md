@@ -42,7 +42,7 @@ conversations of the others. Plan for the TUI tab and for the phone deciding whi
 |---|---|
 | `sesync machine add <name> <pairing link>` | Saves a pairing made on the other machine with `sesync bridge pair --endpoint ws://ITS-ADDRESS:6768 --label <this machine>` (the `agenthub://pair?code=` link or the offer JSON), then checks that it answers. A name is 1 to 32 letters, digits, `-`, `_` or `.`; adding it again replaces it. |
 | `sesync machine list [<name>]` | For each machine, its conversations as its bridge lists them: state (the open pane's, else `closed`), title, harness, project directory, worktree id. |
-| `sesync machine attach <name> <conversation> [--open]` | Mirrors the conversation's pane in this terminal and types into it. The conversation is named by its worktree id, its title (any case), or a part of the title that fits only one; two that fit list their ids. One not open there is refused unless `--open` is given, which resumes it in that machine's herdr first, as the phone's Resume: a bridge that misses an open pane (an older one, or a pane it cannot place) would otherwise start a second agent on a running conversation. PageUp or the mouse wheel shows the pane's scrollback, the last 1000 rows as text (`terminal.read` with `lines`; 200 from a bridge older than that), moved by PageUp/PageDown, the arrows, the wheel and Home; End, Esc, `q` or scrolling past the bottom goes back to the live screen, and typing goes back and reaches the pane. Mouse reporting is on while attached, so selecting text in this terminal takes Shift. Ctrl-] detaches. Run inside a herdr tab, this is a remote terminal tab. |
+| `sesync machine attach <name> <conversation> [--open]` | Mirrors the conversation's pane in this terminal and types into it. The conversation is named by its worktree id, its title (any case), or a part of the title that fits only one; two that fit list their ids. One not open there is refused unless `--open` is given, which resumes it in that machine's herdr first, as the phone's Resume: a bridge that misses an open pane (an older one, or a pane it cannot place) would otherwise start a second agent on a running conversation. Attach draws on the main screen, and the pane's history (the stream's `history` events, see Terminal streams) goes into this terminal's own scrollback, in colour: scroll back as through any output (in a herdr tab, herdr's scrolling). Ctrl-] detaches, and the last screen stays above the prompt. Run inside a herdr tab, this is a remote terminal tab. |
 | `sesync machine remove <name>` | Forgets the machine here. Its device stays paired there until `sesync bridge revoke` on it. |
 | `sesync machine endpoint <name> <ws://address>` / `--clear` | Dials that machine at this address from here instead of the endpoint its pairing or grant names (a tunnel such as wireproxy's `ws://127.0.0.1:16768`). Kept when a phone grant replaces the entry, since the phone only knows the address it dials; `--clear` goes back to the paired endpoint. `list` shows both. |
 
@@ -132,7 +132,7 @@ Served methods:
 | `session.tabs.list` `{worktree:"id:<wt>"}` | `{worktree, publicationEpoch, snapshotVersion, tabs:[…], activeTabId, activeTabType}`: one `type:"terminal"` tab per pane running the conversation (see Mapping for what "running" means). Empty when none is open. |
 | `session.tabs.subscribe` `{worktree}` | Streams `{type:"snapshot", …tabs}` then `{type:"updated", …tabs}` when the tab list changes. `session.tabs.unsubscribe {worktree, subscriptionId?}` ends it. |
 | `terminal.list` `{worktree?, handles?}` | `{terminals:[…], totalCount, truncated:false}`: one row per pane (`handle` = herdr's terminal id). |
-| `terminal.read` `{terminal, lines?}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last `lines` rows as text, 200 when not given, at most 1000 (all herdr keeps). |
+| `terminal.read` `{terminal}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last 200 rows as text. |
 | `terminal.subscribe` `{terminal, client:{id}, viewport?, capabilities?}` | The screen, then live changes. See Terminal streams. `terminal.unsubscribe {subscriptionId, client, requestId}` ends it. |
 | `terminal.send` `{terminal, text?, enter?, interrupt?}` | `{send:{handle, accepted:true, bytesWritten}}`. A prompt (`text` with `enter:true`) takes the conversation's claim first; see Prompt turns. Approval keys are `text` with `enter:false` (see Approvals). |
 | `terminal.clearBuffer` `{terminal}` | `{terminal:{handle, cleared:true}}` after Ctrl-L is sent into the pane. Not a prompt turn, so it claims nothing. |
@@ -228,6 +228,18 @@ repaint `ESC[H ESC[2J` followed by the new screen, so no row from the previous f
 
 Without the capability the same screen goes as JSON: a `scrollback` result with `serialized`, then
 `{type:"data", chunk}` events, each a full repaint. A phone without the capability is served either way.
+
+**History.** The stream also carries the pane's history, the rows herdr keeps above the screen (`pane.read` "recent"
+with colours, at most 1000 rows with the screen), so the client can scroll back; only at the pane's real size
+(`displayMode:"desktop"`). Binary: every snapshot (`scrollback` and `resized`) is the history, one row per line, then
+the screen; the phone resets its terminal for a snapshot, so the history scrolls into its scrollback (5000 rows) and
+the screen stays in view. When the first row of the screen changes, the bridge reads the history again and finds the
+rows after the last 12 it sent (`HistoryMark`; three screens first, then all 1000); those rows lead the next Output,
+drawn from the top of a screen cleared with `ESC[H ESC[J` and scrolled off by line feeds at the bottom row, then the
+repaint. JSON: `{type:"history", lines:[…]}` events, oldest first, at most 48 KiB of rows each, after the
+`scrollback` result and before the repaint they left. Limits: rows lost when herdr's history is cleared or rewrapped
+are sent again in full (a client may show some twice); more than 1000 rows between two reads (250 ms) lose the
+oldest; a run of 12 identical rows can hide new rows that repeat it.
 
 The stream ends with `{type:"end"}` when the pane is gone or the stream is unsubscribed. Dropping the
 connection stops its streams.

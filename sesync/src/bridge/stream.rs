@@ -10,6 +10,11 @@
 //! `capabilities.terminalBinaryStream`: a JSON `subscribed` reply carrying the stream id, then binary
 //! frames tagged with that id (`mobile/src/transport/rpc-client-terminal-binary-frame.ts`). Otherwise it
 //! sends the legacy JSON `scrollback` and `data` events. Both carry the same screen.
+//!
+//! A terminal stream also carries the pane's history, the rows herdr keeps above the screen, so a client can scroll
+//! back. Binary: each snapshot starts with the history (the phone resets its terminal for a snapshot, and the rows
+//! above the screen land in its scrollback), and rows that scroll off the screen later are pushed into the
+//! terminal's scrollback before the repaint (`push_history`). JSON: `history` events carry the rows, oldest first.
 
 use super::catalog::{Catalog, Conversation};
 use super::e2ee::Channel;
@@ -45,6 +50,104 @@ pub const CATALOG_REFRESH: Duration = Duration::from_secs(5);
 /// Clear the screen and home the cursor, then the screen: a full repaint, so a change never leaves
 /// rows from the previous frame behind.
 pub const REPAINT: &str = "\x1b[H\x1b[2J";
+
+/// The history a terminal stream carries: all `pane.read` "recent" gives (herdr keeps 1000 rows of a pane).
+pub const HISTORY_ROWS: u32 = 1000;
+/// The history rows a stream remembers of what it sent: a later read is searched for them to find the rows that
+/// came after. Many, so a run of repeated rows (blank ones, box borders) rarely matches in the wrong place.
+const MARK_ROWS: usize = 12;
+
+/// The rows of a herdr read, CR LF or LF separated, without the empty row after a final line break.
+pub fn rows_of(text: &str) -> Vec<String> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split('\n').map(|row| row.strip_suffix('\r').unwrap_or(row).to_string()).collect()
+}
+
+/// The pane's history with colour codes: its last `lines` rows without the `screen_rows` of its screen, oldest first.
+pub fn read_history(h: &dyn Herdr, pane_id: &str, screen_rows: u32, lines: u32) -> Result<Vec<String>, String> {
+    let mut rows = rows_of(&herdr::read_recent_ansi(h, pane_id, lines)?);
+    rows.truncate(rows.len().saturating_sub(screen_rows as usize));
+    Ok(rows)
+}
+
+/// Where the history a client has ends: the last rows of it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HistoryMark(Vec<String>);
+
+impl HistoryMark {
+    /// The mark at the end of `history`.
+    pub fn after(history: &[String]) -> HistoryMark {
+        HistoryMark(history[history.len().saturating_sub(MARK_ROWS)..].to_vec())
+    }
+
+    /// The rows of `history` after the mark: all of it when the client had no history, None when the mark is not in
+    /// it (the read was too short for what scrolled, or herdr's history was cleared or rewrapped). The last place
+    /// the mark fits is taken.
+    pub fn new_rows<'a>(&self, history: &'a [String]) -> Option<&'a [String]> {
+        if self.0.is_empty() {
+            return Some(history);
+        }
+        history.windows(self.0.len()).rposition(|w| w == self.0.as_slice()).map(|at| &history[at + self.0.len()..])
+    }
+}
+
+/// Bytes that add `history` to a terminal's scrollback, oldest first, and leave its screen blank: the phone's xterm
+/// and the terminal `sesync machine attach` runs in. Each batch of up to `rows` rows is drawn from the top of a
+/// cleared screen, then line feeds at the bottom row scroll it off into the scrollback. The screen is cleared from the
+/// home position down (ED 0), never as a whole (ED 2), which some terminals copy into their scrollback.
+pub fn push_history(history: &[String], rows: u32) -> String {
+    let rows = rows.max(1);
+    let mut out = String::new();
+    for batch in history.chunks(rows as usize) {
+        out.push_str("\x1b[H\x1b[J");
+        for (i, row) in batch.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\r\n");
+            }
+            out.push_str(row);
+            out.push_str("\x1b[0m");
+        }
+        out.push_str(&format!("\x1b[{rows};1H"));
+        out.push_str(&"\n".repeat(batch.len()));
+    }
+    out
+}
+
+/// A snapshot for a terminal the client has just reset: the history, then the screen. Writing it scrolls the
+/// history off into the scrollback and leaves the screen in view.
+pub fn snapshot_text(history: &[String], screen: &str) -> String {
+    let mut out = String::new();
+    for row in history {
+        out.push_str(row);
+        out.push_str("\x1b[0m\r\n");
+    }
+    out.push_str(screen);
+    out
+}
+
+/// `history` as JSON `history` events, each under one frame chunk of text.
+pub fn history_events(history: &[String]) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut batch: Vec<&str> = Vec::new();
+    let mut size = 0;
+    for row in history {
+        if !batch.is_empty() && size + row.len() > frame::CHUNK_BYTES {
+            events.push(json!({ "type": "history", "lines": batch }));
+            batch = Vec::new();
+            size = 0;
+        }
+        size += row.len();
+        batch.push(row);
+    }
+    if !batch.is_empty() {
+        events.push(json!({ "type": "history", "lines": batch }));
+    }
+    events
+}
 
 /// The binary terminal stream's wire format (`src/shared/terminal-stream-protocol.ts`): a 16-byte
 /// little-endian header, then the payload.
@@ -233,6 +336,53 @@ pub struct Terminal {
     pub stop: Arc<AtomicBool>,
     /// The screen already sent (in the subscribe reply, or as the binary snapshot).
     pub shown: String,
+    /// The history read at subscribe, sent once at the start (empty when the pane has no layout).
+    pub history: Vec<String>,
+    /// Where the history the client has ends.
+    pub mark: HistoryMark,
+}
+
+/// The first row of a screen. Rows scroll off the screen only when it changes, so history is looked for only then.
+fn first_row(screen: &str) -> &str {
+    screen.split("\r\n").next().unwrap_or("")
+}
+
+/// The pane's whole history, for a snapshot after a size change: the mark moves to its end. None without a layout.
+fn fresh_history(t: &mut Terminal) -> Vec<String> {
+    let history = if t.display_mode == DESKTOP {
+        read_history(t.herdr.as_ref(), &t.pane_id, t.rows, HISTORY_ROWS).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    t.mark = HistoryMark::after(&history);
+    history
+}
+
+/// The history rows that scrolled off the screen since the client's mark, and the mark moved past them. A short read
+/// first (three screens); the whole history when the mark is not in it. When the whole history lacks the mark (herdr
+/// cleared it, or more scrolled than herdr keeps), all of it is new.
+fn scrolled_history(t: &mut Terminal) -> Vec<String> {
+    if t.display_mode != DESKTOP {
+        return Vec::new();
+    }
+    for lines in [(t.rows * 3).min(HISTORY_ROWS), HISTORY_ROWS] {
+        let Ok(history) = read_history(t.herdr.as_ref(), &t.pane_id, t.rows, lines) else { return Vec::new() };
+        // A read shorter than asked holds all herdr keeps: a longer one would find nothing more.
+        let whole = history.len() + (t.rows as usize) < lines as usize;
+        let fresh = match t.mark.new_rows(&history) {
+            Some(fresh) => fresh.to_vec(),
+            None if whole || lines == HISTORY_ROWS => history.clone(),
+            None => continue,
+        };
+        t.mark = HistoryMark::after(&history);
+        return fresh;
+    }
+    Vec::new()
+}
+
+/// Send `history` as JSON `history` events. False once the connection has gone.
+fn send_history(t: &Terminal, history: &[String]) -> bool {
+    history_events(history).into_iter().all(|event| t.sink.json(&streamed(&t.request_id, event)))
 }
 
 /// Send `screen` as a binary snapshot of `kind` (`scrollback` for a subscribe, `resized` for a size change):
@@ -249,10 +399,11 @@ fn send_snapshot(t: &Terminal, kind: &str, seq: u64, screen: &str) -> bool {
     ok && t.sink.binary(&frame::encode(frame::SNAPSHOT_END, t.stream_id, seq, b""))
 }
 
-/// Send `screen` as the terminal's new size: a resized snapshot in binary mode, a `resized` event in JSON mode.
-fn send_resized(t: &Terminal, seq: u64, screen: &str) -> bool {
+/// Send `screen` as the terminal's new size: a resized snapshot in binary mode, led by the pane's `history`, a
+/// `resized` event in JSON mode (a JSON client keeps the history it has).
+fn send_resized(t: &Terminal, seq: u64, screen: &str, history: &[String]) -> bool {
     if t.binary {
-        send_snapshot(t, "resized", seq, screen)
+        send_snapshot(t, "resized", seq, &snapshot_text(history, screen))
     } else {
         t.sink.json(&streamed(
             &t.request_id,
@@ -261,12 +412,20 @@ fn send_resized(t: &Terminal, seq: u64, screen: &str) -> bool {
     }
 }
 
-/// Send the binary snapshot of `shown`, then poll the screen until the stream stops, sending a full
-/// repaint whenever it changes. The pane's size is read every [`SIZE_POLL`]. A change of size sends the
-/// tick's screen as a resize and nothing else for that tick, so a size and a screen change never both go out.
+/// Send the history and the screen the client starts from, then poll the screen until the stream stops, sending a
+/// full repaint whenever it changes, led by the rows that scrolled into the pane's history. The pane's size is read
+/// every [`SIZE_POLL`]. A change of size sends the tick's screen as a resize and nothing else for that tick, so a
+/// size and a screen change never both go out.
 pub fn run_terminal(mut t: Terminal) {
     let mut seq = 0u64;
-    if t.binary && !send_snapshot(&t, "scrollback", 0, &t.shown) {
+    let history = std::mem::take(&mut t.history);
+    let opened = if t.binary {
+        send_snapshot(&t, "scrollback", 0, &snapshot_text(&history, &t.shown))
+    } else {
+        send_history(&t, &history)
+    };
+    drop(history);
+    if !opened {
         return;
     }
     let mut size_checked = Instant::now();
@@ -295,8 +454,9 @@ pub fn run_terminal(mut t: Terminal) {
                     t.rows = rows;
                     t.display_mode = DESKTOP;
                     t.shown = screen.clone();
+                    let history = fresh_history(&mut t);
                     seq += 1;
-                    if !send_resized(&t, seq, &screen) {
+                    if !send_resized(&t, seq, &screen, &history) {
                         return;
                     }
                     continue;
@@ -306,9 +466,10 @@ pub fn run_terminal(mut t: Terminal) {
         if screen == t.shown {
             continue;
         }
-        let body = format!("{REPAINT}{screen}");
+        let scrolled = if first_row(&screen) != first_row(&t.shown) { scrolled_history(&mut t) } else { Vec::new() };
         t.shown = screen;
         let delivered = if t.binary {
+            let body = format!("{}{REPAINT}{}", push_history(&scrolled, t.rows), t.shown);
             let mut ok = true;
             for piece in frame::chunks(&body) {
                 seq += 1;
@@ -316,7 +477,8 @@ pub fn run_terminal(mut t: Terminal) {
             }
             ok
         } else {
-            let mut ok = true;
+            let body = format!("{REPAINT}{}", t.shown);
+            let mut ok = send_history(&t, &scrolled);
             for piece in frame::chunks(&body) {
                 ok = ok && t.sink.json(&streamed(&t.request_id, json!({ "type": "data", "chunk": piece })));
             }
@@ -607,9 +769,16 @@ mod tests {
 
     impl Running {
         fn start(binary: bool, screen: &str, size: (u32, u32), display_mode: &'static str) -> Running {
+            Running::start_with(binary, screen, size, display_mode, &[])
+        }
+
+        /// `start`, with `history` above the pane's screen, read as `terminal.subscribe` reads it.
+        fn start_with(binary: bool, screen: &str, size: (u32, u32), display_mode: &'static str, history: &[&str]) -> Running {
             let fake = FakeHerdr::new();
             let pane = fake.open_tab("w-main", "stream", "/work", &[]);
             fake.set_pane(&pane.terminal_id, screen, size);
+            fake.set_history(&pane.terminal_id, history);
+            let history = read_history(fake.as_ref(), &pane.pane_id, size.1, HISTORY_ROWS).unwrap();
             let (channel, boxed) = keys();
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let stop = Arc::new(AtomicBool::new(false));
@@ -626,6 +795,8 @@ mod tests {
                 display_mode,
                 stop: Arc::clone(&stop),
                 shown: screen_text(screen),
+                mark: HistoryMark::after(&history),
+                history,
             };
             let thread = thread::spawn(move || run_terminal(t));
             Running { fake, terminal: pane.terminal_id, stop, thread: Some(thread), rx, channel, boxed }
@@ -720,6 +891,58 @@ mod tests {
         assert_eq!(starts(&initial)[0]["displayMode"], "auto", "{initial:?}");
         let later = s.sent_within(Duration::from_millis(1800));
         assert!(later.is_empty(), "no layout, no resize: {later:?}");
+        s.finish();
+    }
+
+    fn rows(r: &[&str]) -> Vec<String> {
+        r.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_mark_finds_the_rows_after_it_and_none_when_the_history_lost_it() {
+        let had = rows(&["a", "b", "c"]);
+        let mark = HistoryMark::after(&had);
+        assert_eq!(mark.new_rows(&rows(&["a", "b", "c", "d", "e"])), Some(&rows(&["d", "e"])[..]));
+        assert_eq!(mark.new_rows(&had), Some(&[][..]), "nothing scrolled");
+        assert_eq!(mark.new_rows(&rows(&["b", "c", "d"])), None, "the read began after the mark's first row");
+        assert_eq!(mark.new_rows(&rows(&["x"])), None, "cleared");
+        assert_eq!(HistoryMark::default().new_rows(&rows(&["x", "y"])), Some(&rows(&["x", "y"])[..]), "a client with no history takes all");
+        let long: Vec<String> = (0..30).map(|n| n.to_string()).collect();
+        assert_eq!(HistoryMark::after(&long).new_rows(&long[5..]), Some(&[][..]), "only the last rows are the mark");
+    }
+
+    #[test]
+    fn the_history_leads_the_snapshot_and_rows_that_scroll_off_lead_the_repaint_once() {
+        let mut s = Running::start_with(true, "c\nd\ne", (10, 3), DESKTOP, &["a", "b"]);
+        let initial = s.sent_within(Duration::from_millis(150));
+        assert_eq!(chunk_text(&initial), "a\x1b[0m\r\nb\x1b[0m\r\nc\r\nd\r\ne", "history above the screen: {initial:?}");
+
+        // Two rows scroll off the top.
+        s.fake.set_history(&s.terminal, &["a", "b", "c", "d"]);
+        s.set("e\nf\ng", (10, 3));
+        let out = outputs(&s.sent_within(Duration::from_millis(600))).concat();
+        assert_eq!(out, format!("{}{REPAINT}e\r\nf\r\ng", push_history(&rows(&["c", "d"]), 3)));
+
+        // Only the bottom row changes: nothing new in the history.
+        s.set("e\nf\nh", (10, 3));
+        let out = outputs(&s.sent_within(Duration::from_millis(600))).concat();
+        assert_eq!(out, format!("{REPAINT}e\r\nf\r\nh"));
+        s.finish();
+    }
+
+    #[test]
+    fn a_json_stream_sends_its_history_as_events_before_the_screen_they_left() {
+        let mut s = Running::start_with(false, "c\nd\ne", (10, 3), DESKTOP, &["a", "b"]);
+        let initial = s.sent_within(Duration::from_millis(150));
+        let events: Vec<Value> = initial.iter().filter_map(|e| if let Sent::Event(v) = e { Some(v.clone()) } else { None }).collect();
+        assert_eq!(events, vec![json!({ "type": "history", "lines": ["a", "b"] })]);
+
+        s.fake.set_history(&s.terminal, &["a", "b", "c"]);
+        s.set("d\ne\nf", (10, 3));
+        let later = s.sent_within(Duration::from_millis(600));
+        let events: Vec<Value> = later.iter().filter_map(|e| if let Sent::Event(v) = e { Some(v.clone()) } else { None }).collect();
+        assert_eq!(events[0], json!({ "type": "history", "lines": ["c"] }));
+        assert_eq!(events[1]["type"], "data");
         s.finish();
     }
 }
