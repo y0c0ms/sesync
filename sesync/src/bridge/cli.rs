@@ -123,7 +123,28 @@ fn revoke(args: &[String], dir: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Keep the bridge's large buffers out of the heap. A title read takes a buffer as large as a window of a long journal
+/// (several megabytes). glibc raises its mmap threshold after the first such buffer is freed, so the later ones come
+/// from the heap, and the heap keeps their peak resident: 25 MB with 107 conversations, 9 MB with the threshold fixed.
+/// Fixing the threshold at 128 KiB returns each large buffer to the system when it is freed.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn fix_mmap_threshold() {
+    extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_MMAP_THRESHOLD: i32 = -3;
+    // SAFETY: mallopt sets one allocator tunable and takes no pointers.
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
+/// Other allocators return freed memory themselves.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn fix_mmap_threshold() {}
+
 fn serve(args: &[String], dir: &Path, machines: &Path, sessions: Sessions, locks: LockTools) -> Result<(), Fail> {
+    fix_mmap_threshold();
     let opts = options(
         args,
         &["listen", "allow", "herdr-socket", "ntfy-url", "ntfy-topic", "ntfy-token-command", "usage-every", "omp"],
