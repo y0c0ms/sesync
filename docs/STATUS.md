@@ -3,6 +3,13 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-31: work PC report (agent-hub#22 comment 423): picker-started panes and a dial address per machine
+
+- **Why.** On the work PC, OTmain ran in herdr pane `w6:p3` started from omp's picker: argv `omp.exe --resume`, no session file, so the bridge listed the conversation as not open, though herdr's omp integration reported the session (`agent.list` `agent_session`, all backslashes; sesync's resume path mixes `/` and `\`). And the work PC reaches yocomsMain's bridge only through wireproxy (`ws://127.0.0.1:16768`), while the phone's grant names `ws://10.10.20.3:6768`.
+- **What changed.** `terminals::running_panes` keeps a pane's reported session (`Running::reported`) when no foreground argument carries any conversation's session id; `runs_directly` then matches it against the conversation's ids with `herdr::same_session` (the `same_path` compare: exact, and on Windows `/`≡`\` and case ignored). A command line naming a session always wins over the report. `machines.json` entries take `localEndpoint`; `Machine::address()` is what `client::connect`, `machine list` and the Machines tab use. `sesync machine endpoint <name> <ws://…>|--clear` sets it, checked as a pairing endpoint is; `store::put` keeps it when a grant (`machines.accept`) or `machine add` replaces the entry, and `machines.accept` probes the saved entry, so through the override.
+- **Tests.** `terminals`: a picker pane runs the conversation its agent reported; a pane whose argv names another conversation keeps that one; a report no conversation has places nothing (canned herdr with `agent.list`). `herdr`: `same_session` exact off Windows, plus a `cfg(windows)` test with the work PC's two spellings. `store`: the override is dialled, survives a grant replacing the entry, a non-ws address and an unknown name are refused, `--clear` restores the paired endpoint.
+- **Not verified here.** The Windows tests (the lib's test build is Unix-only); the Windows release binaries cross-build (`cargo xwin build --release --target x86_64-pc-windows-msvc --bins`). The live check is the work PC's (issue #22).
+
 ## 2026-10-30: the phone grants machine-to-machine links (branch machines-grants, step 3 of machines-plan-2026-10-30)
 
 - **Why.** Machine A could see machine B only through a pairing made by hand. The phone now decides which machines see each other, as the plan's step 3 contract says.

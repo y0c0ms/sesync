@@ -58,7 +58,7 @@ pub struct Conversation {
 pub fn rows(machines: &[Machine], answers: &BTreeMap<String, Result<Value, String>>) -> Vec<Row> {
     let mut out = Vec::new();
     for m in machines {
-        let header = |status: Status| Row::Machine { name: m.name.clone(), endpoint: m.endpoint.clone(), status };
+        let header = |status: Status| Row::Machine { name: m.name.clone(), endpoint: m.address().to_string(), status };
         match answers.get(&m.name) {
             None => out.push(header(Status::Loading)),
             Some(Err(why)) => out.push(header(Status::Unreachable(why.clone()))),
@@ -195,7 +195,7 @@ mod tests {
     use crate::herdr_open::{shell_line, PaneShell};
 
     fn machine(name: &str) -> Machine {
-        Machine { name: name.into(), endpoint: format!("ws://{name}:6768"), device_token: "t".into(), public_key_b64: "k".into(), grant_device_id: None }
+        Machine { name: name.into(), endpoint: format!("ws://{name}:6768"), device_token: "t".into(), public_key_b64: "k".into(), grant_device_id: None, local_endpoint: None }
     }
 
     #[test]

@@ -67,9 +67,12 @@ pub fn accept(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
         device_token: text_param(params, "deviceToken")?,
         public_key_b64,
         grant_device_id: Some(text_param(params, "grantDeviceId")?),
+        // A local override set on this machine is kept by `store::put`; the phone does not know it.
+        local_endpoint: None,
     };
     store::put(&ctx.machines, machine.clone()).map_err(|m| ("unavailable", m))?;
-    Ok(match probe(&machine) {
+    let saved = store::load(&ctx.machines).map_err(unavailable)?.into_iter().find(|m| m.name == name).unwrap_or(machine);
+    Ok(match probe(&saved) {
         Ok(()) => json!({ "name": name, "answers": true }),
         Err(reason) => json!({ "name": name, "answers": false, "error": reason }),
     })

@@ -469,6 +469,7 @@ mod tests {
             prompt: None,
             owner: None,
             fallback: None,
+            reported: None,
         }
     }
 

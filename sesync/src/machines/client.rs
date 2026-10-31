@@ -40,10 +40,11 @@ pub struct Reader {
 pub async fn connect(machine: &Machine) -> Result<(Writer, Reader), String> {
     let server = e2ee::parse_client_key(&machine.public_key_b64)
         .ok_or_else(|| format!("{}: the saved public key is damaged; add the machine again", machine.name))?;
-    let (ws, _) = tokio::time::timeout(STEP, tokio_tungstenite::connect_async(machine.endpoint.as_str()))
+    let address = machine.address();
+    let (ws, _) = tokio::time::timeout(STEP, tokio_tungstenite::connect_async(address))
         .await
-        .map_err(|_| format!("{} did not answer at {}", machine.name, machine.endpoint))?
-        .map_err(|e| format!("cannot reach {} at {}: {e}", machine.name, machine.endpoint))?;
+        .map_err(|_| format!("{} did not answer at {address}", machine.name))?
+        .map_err(|e| format!("cannot reach {} at {address}: {e}", machine.name))?;
     let (mut tx, mut rx) = ws.split();
 
     let (hello, pending) = hybrid::begin()?;

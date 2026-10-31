@@ -25,6 +25,18 @@ pub struct Machine {
     /// revoke it there. None for a pairing added by hand, and for a file written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_device_id: Option<String>,
+    /// The address this machine dials instead of `endpoint`, set with `sesync machine endpoint`: for a machine that
+    /// reaches the other one another way (the work PC through a local wireproxy forward). It outlives a grant that
+    /// replaces the entry, since the phone only knows the address it dials itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_endpoint: Option<String>,
+}
+
+impl Machine {
+    /// The address to dial: the local override when one is set, else the endpoint the pairing named.
+    pub fn address(&self) -> &str {
+        self.local_endpoint.as_deref().unwrap_or(&self.endpoint)
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -56,17 +68,32 @@ fn save(path: &Path, machines: Vec<Machine>) -> Result<(), String> {
 }
 
 /// Save `machine` under its name, replacing a machine of that name. True when one was replaced. The name must be
-/// one `check_name` accepts.
-pub fn put(path: &Path, machine: Machine) -> Result<bool, String> {
+/// one `check_name` accepts. A replaced entry's local endpoint is kept unless `machine` brings its own.
+pub fn put(path: &Path, mut machine: Machine) -> Result<bool, String> {
     check_name(&machine.name)?;
     let _writing = writing();
     let mut machines = load(path)?;
-    let before = machines.len();
-    machines.retain(|m| m.name != machine.name);
-    let replaced = machines.len() != before;
+    let old = machines.iter().position(|m| m.name == machine.name).map(|i| machines.remove(i));
+    if machine.local_endpoint.is_none() {
+        machine.local_endpoint = old.as_ref().and_then(|m| m.local_endpoint.clone());
+    }
     machines.push(machine);
     save(path, machines)?;
-    Ok(replaced)
+    Ok(old.is_some())
+}
+
+/// Set (or with None, clear) the address `name` is dialled at from here; returns the updated entry.
+pub fn set_local_endpoint(path: &Path, name: &str, endpoint: Option<&str>) -> Result<Machine, String> {
+    if let Some(endpoint) = endpoint {
+        crate::bridge::offer::check_endpoint(endpoint)?;
+    }
+    let _writing = writing();
+    let mut machines = load(path)?;
+    let machine = machines.iter_mut().find(|m| m.name == name).ok_or_else(|| format!("no machine named {name:?}"))?;
+    machine.local_endpoint = endpoint.map(str::to_string);
+    let updated = machine.clone();
+    save(path, machines)?;
+    Ok(updated)
 }
 
 /// Save `offer` under `name` as a pairing made by hand, replacing a machine of that name. True when one was replaced.
@@ -77,6 +104,7 @@ pub fn add(path: &Path, name: &str, offer: &Offer) -> Result<bool, String> {
         device_token: offer.device_token.clone(),
         public_key_b64: offer.public_key_b64.clone(),
         grant_device_id: None,
+        local_endpoint: None,
     })
 }
 
@@ -179,6 +207,7 @@ mod tests {
             device_token: "t2".into(),
             public_key_b64: "k2".into(),
             grant_device_id: Some("0a1b2c".into()),
+            local_endpoint: None,
         })
         .unwrap();
         let granted = load(&path).unwrap().into_iter().find(|m| m.name == "granted").unwrap();
@@ -186,6 +215,33 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"grantDeviceId\": \"0a1b2c\""), "{text}");
         assert!(!text.contains("\"grantDeviceId\": null"), "a hand-made entry writes no grant field: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_endpoint_is_dialled_and_outlives_a_grant_that_replaces_the_entry() {
+        let dir = std::env::temp_dir().join(format!("sesync-machines-local-{}", std::process::id()));
+        let path = dir.join("machines.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        add(&path, "yocomsMain", &offer("ws://10.10.20.3:6768")).unwrap();
+        assert!(set_local_endpoint(&path, "yocomsMain", Some("http://127.0.0.1:16768")).is_err(), "not a ws address");
+        assert!(set_local_endpoint(&path, "nobody", Some("ws://127.0.0.1:1")).is_err());
+        let set = set_local_endpoint(&path, "yocomsMain", Some("ws://127.0.0.1:16768")).unwrap();
+        assert_eq!(set.address(), "ws://127.0.0.1:16768");
+        // The phone grants again: a new token and the endpoint it dials, no override.
+        put(&path, Machine {
+            name: "yocomsMain".into(),
+            endpoint: "ws://10.10.20.3:6768".into(),
+            device_token: "new".into(),
+            public_key_b64: "k".into(),
+            grant_device_id: Some("g2".into()),
+            local_endpoint: None,
+        })
+        .unwrap();
+        let after = load(&path).unwrap().remove(0);
+        assert_eq!((after.device_token.as_str(), after.address()), ("new", "ws://127.0.0.1:16768"));
+        let cleared = set_local_endpoint(&path, "yocomsMain", None).unwrap();
+        assert_eq!(cleared.address(), "ws://10.10.20.3:6768");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

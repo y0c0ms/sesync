@@ -207,6 +207,7 @@ fn machine_for(b: &Bridge, token: &str) -> sesync::machines::store::Machine {
         device_token: token.into(),
         public_key_b64: STANDARD.encode(b.server_public.as_bytes()),
         grant_device_id: None,
+        local_endpoint: None,
     }
 }
 

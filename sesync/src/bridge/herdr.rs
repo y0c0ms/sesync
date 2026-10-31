@@ -583,6 +583,13 @@ pub fn with_reported_session(argvs: Vec<Vec<String>>, reported: Option<&str>) ->
         .collect()
 }
 
+/// Whether a session the agent reported to herdr (`agent_sessions`) is the conversation identifier `ident`: the same
+/// file, compared as `same_path` does. Places a pane whose command line names no session, as `omp --resume` started from
+/// omp's picker.
+pub fn same_session(reported: &str, ident: &str) -> bool {
+    !ident.is_empty() && same_path(Path::new(reported), Path::new(ident))
+}
+
 /// Two paths name the same file: equal as written, or, on Windows, equal once `/` and `\` are unified and case is ignored.
 fn same_path(a: &Path, b: &Path) -> bool {
     if a == b {
@@ -721,6 +728,24 @@ mod tests {
             vec![vec!["omp.exe", "--resume", r"C:\Users\u\.omp/agent\sessions\-P\new.jsonl"]]
         );
         assert_eq!(with_reported_session(argvs.clone(), Some(r"C:\Users\u\.omp\agent\sessions\-P\OLD.jsonl")), argvs);
+    }
+
+    #[test]
+    fn a_reported_session_is_the_identifier_naming_the_same_file() {
+        assert!(same_session("/s/-p/a.jsonl", "/s/-p/a.jsonl"));
+        assert!(same_session("uuid-1", "uuid-1"), "an id reported by Claude or OpenCode");
+        assert!(!same_session("/s/-p/a.jsonl", "/s/-p/b.jsonl"));
+        assert!(!same_session("", ""), "nothing matches an empty identifier");
+        assert_eq!(same_session("/S/-p/a.jsonl", "/s/-p/a.jsonl"), cfg!(windows), "case counts off Windows");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_herdrs_backslashed_report_is_the_mixed_resume_path() {
+        // herdr's report and sesync's resume path for OTmain on the work PC, 2026-10-30.
+        let reported = r"C:\Users\u\.omp\agent\sessions\-Projetos-admin\2026-10-27T16-57-49-910Z_01a17e4b.jsonl";
+        assert!(same_session(reported, r"C:\Users\u\.omp/agent\sessions\-Projetos-admin\2026-10-27T16-57-49-910Z_01a17e4b.jsonl"));
+        assert!(same_session(reported, r"c:/users/u/.omp/agent/sessions/-projetos-admin/2026-10-27t16-57-49-910z_01a17e4b.jsonl"));
     }
 
     #[test]

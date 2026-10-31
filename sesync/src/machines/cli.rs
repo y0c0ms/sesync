@@ -11,7 +11,8 @@ use std::path::Path;
 const USAGE: &str = "usage: sesync machine add <name> <pairing link>   (from `sesync bridge pair --label <this machine>` there)
        sesync machine list [<name>]
        sesync machine attach <name> <conversation title or id> [--open]   (Ctrl-] detaches)
-       sesync machine remove <name>";
+       sesync machine remove <name>
+       sesync machine endpoint <name> <ws://address> | --clear   (dial that machine here, kept over a new grant)";
 
 enum Fail {
     Usage(String),
@@ -28,7 +29,9 @@ pub fn run(args: &[String], path: &Path) -> i32 {
         ["attach", name, query] => attach(path, name, query, false),
         ["attach", name, query, "--open"] => attach(path, name, query, true),
         ["remove", name] => remove(path, name),
-        _ => Err(Fail::Usage("expected add, list, attach or remove with their arguments".into())),
+        ["endpoint", name, "--clear"] => endpoint(path, name, None),
+        ["endpoint", name, address] => endpoint(path, name, Some(address)),
+        _ => Err(Fail::Usage("expected add, list, attach, remove or endpoint with their arguments".into())),
     };
     match result {
         Ok(()) => 0,
@@ -41,6 +44,15 @@ pub fn run(args: &[String], path: &Path) -> i32 {
             1
         }
     }
+}
+
+fn endpoint(path: &Path, name: &str, address: Option<&str>) -> Result<(), Fail> {
+    let machine = store::set_local_endpoint(path, name, address).map_err(Fail::Usage)?;
+    match &machine.local_endpoint {
+        Some(local) => println!("{name} is dialled at {local} from here (its pairing names {})", machine.endpoint),
+        None => println!("{name} is dialled at {} again", machine.endpoint),
+    }
+    Ok(())
 }
 
 fn add(path: &Path, name: &str, link: &str) -> Result<(), Fail> {
@@ -98,7 +110,10 @@ fn list(path: &Path, only: Option<&str>) -> Result<(), Fail> {
     }
     let rt = runtime()?;
     for machine in &machines {
-        println!("{}  {}", machine.name, machine.endpoint);
+        match &machine.local_endpoint {
+            Some(local) => println!("{}  {local}  (dialled here instead of {})", machine.name, machine.endpoint),
+            None => println!("{}  {}", machine.name, machine.endpoint),
+        }
         let rows = rt.block_on(async {
             let (mut writer, mut reader) = client::connect(machine).await?;
             client::call(&mut writer, &mut reader, "worktree.ps", json!({})).await

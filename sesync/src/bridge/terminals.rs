@@ -24,7 +24,8 @@ const SCREEN_LINES: u32 = 60;
 /// reports the pane blocked on a prompt the bridge recognises: the app's `interactivePrompt` envelope.
 /// `owner` is the worktree id the bridge opened the pane for (see `remember_pane`). `fallback` is the
 /// worktree id the pane runs by the tag and title rules, set only when no argument list or owner
-/// places the pane (see `assign_fallbacks`).
+/// places the pane (see `assign_fallbacks`). `reported` is the session the pane's agent reported to herdr, kept only
+/// when no foreground argument carries any conversation's session id: the pane's identity then (see `runs_directly`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Running {
     pub pane: Pane,
@@ -32,6 +33,7 @@ pub struct Running {
     pub prompt: Option<String>,
     pub owner: Option<String>,
     pub fallback: Option<String>,
+    pub reported: Option<String>,
 }
 
 /// Panes the bridge opened, by herdr server and terminal id, with the worktree id they were opened for. A pane
@@ -87,10 +89,13 @@ pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Ve
         .map(|pane| {
             let argvs = herdr::foreground_argvs(h, &pane.pane_id)
                 .map_err(|e| format!("could not read the processes of pane {}: {e}", pane.pane_id))?;
-            let argvs = herdr::with_reported_session(argvs, reported.get(&pane.pane_id).map(String::as_str));
+            let reported_session = reported.get(&pane.pane_id).map(String::as_str);
+            let argvs = herdr::with_reported_session(argvs, reported_session);
+            let named = conversations.iter().any(|c| c.idents.iter().any(|i| herdr_open::argv_carries(&argvs, i)));
+            let reported = if named { None } else { reported_session.map(str::to_string) };
             let prompt = blocked_prompt(h, &pane);
             let owner = owners.get(&pane.terminal_id).cloned();
-            Ok(Running { pane, argvs, prompt, owner, fallback: None })
+            Ok(Running { pane, argvs, prompt, owner, fallback: None, reported })
         })
         .collect::<Result<_, String>>()?;
     // Tab labels cost one herdr call, so they are read only when some pane runs an agent.
@@ -236,10 +241,13 @@ fn runs(r: &Running, conv: &Conversation) -> bool {
     runs_directly(r, conv, &worktree) || r.fallback.as_deref() == Some(worktree.as_str())
 }
 
-/// Whether `r` runs `conv` by what herdr reports: the bridge opened the pane for `worktree`, or a
-/// foreground argument carries one of `conv`'s session ids.
+/// Whether `r` runs `conv` by what herdr reports: the bridge opened the pane for `worktree`, a foreground argument
+/// carries one of `conv`'s session ids, or, when no argument names a session, the agent reported one of them to herdr.
 fn runs_directly(r: &Running, conv: &Conversation, worktree: &str) -> bool {
-    r.owner.as_deref() == Some(worktree) || conv.idents.iter().any(|ident| herdr_open::argv_carries(&r.argvs, ident))
+    r.owner.as_deref() == Some(worktree)
+        || conv.idents.iter().any(|ident| {
+            herdr_open::argv_carries(&r.argvs, ident) || r.reported.as_deref().is_some_and(|s| herdr::same_session(s, ident))
+        })
 }
 
 /// The label a terminal shows: the harness and the conversation's title, as "open in herdr" names a tab.
@@ -470,6 +478,7 @@ mod tests {
             prompt: None,
             owner: None,
             fallback: None,
+            reported: None,
         }
     }
 
@@ -714,5 +723,54 @@ mod tests {
         assert_eq!(pane_title_name("opencode", "OC | DoppleClankerMain").as_deref(), Some("DoppleClankerMain"));
         assert_eq!(pane_title_name("opencode", "DoppleClankerMain"), None);
         assert_eq!(pane_title_name("pi", "π > Main agent"), None);
+    }
+
+    /// herdr answering a pane listing, each pane's foreground argv, and the sessions agents reported.
+    struct Reports {
+        panes: Vec<(&'static str, Vec<&'static str>)>,
+        sessions: Vec<(&'static str, &'static str)>,
+    }
+
+    impl Herdr for Reports {
+        fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+            match method {
+                "pane.list" => Ok(json!({ "panes": self.panes.iter().map(|(id, _)| json!({
+                    "pane_id": id, "terminal_id": format!("term_{id}"), "tab_id": "w1:t1", "focused": false,
+                    "agent_status": "idle", "agent": "omp",
+                })).collect::<Vec<_>>() })),
+                "pane.process_info" => {
+                    let (_, argv) = self.panes.iter().find(|(id, _)| params["pane_id"] == *id).ok_or("no pane")?;
+                    Ok(json!({ "process_info": { "foreground_processes": [{ "argv": argv }] } }))
+                }
+                "agent.list" => Ok(json!({ "agents": self.sessions.iter().map(|(pane, value)| json!({
+                    "pane_id": pane, "agent": "omp", "agent_session": { "kind": "path", "value": value },
+                })).collect::<Vec<_>>() })),
+                "tab.list" => Ok(json!({ "tabs": [] })),
+                other => Err(format!("no answer for {other}")),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_whose_command_names_no_session_runs_the_session_its_agent_reported() {
+        let main = conv("omp", "OTmain", "/s/-a/main.jsonl", "/a");
+        let other = conv("omp", "Other", "/s/-b/other.jsonl", "/b");
+        let herdr = Reports {
+            panes: vec![
+                // Started from omp's picker: the command line names no session (work PC, 2026-10-30).
+                ("w6:p3", vec!["omp", "--resume"]),
+                // Its command line names `other`; a report naming `main` (another directory, so not a move) does not
+                // make it a second `main` pane.
+                ("w7:p1", vec!["omp", "--session", "/s/-b/other.jsonl"]),
+                ("w8:p1", vec!["omp", "--resume"]),
+            ],
+            sessions: vec![("w6:p3", "/s/-a/main.jsonl"), ("w7:p1", "/s/-a/main.jsonl"), ("w8:p1", "/s/-a/gone.jsonl")],
+        };
+        let convs = vec![main, other];
+        let panes = running_panes(&herdr, &convs).unwrap();
+        let runs = |id: &str| panes.iter().find(|r| r.pane.pane_id == id).and_then(|r| conversation_of(r, &convs)).map(|c| c.title.clone());
+        assert_eq!(runs("w6:p3").as_deref(), Some("OTmain"));
+        assert_eq!(runs("w7:p1").as_deref(), Some("Other"), "the command line wins over the report");
+        assert_eq!(runs("w8:p1"), None, "a reported session no conversation has places nothing");
     }
 }
