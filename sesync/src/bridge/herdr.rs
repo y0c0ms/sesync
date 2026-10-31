@@ -48,16 +48,26 @@ pub trait Herdr: Send + Sync {
         String::new()
     }
 
-    /// Pane agent-status changes for `pane_ids`. Canned answers have none, so the default refuses.
+    /// A stream of changes: each status change of a pane in `pane_ids`, and every change to the pane list
+    /// (`Change::Panes`). Canned answers have none, so the default refuses.
     fn status_events(&self, _pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
         Err("herdr status events are not available here".into())
     }
 }
 
-/// A stream of pane agent-status changes, read with a timeout.
+/// One change on a status stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A listed pane's agent status, title or agent changed. The values are herdr's now.
+    Status { pane_id: String, status: String, agent: Option<String>, title: Option<String> },
+    /// A pane opened, closed or exited, or an agent was detected in or released from one: the pane list may differ.
+    Panes,
+}
+
+/// A stream of changes, read with a timeout.
 pub trait StatusSource: Send {
-    /// The next `(pane_id, agent_status)`, or None when `wait` passes first. An error ends the stream.
-    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String>;
+    /// The next change, or None when `wait` passes first. An error ends the stream.
+    fn next(&mut self, wait: Duration) -> Result<Option<Change>, String>;
 }
 
 /// herdr over its API socket.
@@ -215,25 +225,30 @@ impl Herdr for Socket {
 }
 
 impl StatusSource for StatusEvents {
-    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+    fn next(&mut self, wait: Duration) -> Result<Option<Change>, String> {
         StatusEvents::next(self, wait)
     }
 }
 
-/// A subscription to `pane.agent_status_changed` for a set of panes. herdr pushes one event line per
-/// change, in order, so no status between two reads is lost. Sampling cannot promise that: an agent
-/// turn can start and finish between two samples.
+/// The pane lifecycle events a status stream always carries: a pane list change for any pane in the workspace.
+const PANE_LIST_EVENTS: [&str; 4] = ["pane.created", "pane.closed", "pane.exited", "pane.agent_detected"];
+
+/// One subscription to herdr's events: the pane list changes (`PANE_LIST_EVENTS`) and the agent status of each
+/// pane in a set. herdr pushes one event line per change, in order, so no status between two reads is lost.
+/// Sampling cannot promise that: an agent turn can start and finish between two samples. The connection is kept
+/// open; a change of pane set needs a new subscription.
 pub struct StatusEvents {
     conn: Conn,
 }
 
 impl StatusEvents {
-    /// Subscribe to the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
+    /// Subscribe to the pane list changes and the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
     pub fn open(path: &Path, pane_ids: &[String]) -> Result<StatusEvents, String> {
         let mut conn = Conn::open(path)?;
-        let subscriptions: Vec<Value> = pane_ids
+        let subscriptions: Vec<Value> = PANE_LIST_EVENTS
             .iter()
-            .map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id }))
+            .map(|kind| json!({ "type": kind }))
+            .chain(pane_ids.iter().map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id })))
             .collect();
         let request = json!({ "id": "sesync-events", "method": "events.subscribe", "params": { "subscriptions": subscriptions } });
         conn.send(&request).map_err(|e| format!("herdr did not take the event subscription ({e})"))?;
@@ -246,21 +261,27 @@ impl StatusEvents {
         Ok(events)
     }
 
-    /// The next pane status change as `(pane_id, agent_status)`, or None when `wait` passes without one.
-    /// Other events are skipped. An error means the connection ended and the subscription must be reopened.
-    pub fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+    /// The next change, or None when `wait` passes without one. Other events are skipped. An error means the
+    /// connection ended and the subscription must be reopened.
+    pub fn next(&mut self, wait: Duration) -> Result<Option<Change>, String> {
         loop {
             let Some(line) = self.line(wait)? else { return Ok(None) };
             let event: Value = match serde_json::from_str(line.trim()) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if event["event"] != "pane.agent_status_changed" {
+            let kind = event["event"].as_str().unwrap_or("");
+            if PANE_LIST_EVENTS.contains(&kind) {
+                return Ok(Some(Change::Panes));
+            }
+            if kind != "pane.agent_status_changed" {
                 continue;
             }
             let data = &event["data"];
             if let (Some(pane), Some(status)) = (data["pane_id"].as_str(), data["agent_status"].as_str()) {
-                return Ok(Some((pane.to_string(), status.to_string())));
+                let agent = data["agent"].as_str().filter(|a| !a.is_empty()).map(str::to_string);
+                let title = data["title"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string);
+                return Ok(Some(Change::Status { pane_id: pane.to_string(), status: status.to_string(), agent, title }));
             }
         }
     }
@@ -891,17 +912,19 @@ mod tests {
             "{\"id\":\"sesync-events\",\"result\":{\"type\":\"subscription_started\"}}\n",
             vec![
                 "{\"event\":\"pane.output_matched\",\"data\":{}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"working\"}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"idle\"",
-                "}}\n",
+                "}}\n{\"event\":\"pane.closed\",\"data\":{\"pane_id\":\"w1:p9\",\"workspace_id\":\"w1\"}}\n",
             ],
         );
         let mut events = StatusEvents::open(&path, &["w1:p1".to_string()]).unwrap();
         let wait = Duration::from_secs(2);
-        assert_eq!(events.next(wait).unwrap(), Some(("w1:p1".to_string(), "working".to_string())));
+        let status = |pane: &str, status: &str| Change::Status { pane_id: pane.into(), status: status.into(), agent: None, title: None };
+        assert_eq!(events.next(wait).unwrap(), Some(status("w1:p1", "working")));
         assert_eq!(
             events.next(wait).unwrap(),
-            Some(("w1:p1".to_string(), "idle".to_string())),
+            Some(status("w1:p1", "idle")),
             "a line split across writes is joined"
         );
+        assert_eq!(events.next(wait).unwrap(), Some(Change::Panes), "a closed pane changes the pane list");
         assert_eq!(events.next(Duration::from_millis(100)).unwrap(), None, "no change within the wait");
         drop(release);
         assert!(events.next(wait).is_err(), "a closed stream is an error the watcher reopens on");
