@@ -89,29 +89,35 @@ pub fn copy_mtime(fmt: &str, path: &std::path::Path) -> f64 {
 }
 
 /// What one stat per file of a copy tells the daemon: the newest modification time of the copy in
-/// seconds (as `copy_mtime`), and its identity, the size, modification time in nanoseconds and
-/// inode of each file `copy_files` names ("missing" for a main file that is gone). Two identities
-/// that are equal name the same bytes as far as a stat can tell.
+/// seconds (as `copy_mtime`), the size of its main file (None when that file is gone), and its
+/// identity, the size, modification time in nanoseconds and inode of each file `copy_files` names
+/// ("missing" for a main file that is gone). Two identities that are equal name the same bytes as
+/// far as a stat can tell.
 pub struct CopyStat {
     pub mtime: f64,
+    pub size: Option<u64>,
     pub identity: String,
 }
 
 /// The `CopyStat` of a copy, with one stat per file.
 pub fn copy_stat(fmt: &str, path: &std::path::Path) -> CopyStat {
     let mut mtime = 0.0_f64;
+    let mut size = None;
     let mut parts = Vec::new();
-    for f in copy_files(fmt, path) {
-        match std::fs::metadata(&f) {
+    for (i, f) in copy_files(fmt, path).iter().enumerate() {
+        match std::fs::metadata(f) {
             Ok(m) => {
                 let since = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
                 mtime = mtime.max(since.map_or(0.0, |d| d.as_secs_f64()));
+                if i == 0 {
+                    size = Some(m.len());
+                }
                 parts.push(identity_of(&m));
             }
             Err(_) => parts.push("missing".to_string()),
         }
     }
-    CopyStat { mtime, identity: parts.join("+") }
+    CopyStat { mtime, size, identity: parts.join("+") }
 }
 
 /// The identity of one file: size, modification time in nanoseconds and inode, as `copy_stat`

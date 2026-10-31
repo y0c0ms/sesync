@@ -160,10 +160,10 @@ fn scan(env: &Env, state: &mut State, memo: &mut PassMemo) -> Vec<PassSource> {
             if is_mirror(state, &key) || recorded.contains(&key) {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
             // A conversation of several files (a database and its WAL) changes in any of them:
-            // its time and hash cover them together.
+            // its time and hash cover them together. One stat per file gives all of it.
             let stat = copy_stat(fmt, &path);
+            let Some(size) = stat.size else { continue };
             let mtime = stat.mtime;
             let src = state.sources.entry(key.clone()).or_insert_with(|| Source::new(fmt, &key));
             if src.conv.is_empty() {
@@ -193,7 +193,7 @@ fn scan(env: &Env, state: &mut State, memo: &mut PassMemo) -> Vec<PassSource> {
                 missing, src.chosen_targets.len(), src.mirrors.len(),
                 src.failures, src.last_failure, now, env.quiet_secs);
             let input = ScanInput {
-                size: meta.len(),
+                size,
                 mtime,
                 now,
                 is_mirror: false,
@@ -205,7 +205,7 @@ fn scan(env: &Env, state: &mut State, memo: &mut PassMemo) -> Vec<PassSource> {
                 wanted_mirrors: wanted,
                 needs_mirror,
             };
-            if !should_sync(&input) || meta.len() < MIN_BYTES {
+            if !should_sync(&input) || size < MIN_BYTES {
                 continue;
             }
             let title = h.title(&path);
