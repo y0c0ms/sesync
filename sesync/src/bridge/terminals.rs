@@ -67,6 +67,16 @@ pub fn owner_of(herdr: &dyn Herdr, terminal_id: &str) -> Option<String> {
 /// reported idle while one of its panes is unknown. `conversations` is what the fallback rules match.
 pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Vec<Running>, String> {
     let panes = herdr::list_panes(h)?;
+    running_listed(h, panes, conversations).map(|(running, _labels)| running)
+}
+
+/// `running_panes` for a pane list already read. Also returns the tab labels it read (by tab id), so the
+/// watcher can place a pane again when its title changes (`reassign_fallbacks`) without another read.
+pub fn running_listed(
+    h: &dyn Herdr,
+    panes: Vec<herdr::Pane>,
+    conversations: &[Conversation],
+) -> Result<(Vec<Running>, HashMap<String, String>), String> {
     let scope = h.scope();
     let owners: HashMap<String, String> = {
         let mut opened = OPENED.lock();
@@ -105,7 +115,13 @@ pub fn running_panes(h: &dyn Herdr, conversations: &[Conversation]) -> Result<Ve
         HashMap::new()
     };
     assign_fallbacks(&mut running, conversations, &labels);
-    Ok(running)
+    Ok((running, labels))
+}
+
+/// Give each pane its fallback conversation again, after a pane's title or agent changed: the same rules as
+/// `running_panes`, over the argument lists and tab labels already read.
+pub fn reassign_fallbacks(panes: &mut [Running], conversations: &[Conversation], labels: &HashMap<String, String>) {
+    assign_fallbacks(panes, conversations, labels);
 }
 
 /// Give a fallback conversation to each agent pane that no argument list or owner places. The rules, in
