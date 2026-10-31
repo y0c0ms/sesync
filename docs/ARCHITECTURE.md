@@ -92,6 +92,14 @@ flowchart TD
     F --> SV
 ```
 
+A pass does no work for what did not change. Each session file is stat'ed once per pass. A copy's content hash is
+kept for the daemon's run, keyed by the file's identity (size, mtime in ns and inode), and dropped for copies a pass
+did not see (`mirror::CopyHashes`), so an unchanged session is read once per run, not every 5 s. A subagent transcript
+is archived once per change, streamed (`archive::pack_file`), not read whole every pass. `state.json` is written
+(temp file, fsync, rename) only when its bytes change. Measured on yocomsMain's data, an idle pass went from 0.107 to
+0.004 CPU-s; with large subagent transcripts (4 × 28 MB, 1 × 340 MB) from 2.86 CPU-s and 432 MB peak RSS to 0.0035 CPU-s
+and 15 MB. The first pass after a start hashes and archives everything once.
+
 ### Writing a copy into Y
 
 ```mermaid
@@ -1015,7 +1023,7 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 
 | Key | Meaning |
 |---|---|
-| `sources` | per `(fmt,key)`: `conv`, `last_seen_change`, `last_hash`, `last_stamp`, `failures`, `last_failure`, `mirrors`, `chosen_targets`, `title`, `turn_at` |
+| `sources` | per `(fmt,key)`: `conv`, `last_seen_change`, `last_hash`, `failures`, `last_failure`, `mirrors`, `chosen_targets`, `title`, `turn_at`. A file written before 2026-10-31 may carry `last_stamp`; it is ignored |
 | `sources[].sync` | per chosen copy: `{ok_at, problem, problem_at}`, the daemon's last good write and last failure. Settled on every pass (`settle_sync_records`): a copy no longer chosen loses its record at once, and a file copy written before the record existed gets `ok_at` once from its mtime (never for a diverged copy or bytes sesync did not write; an OpenCode copy waits for its next write, since its row time is the imported conversation's). A problem that says "will retry" (the copy was in use) shows as waiting, not failing |
 | `mirror_keys` | every path/id the daemon created; never treated as a source |
 | `subagents` | parent session → subagent transcript paths |

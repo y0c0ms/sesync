@@ -253,8 +253,11 @@ herdr's `pane.updated` does not fire when a pane's output changes (checked again
 from `pane.send_keys` and `pane.send_text` produced no event). `pane.output_matched` fires only when a
 matching line appears, and an events connection fixes its pane set when it opens, so it cannot follow
 panes that come and go. The bridge therefore polls: a screen every 250 ms (sent only when it changed),
-the tab and status lists every second, and the conversation list from disk every 5 seconds.
-herdr's `pane.agent_status_changed` is not used for screens, but it is used for notifications: a per-pane `events.subscribe` delivers every status change (see Notifications), so no turn is missed between samples.
+the tab and status lists every second, and the conversation list from disk every 5 seconds. A pane listing reuses
+each pane's processes, the agents' reported sessions and the tab labels for up to 5 s while the pane's listed fields
+(id, tab, agent, foreground directory) are unchanged (`herdr::ProcessMemo`), so a tick costs about two herdr
+requests, not two plus one per pane.
+herdr's `pane.agent_status_changed` is not used for screens, but it is used for notifications (see Notifications), so no turn is missed between samples.
 
 ## Prompt turns
 
@@ -380,7 +383,7 @@ Chat sends (`terminal.send` with `enter`) are refused with `not_running_agent` w
 
 ## Notifications
 
-A watcher subscribes to herdr's `pane.agent_status_changed` event for each pane it knows (`events.subscribe`, one subscription per pane), and applies every status change as it arrives, so a turn is seen however short it is. The pane list is re-read every second to follow panes that open or close, and the subscription is reopened then. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push e…
+A watcher keeps one herdr events connection (`events.subscribe`) for pane-list events and for `pane.agent_status_changed` of the panes that can change status (an agent runs, or herdr reports a status), and applies every status change as it arrives, so a turn is seen however short it is. It reads the pane list again on a pane-list event, on a status move, and every 30 s as a safety net; a title or agent change re-places the pane without a read. It re-reads the conversations every 5 s only while an agent pane runs. A pane whose argv changes with no pane or status event is placed at the next 30 s read. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push enabled, each event is also published on a detached thread to `<ntfy url>/<topic>` with `Authorization: Bearer`, the headers `Title` ("Agent finished" or "Agent needs input"), `Priority` (3 or 4) and `Tags`. Dismissal is not implemented: `dismissedPushes` is always `[]`.
 
 `notifications.testPush` sends one synthetic frame, `{type:"notification", source:"test", title:"Test notification", notificationId:"test:<epoch>:<n>"}`, to every open `notifications.subscribe` stream. It is not kept in the history, takes no sequence number and never goes to ntfy. The reply is `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no stream is open.
 
@@ -393,14 +396,19 @@ A watcher subscribes to herdr's `pane.agent_status_changed` event for each pane 
 `worktree.ps` and `repo.list` read the listing the TUI uses (`manage::list_groups`) on the saved
 `state.json`, read-only, through each harness's own cwd or store row, and resolve each conversation's
 herdr session identifiers through the harness's resume command. It does not run the daemon's save-time
-steps, so a session the TUI hides only in memory can show here until the daemon next saves. Each request
-re-reads the files it needs; the conversation list is not cached between requests (streams refresh it
-every 5 seconds).
+steps, so a session the TUI hides only in memory can show here until the daemon next saves. The catalog keeps what
+it read between builds and reads again only what moved: each journal's title by the file's size and mtime
+(`TitleCache`), each store's rows by its files' stamps (`Harness::rows_stamp`; OpenCode's database, `-wal` and
+`-journal`, so an idle bridge no longer opens the database and rewrites its `-shm`), and each project folder. A file
+replaced with the same size and mtime is seen at its next change. On Linux with glibc the bridge sets `mallopt`'s
+mmap threshold to 128 KiB, so the large title-read buffers go back to the system instead of staying in the heap
+(idle RSS about 10 MB).
 
 ## Herdr access
 
 The bridge talks to herdr over its Unix socket: one JSON request per line, one reply line per request,
-each request on its own connection, 5 s timeout. The socket is `$HERDR_SOCKET_PATH`, else
+each request on its own connection (herdr closes a request connection after its reply; only an events connection
+stays open), 5 s timeout. The socket is `$HERDR_SOCKET_PATH`, else
 `$HOME/.config/herdr/herdr.sock`; `--herdr-socket` overrides it. Methods used: `pane.list`, `pane.get`,
 `pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`, `agent.list` (the session each agent reported, read only when an agent pane is listed), `tab.list` (tab labels, read only when an agent pane is listed, for the tag rule), and `pane.layout` (the pane's size, for `terminal.subscribe` and the size checks). The bridge never
 creates, closes, or resizes panes. Verified against herdr 0.9.1 (protocol 22):

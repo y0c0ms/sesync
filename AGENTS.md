@@ -105,9 +105,10 @@ HS_E2E=1 sh build-test.sh
 - **Harnesses**: `harness` holds the `Harness` trait and its registry (`ALL`, `get`), one module
   per harness (`omp`, `pi`, `claude` with `compaction`, `opencode` with `store` and `rename`,
   `antigravity` with `store`), the JSONL helpers they share (`journal`) and the retired ones
-  (`retired`). Nothing outside `harness` names a harness.
-- **Local pipeline**: `scan`, `pass`, `mirror`, `mirror_write`, `mirror_cleanup`, `turn`,
-  `prompts`, `lock`, `archive`, `archive_store`.
+  (`retired`). Nothing outside `harness` names a harness. A store harness implements `rows_stamp` (the stamps of its
+  store's files) so a reader can keep its rows until they move (`manage::StoreRows`); OpenCode does, the others return None.
+- **Local pipeline**: `scan`, `pass`, `mirror` (with `CopyHashes`, the run's content hashes by file identity),
+  `mirror_write`, `mirror_cleanup`, `turn`, `prompts`, `lock`, `archive`, `archive_store`.
 - **TUI**: `tui`, `app`, `ui`, `keys`, `palette`, `form`, `theme`, `session_cols` (columns,
   `display_safe`), `manage`, `members` (members dialog state), `team_actions` (the network work
   behind the team dialogs, run on worker threads), `preview` (the highlighted session's last
@@ -122,7 +123,7 @@ HS_E2E=1 sh build-test.sh
   `e2ee` (the channel: Orca's NaCl framing, or AES-256-GCM after the hybrid handshake), `hybrid` (X25519 +
   ML-KEM-768 handshake for sesync clients), `net` (allowlist), `rpc` (the served methods), `catalog` (conversations
   by project directory, read-only), `devices` (hashed device tokens, each a `phone` or a `machine`), `grants` (the `machines.*` RPCs and `devices.revoke`: the phone decides which machines see each other), `offer` (pairing offer v2), `keys`,
-  `herdr` (socket client), `terminals`, `stream` (live terminal screens), `transcript` (chat view),
+  `herdr` (socket client; `ProcessMemo` keeps a listing's process reads while the panes are unchanged), `terminals`, `stream` (live terminal screens and the pane history behind them), `transcript` (chat view),
   `turns` (prompt claims), `start` (new sessions), `approvals`, `notify`, `ntfy`, `usage`, `files`, `git`,
   `pins`, `confine`, `uploads`, `testkit`, `cli`.
 - **Machines** (`machines/`, only `sesync machine …` runs it; commands in `docs/BRIDGE.md`): this machine as a

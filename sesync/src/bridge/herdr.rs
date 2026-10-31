@@ -282,6 +282,9 @@ impl Conn {
         use std::io::Read;
         use std::os::windows::io::AsRawHandle;
         let deadline = Instant::now() + wait;
+        // A reply comes within milliseconds; an events connection can wait 30 s for its next line. Polling starts at
+        // 5 ms and doubles to 100 ms while nothing arrives, so a long wait costs 10 wake-ups a second, not 200.
+        let mut pause = Duration::from_millis(5);
         loop {
             let mut available: u32 = 0;
             let ok = unsafe {
@@ -310,7 +313,8 @@ impl Conn {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+            pause = (pause * 2).min(Duration::from_millis(100));
         }
     }
 }
