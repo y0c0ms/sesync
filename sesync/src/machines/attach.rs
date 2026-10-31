@@ -2,7 +2,9 @@
 //! pane's screen as full repaints (JSON `terminal.subscribe`); each is drawn cut to this window, bottom rows
 //! kept, with autowrap off so a wider remote pane is cut at the right edge instead of wrapping. Keys go to the
 //! pane as typing (`terminal.send` text, as the phone's terminal keyboard sends them), so Enter there is typing,
-//! not a prompt turn. Ctrl-] detaches. Run inside a herdr tab, this is a remote terminal tab.
+//! not a prompt turn. PageUp or the mouse wheel shows the pane's scrollback (`terminal.read`, as text) until End,
+//! Esc, `q`, scrolling past the bottom, or typing. Ctrl-] detaches. Run inside a herdr tab, this is a remote
+//! terminal tab.
 
 use super::client::{self, Reader, Writer};
 use super::store::Machine;
@@ -16,6 +18,10 @@ pub const DETACH: u8 = 0x1d;
 const REPAINT: &str = "\x1b[H\x1b[2J";
 /// How often the window size is checked, so a resized window is drawn again.
 const SIZE_EVERY: Duration = Duration::from_millis(400);
+/// The scrollback rows asked of the bridge: all herdr keeps. A bridge older than `terminal.read`'s `lines` sends 200.
+const SCROLLBACK: u32 = 1000;
+/// Rows one wheel notch scrolls.
+const WHEEL: usize = 3;
 
 /// The conversation `query` names among `worktree.ps` rows: its worktree id; else its title, ignoring case;
 /// else the one title that contains it. Two that fit equally is an error that lists their ids.
@@ -60,6 +66,129 @@ pub fn render(frame: &str, rows: u16, status: &str) -> String {
     out
 }
 
+/// What attach does with a key or mouse report read from this terminal. Everything it does not act on is `Text`,
+/// typing for the remote pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Text,
+    Detach,
+    PageUp,
+    PageDown,
+    WheelUp,
+    WheelDown,
+    Up,
+    Down,
+    Home,
+    End,
+    Esc,
+    /// Any other mouse report: clicks and moves, which the remote pane is never sent.
+    Mouse,
+}
+
+/// `bytes` read from this terminal, split into keys, each with its bytes. Runs of plain text stay together.
+fn keys(bytes: &[u8]) -> Vec<(Key, &[u8])> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        let (key, len) = match rest[0] {
+            DETACH => (Key::Detach, 1),
+            0x1b => escape(rest),
+            _ => (Key::Text, rest.iter().position(|&b| b == 0x1b || b == DETACH).unwrap_or(rest.len())),
+        };
+        out.push((key, &rest[..len]));
+        at += len;
+    }
+    out
+}
+
+/// The key the escape sequence starting `rest` is, and its length. A lone Esc ends the read; Alt and a key is
+/// text; a CSI sequence runs to its final byte, and an SGR mouse report (`ESC [ < button ; x ; y M`) is a wheel
+/// notch for buttons 64 and 65.
+fn escape(rest: &[u8]) -> (Key, usize) {
+    match rest.get(1) {
+        None => (Key::Esc, 1),
+        Some(b'[') => {
+            let Some(end) = rest[2..].iter().position(|b| (0x40..=0x7e).contains(b)).map(|p| p + 3) else {
+                return (Key::Text, rest.len());
+            };
+            let key = match &rest[2..end] {
+                b"5~" => Key::PageUp,
+                b"6~" => Key::PageDown,
+                b"A" => Key::Up,
+                b"B" => Key::Down,
+                b"H" | b"1~" => Key::Home,
+                b"F" | b"4~" => Key::End,
+                [b'<', report @ ..] => match report.split(|&b| b == b';').next() {
+                    Some(b"64") => Key::WheelUp,
+                    Some(b"65") => Key::WheelDown,
+                    _ => Key::Mouse,
+                },
+                _ => Key::Text,
+            };
+            (key, end)
+        }
+        Some(_) => (Key::Text, 2),
+    }
+}
+
+/// What a key does while the scrollback is shown.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Show the view ending this many rows above the bottom.
+    Move(usize),
+    /// Back to the live screen.
+    Live,
+    /// Back to the live screen, and the key is typing for the pane.
+    Type,
+    Ignore,
+}
+
+/// `key` while the view ends `offset` rows above the bottom, `most` being the furthest it can go and `page` the rows
+/// a page moves. Scrolling down past the bottom is the live screen again.
+fn scroll_step(key: Key, raw: &[u8], offset: usize, most: usize, page: usize) -> Step {
+    let down = |by: usize| if by >= offset { Step::Live } else { Step::Move(offset - by) };
+    let up = |by: usize| Step::Move(offset.saturating_add(by).min(most));
+    match key {
+        Key::PageUp => up(page),
+        Key::WheelUp => up(WHEEL),
+        Key::Up => up(1),
+        Key::Home => Step::Move(most),
+        Key::PageDown => down(page),
+        Key::WheelDown => down(WHEEL),
+        Key::Down => down(1),
+        Key::End | Key::Esc => Step::Live,
+        Key::Text if raw == b"q" => Step::Live,
+        Key::Text => Step::Type,
+        Key::Mouse | Key::Detach => Step::Ignore,
+    }
+}
+
+/// The scrollback on show: the pane's last rows as the bridge answered the `read` request (None until it does),
+/// and how many rows above the bottom the view ends.
+struct Scroll {
+    read: String,
+    rows: Option<Vec<String>>,
+    offset: usize,
+}
+
+/// The furthest a view of `rows` rows can end above the bottom in a window `height` rows high.
+fn most(rows: usize, height: u16) -> usize {
+    rows.saturating_sub(usize::from(height.max(2)) - 1)
+}
+
+/// What the window shows: the live `frame`, or the scrollback once its rows have arrived.
+fn screen(frame: &str, scroll: Option<&Scroll>, height: u16, name: &str) -> String {
+    match scroll.and_then(|s| s.rows.as_ref().map(|rows| (rows, s.offset))) {
+        Some((rows, offset)) => {
+            let end = rows.len() - offset.min(rows.len());
+            let status = format!("{name} — scrollback, {offset} of {} rows up · PgUp PgDn ↑ ↓ wheel · End or q: live", most(rows.len(), height));
+            render(&rows[..end].join("\r\n"), height, &status)
+        }
+        None => render(frame, height, &format!("{name} — PgUp or wheel: scrollback · Ctrl-] detaches")),
+    }
+}
+
 /// Restores the terminal however attach ends.
 struct Screen;
 
@@ -67,8 +196,9 @@ impl Screen {
     fn enter() -> Result<Screen, String> {
         crossterm::terminal::enable_raw_mode().map_err(|e| format!("cannot take over the terminal: {e}"))?;
         enable_vt_input();
-        // Alternate screen, no autowrap, no cursor: the remote screen carries no cursor position.
-        print!("\x1b[?1049h\x1b[?7l\x1b[?25l");
+        // Alternate screen, no autowrap, no cursor (the remote screen carries no cursor position), mouse reports in
+        // SGR form for the wheel.
+        print!("\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[?1000h\x1b[?1006h");
         let _ = std::io::stdout().flush();
         Ok(Screen)
     }
@@ -76,7 +206,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        print!("\x1b[?25h\x1b[?7h\x1b[?1049l");
+        print!("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?7h\x1b[?1049l");
         let _ = std::io::stdout().flush();
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -133,15 +263,15 @@ pub async fn run(machine: &Machine, query: &str, open: bool) -> Result<String, S
     let stream = writer
         .request("terminal.subscribe", json!({ "terminal": terminal, "client": { "id": format!("sesync-machine-{host}") } }))
         .await?;
-    let status = format!("{} · {title} — Ctrl-] detaches", machine.name);
+    let name = format!("{} · {title}", machine.name);
     let screen = Screen::enter()?;
-    let result = mirror(&mut writer, &mut reader, &stream, &terminal, &status).await;
+    let result = mirror(&mut writer, &mut reader, &stream, &terminal, &name).await;
     drop(screen);
     result.map(|()| format!("detached from {title} on {}", machine.name))
 }
 
-async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal: &str, status: &str) -> Result<(), String> {
-    let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal: &str, name: &str) -> Result<(), String> {
+    let (keys_tx, mut typed_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     // Blocking reads of stdin, on a thread of their own; the thread ends with the process.
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
@@ -153,16 +283,28 @@ async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal
         }
     });
     let mut frame = String::new();
+    let mut scroll: Option<Scroll> = None;
     let mut size = crossterm::terminal::size().map_err(|e| e.to_string())?;
     let mut tick = tokio::time::interval(SIZE_EVERY);
-    let draw = |frame: &str, rows: u16| {
-        print!("{}", render(frame, rows, status));
+    let draw = |frame: &str, scroll: Option<&Scroll>, height: u16| {
+        print!("{}", screen(frame, scroll, height, name));
         let _ = std::io::stdout().flush();
     };
     loop {
         tokio::select! {
             message = reader.next() => {
                 let Some(message) = message? else { return Err("the machine closed the connection".into()) };
+                if let Some(s) = scroll.as_mut().filter(|s| message["id"].as_str() == Some(s.read.as_str())) {
+                    let rows = client::outcome(&message).map_err(|e| format!("cannot read the pane's scrollback: {e}"))?;
+                    let rows: Vec<String> = rows["terminal"]["tail"]
+                        .as_array()
+                        .map(|tail| tail.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    s.offset = s.offset.min(most(rows.len(), size.1));
+                    s.rows = Some(rows);
+                    draw(&frame, scroll.as_ref(), size.1);
+                    continue;
+                }
                 if message["id"] != stream {
                     continue; // replies to typing
                 }
@@ -180,27 +322,60 @@ async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal
                     Some("end") => return Err("the pane closed on that machine".into()),
                     _ => continue,
                 }
-                draw(&frame, size.1);
+                if scroll.is_none() {
+                    draw(&frame, None, size.1);
+                }
             }
-            typed = keys.recv() => {
+            typed = typed_rx.recv() => {
                 let Some(bytes) = typed else { return Ok(()) };
-                let (send, detach) = match bytes.iter().position(|&b| b == DETACH) {
-                    Some(at) => (&bytes[..at], true),
-                    None => (&bytes[..], false),
-                };
+                let page = usize::from(size.1.max(3)) - 2;
+                let mut send: Vec<u8> = Vec::new();
+                let scrolled = scroll.is_some();
+                let mut detach = false;
+                for (key, raw) in keys(&bytes) {
+                    if key == Key::Detach {
+                        detach = true;
+                        break;
+                    }
+                    let Some(s) = scroll.as_mut() else {
+                        match key {
+                            Key::PageUp | Key::WheelUp => {
+                                let read = writer.request("terminal.read", json!({ "terminal": terminal, "lines": SCROLLBACK })).await?;
+                                let offset = if key == Key::PageUp { page } else { WHEEL };
+                                scroll = Some(Scroll { read, rows: None, offset });
+                            }
+                            Key::WheelDown | Key::Mouse => {}
+                            _ => send.extend_from_slice(raw),
+                        }
+                        continue;
+                    };
+                    let furthest = s.rows.as_ref().map_or(usize::MAX, |rows| most(rows.len(), size.1));
+                    match scroll_step(key, raw, s.offset, furthest, page) {
+                        Step::Move(offset) => s.offset = offset,
+                        Step::Live => scroll = None,
+                        Step::Type => {
+                            scroll = None;
+                            send.extend_from_slice(raw);
+                        }
+                        Step::Ignore => {}
+                    }
+                }
                 if !send.is_empty() {
-                    let text = String::from_utf8_lossy(send).into_owned();
+                    let text = String::from_utf8_lossy(&send).into_owned();
                     writer.request("terminal.send", json!({ "terminal": terminal, "text": text })).await?;
                 }
                 if detach {
                     return Ok(());
+                }
+                if scrolled || scroll.is_some() {
+                    draw(&frame, scroll.as_ref(), size.1);
                 }
             }
             _ = tick.tick() => {
                 let now = crossterm::terminal::size().map_err(|e| e.to_string())?;
                 if now != size {
                     size = now;
-                    draw(&frame, size.1);
+                    draw(&frame, scroll.as_ref(), size.1);
                 }
             }
         }
@@ -237,5 +412,54 @@ mod tests {
         assert!(out.ends_with("\x1b[3;1H\x1b[0;7m work-pc · OTmain \x1b[0m"), "status on the last row: {out:?}");
         let short = render(&format!("{REPAINT}only"), 10, "s");
         assert!(short.contains("only\x1b[0m"), "a short frame is drawn whole: {short:?}");
+    }
+
+    #[test]
+    fn keys_split_into_scroll_keys_wheel_notches_and_typing() {
+        let read = b"hi\x1b[5~\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[A\x1b[6~\x1bxok\x1d\x1b";
+        let got: Vec<(Key, &[u8])> = keys(read);
+        assert_eq!(
+            got,
+            vec![
+                (Key::Text, &b"hi"[..]),
+                (Key::PageUp, b"\x1b[5~"),
+                (Key::WheelUp, b"\x1b[<64;10;5M"),
+                (Key::WheelDown, b"\x1b[<65;1;1M"),
+                (Key::Mouse, b"\x1b[<0;3;4M"),
+                (Key::Up, b"\x1b[A"),
+                (Key::PageDown, b"\x1b[6~"),
+                (Key::Text, b"\x1bx"),
+                (Key::Text, b"ok"),
+                (Key::Detach, b"\x1d"),
+                (Key::Esc, b"\x1b"),
+            ]
+        );
+        assert_eq!(keys("é\x1b[1;5C".as_bytes()), vec![(Key::Text, "é".as_bytes()), (Key::Text, &b"\x1b[1;5C"[..])], "Ctrl-Right stays typing");
+    }
+
+    #[test]
+    fn the_scrollback_view_stops_at_the_top_and_goes_live_past_the_bottom() {
+        assert_eq!(scroll_step(Key::PageUp, b"", 10, 100, 20), Step::Move(30));
+        assert_eq!(scroll_step(Key::PageUp, b"", 90, 100, 20), Step::Move(100), "the top stops it");
+        assert_eq!(scroll_step(Key::Home, b"", 3, 100, 20), Step::Move(100));
+        assert_eq!(scroll_step(Key::WheelDown, b"", 5, 100, 20), Step::Move(2));
+        assert_eq!(scroll_step(Key::WheelDown, b"", 3, 100, 20), Step::Live, "past the bottom is live");
+        assert_eq!(scroll_step(Key::Down, b"", 1, 100, 20), Step::Live);
+        assert_eq!(scroll_step(Key::Text, b"q", 9, 100, 20), Step::Live);
+        assert_eq!(scroll_step(Key::End, b"", 9, 100, 20), Step::Live);
+        assert_eq!(scroll_step(Key::Text, b"hello", 9, 100, 20), Step::Type, "typing goes back and reaches the pane");
+        assert_eq!(scroll_step(Key::Mouse, b"", 9, 100, 20), Step::Ignore);
+    }
+
+    #[test]
+    fn the_scrollback_shows_the_rows_above_the_bottom_with_its_place_in_the_status() {
+        let rows: Vec<String> = (1..=10).map(|n| format!("row {n}")).collect();
+        let s = Scroll { read: "m3".into(), rows: Some(rows), offset: 4 };
+        let out = screen("LIVE SCREEN", Some(&s), 4, "work-pc · OTmain");
+        assert!(out.contains("row 4\x1b[0m\r\nrow 5\x1b[0m\r\nrow 6\x1b[0m"), "three rows ending 4 above the bottom: {out:?}");
+        assert!(!out.contains("row 7") && !out.contains("LIVE SCREEN"), "{out:?}");
+        assert!(out.contains("scrollback, 4 of 7 rows up"), "{out:?}");
+        let loading = Scroll { read: "m3".into(), rows: None, offset: 4 };
+        assert!(screen("LIVE SCREEN", Some(&loading), 4, "w").contains("LIVE SCREEN"), "the live screen stays until the rows arrive");
     }
 }

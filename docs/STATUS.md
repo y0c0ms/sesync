@@ -3,6 +3,13 @@
 Snapshot, not truth. When this file disagrees with the code or the tests, the code and the
 tests win, and you fix this file. Update it at the end of every work session.
 
+## 2026-10-31: scrollback in `sesync machine attach`
+
+- **Why.** The operator attached to a work PC conversation from yocomsMain and could see only the rows on screen: attach draws the bridge's visible-screen repaints in the alternate screen, so nothing scrolled.
+- **What changed.** PageUp or a wheel notch reads the pane's last rows with `terminal.read` (new optional `lines`, capped at 1000, herdr's own limit measured live; the phone's read stays 200) and shows them as text above a status line giving the place (`scrollback, N of M rows up`). PageUp/PageDown, the arrows, the wheel and Home move; End, Esc, `q` or scrolling past the bottom return to the live screen, and typing returns and reaches the pane. Live frames keep arriving meanwhile and are drawn on return. Attach turns on SGR mouse reporting (1000 + 1006) for the wheel; other mouse reports are dropped, never sent to the pane.
+- **Tests.** `attach`: key splitting (PageUp/PageDown, wheel up/down, other mouse reports, arrows, Alt+key, Ctrl-], a lone Esc, UTF-8 text with Ctrl-Right kept as typing); the scroll steps (top stops, past the bottom is live, `q`/End live, typing goes live and is sent); the view's rows and status. `rpc`: `terminal.read` asks herdr for 200 by default, the rows asked, 1000 at most, 1 at least.
+- **Smoke.** The debug build in a herdr tab attached to the work PC's "PC Config" (its bridge still 6964c34, so 200 rows): PgUp showed older rows with `scrollback, 44 of 155 rows up`; two SGR wheel-up reports typed into the pane moved it to 50; Home to 155 of 155; PgDn to 111; `q` back to the live status; Ctrl-] detached. A physical wheel through herdr was not exercised.
+
 ## 2026-10-31: work PC report (agent-hub#22 comment 423): picker-started panes and a dial address per machine
 
 - **Why.** On the work PC, OTmain ran in herdr pane `w6:p3` started from omp's picker: argv `omp.exe --resume`, no session file, so the bridge listed the conversation as not open, though herdr's omp integration reported the session (`agent.list` `agent_session`, all backslashes; sesync's resume path mixes `/` and `\`). And the work PC reaches yocomsMain's bridge only through wireproxy (`ws://127.0.0.1:16768`), while the phone's grant names `ws://10.10.20.3:6768`.
