@@ -8,6 +8,7 @@
 //! socket is used only in production and in the sandboxed integration test. Pane and read
 //! parsing lives here too, as pure functions over the `result` object.
 
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,31 +49,149 @@ pub trait Herdr: Send + Sync {
         String::new()
     }
 
-    /// Pane agent-status changes for `pane_ids`. Canned answers have none, so the default refuses.
+    /// What this server's panes were read as, kept between listings (`ProcessMemo`). None when nothing is kept, as
+    /// for the canned answers of a test, so each listing reads herdr.
+    fn process_memo(&self) -> Option<&ProcessMemo> {
+        None
+    }
+
+    /// A stream of changes: each status change of a pane in `pane_ids`, and every change to the pane list
+    /// (`Change::Panes`). Canned answers have none, so the default refuses.
     fn status_events(&self, _pane_ids: &[String]) -> Result<Box<dyn StatusSource>, String> {
         Err("herdr status events are not available here".into())
     }
 }
 
-/// A stream of pane agent-status changes, read with a timeout.
+/// One change on a status stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// A listed pane's agent status, title or agent changed. The values are herdr's now.
+    Status { pane_id: String, status: String, agent: Option<String>, title: Option<String> },
+    /// A pane opened, closed or exited, or an agent was detected in or released from one: the pane list may differ.
+    Panes,
+}
+
+/// A stream of changes, read with a timeout.
 pub trait StatusSource: Send {
-    /// The next `(pane_id, agent_status)`, or None when `wait` passes first. An error ends the stream.
-    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String>;
+    /// The next change, or None when `wait` passes first. An error ends the stream.
+    fn next(&mut self, wait: Duration) -> Result<Option<Change>, String>;
 }
 
 /// herdr over its API socket.
 pub struct Socket {
     path: PathBuf,
+    memo: ProcessMemo,
 }
 
 impl Socket {
     pub fn new(path: impl Into<PathBuf>) -> Socket {
-        Socket { path: path.into() }
+        Socket { path: path.into(), memo: ProcessMemo::new(PROCESS_MAX_AGE) }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// How long a pane's processes, and the agent sessions and tab labels a listing reads, are reused while the pane
+/// list shows the same panes in the same state. A process change that shows in no listed field (a pane's title,
+/// agent, status, directory or tab) is seen within this long.
+pub const PROCESS_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// The reads of one herdr server's panes that a listing keeps for the next one: each pane's foreground processes,
+/// and the sessions its agents report and the labels of its tabs. The phone polls the pane list, and each listing
+/// used to read every pane's processes again: a call on its own connection each. A reading is reused only while the
+/// pane is listed as it was and the reading is younger than `max_age`.
+pub struct ProcessMemo {
+    max_age: Duration,
+    panes: Mutex<HashMap<String, Remembered>>,
+    /// The sessions the agents report, and the tab labels, each with the agent panes they were read for.
+    sessions: Mutex<Option<Shared>>,
+    labels: Mutex<Option<Shared>>,
+}
+
+/// The listed fields a pane's processes are read by: which pane it is, the agent in it and the directory its
+/// foreground runs in. A title or status change (a spinner's frame, a turn) does not change the processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessKey {
+    terminal_id: String,
+    tab_id: String,
+    agent: Option<String>,
+    foreground_cwd: Option<String>,
+}
+
+impl ProcessKey {
+    fn of(pane: &Pane) -> ProcessKey {
+        ProcessKey {
+            terminal_id: pane.terminal_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            agent: pane.agent.clone(),
+            foreground_cwd: pane.foreground_cwd.clone(),
+        }
+    }
+}
+
+struct Remembered {
+    key: ProcessKey,
+    argvs: Vec<Vec<String>>,
+    at: Instant,
+}
+
+struct Shared {
+    key: String,
+    at: Instant,
+    map: HashMap<String, String>,
+}
+
+impl ProcessMemo {
+    pub fn new(max_age: Duration) -> ProcessMemo {
+        ProcessMemo { max_age, panes: Mutex::new(HashMap::new()), sessions: Mutex::new(None), labels: Mutex::new(None) }
+    }
+
+    /// The argument lists of `pane`'s foreground processes: the kept reading when the pane's processes are listed as
+    /// they were (`ProcessKey`) and the reading is fresh, else what `read` reads (and keeps).
+    pub fn argvs(&self, pane: &Pane, read: impl FnOnce() -> Result<Vec<Vec<String>>, String>) -> Result<Vec<Vec<String>>, String> {
+        let key = ProcessKey::of(pane);
+        if let Some(kept) = self.panes.lock().get(&pane.pane_id) {
+            if kept.key == key && kept.at.elapsed() < self.max_age {
+                return Ok(kept.argvs.clone());
+            }
+        }
+        let argvs = read()?;
+        self.panes.lock().insert(pane.pane_id.clone(), Remembered { key, argvs: argvs.clone(), at: Instant::now() });
+        Ok(argvs)
+    }
+
+    /// The sessions the agents report (`agent_sessions`), kept while `key` (the agent panes as listed) is the same.
+    pub fn sessions(&self, key: &str, read: impl FnOnce() -> Result<HashMap<String, String>, String>) -> Result<HashMap<String, String>, String> {
+        shared(&self.sessions, self.max_age, key, read)
+    }
+
+    /// The tab labels (`tab_labels`), kept while `key` (the agent panes as listed) is the same.
+    pub fn labels(&self, key: &str, read: impl FnOnce() -> Result<HashMap<String, String>, String>) -> Result<HashMap<String, String>, String> {
+        shared(&self.labels, self.max_age, key, read)
+    }
+
+    /// Forget the panes a listing no longer has, so the memo holds only what is open.
+    pub fn retain(&self, pane_ids: &[String]) {
+        self.panes.lock().retain(|id, _| pane_ids.contains(id));
+    }
+}
+
+fn shared(
+    slot: &Mutex<Option<Shared>>,
+    max_age: Duration,
+    key: &str,
+    read: impl FnOnce() -> Result<HashMap<String, String>, String>,
+) -> Result<HashMap<String, String>, String> {
+    if let Some(kept) = slot.lock().as_ref() {
+        if kept.key == key && kept.at.elapsed() < max_age {
+            return Ok(kept.map.clone());
+        }
+    }
+    let map = read()?;
+    *slot.lock() = Some(Shared { key: key.to_string(), at: Instant::now(), map: map.clone() });
+    Ok(map)
 }
 
 /// One connection to herdr's API. On Unix it is the socket file. On Windows herdr (through the
@@ -197,6 +316,10 @@ impl Conn {
 }
 
 impl Herdr for Socket {
+    fn process_memo(&self) -> Option<&ProcessMemo> {
+        Some(&self.memo)
+    }
+
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let mut conn = Conn::open(&self.path)?;
         let request = json!({ "id": "sesync", "method": method, "params": params });
@@ -215,25 +338,30 @@ impl Herdr for Socket {
 }
 
 impl StatusSource for StatusEvents {
-    fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+    fn next(&mut self, wait: Duration) -> Result<Option<Change>, String> {
         StatusEvents::next(self, wait)
     }
 }
 
-/// A subscription to `pane.agent_status_changed` for a set of panes. herdr pushes one event line per
-/// change, in order, so no status between two reads is lost. Sampling cannot promise that: an agent
-/// turn can start and finish between two samples.
+/// The pane lifecycle events a status stream always carries: a pane list change for any pane in the workspace.
+const PANE_LIST_EVENTS: [&str; 4] = ["pane.created", "pane.closed", "pane.exited", "pane.agent_detected"];
+
+/// One subscription to herdr's events: the pane list changes (`PANE_LIST_EVENTS`) and the agent status of each
+/// pane in a set. herdr pushes one event line per change, in order, so no status between two reads is lost.
+/// Sampling cannot promise that: an agent turn can start and finish between two samples. The connection is kept
+/// open; a change of pane set needs a new subscription.
 pub struct StatusEvents {
     conn: Conn,
 }
 
 impl StatusEvents {
-    /// Subscribe to the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
+    /// Subscribe to the pane list changes and the status of each pane in `pane_ids` (herdr pane ids such as `w1:p1`).
     pub fn open(path: &Path, pane_ids: &[String]) -> Result<StatusEvents, String> {
         let mut conn = Conn::open(path)?;
-        let subscriptions: Vec<Value> = pane_ids
+        let subscriptions: Vec<Value> = PANE_LIST_EVENTS
             .iter()
-            .map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id }))
+            .map(|kind| json!({ "type": kind }))
+            .chain(pane_ids.iter().map(|id| json!({ "type": "pane.agent_status_changed", "pane_id": id })))
             .collect();
         let request = json!({ "id": "sesync-events", "method": "events.subscribe", "params": { "subscriptions": subscriptions } });
         conn.send(&request).map_err(|e| format!("herdr did not take the event subscription ({e})"))?;
@@ -246,21 +374,27 @@ impl StatusEvents {
         Ok(events)
     }
 
-    /// The next pane status change as `(pane_id, agent_status)`, or None when `wait` passes without one.
-    /// Other events are skipped. An error means the connection ended and the subscription must be reopened.
-    pub fn next(&mut self, wait: Duration) -> Result<Option<(String, String)>, String> {
+    /// The next change, or None when `wait` passes without one. Other events are skipped. An error means the
+    /// connection ended and the subscription must be reopened.
+    pub fn next(&mut self, wait: Duration) -> Result<Option<Change>, String> {
         loop {
             let Some(line) = self.line(wait)? else { return Ok(None) };
             let event: Value = match serde_json::from_str(line.trim()) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if event["event"] != "pane.agent_status_changed" {
+            let kind = event["event"].as_str().unwrap_or("");
+            if PANE_LIST_EVENTS.contains(&kind) {
+                return Ok(Some(Change::Panes));
+            }
+            if kind != "pane.agent_status_changed" {
                 continue;
             }
             let data = &event["data"];
             if let (Some(pane), Some(status)) = (data["pane_id"].as_str(), data["agent_status"].as_str()) {
-                return Ok(Some((pane.to_string(), status.to_string())));
+                let agent = data["agent"].as_str().filter(|a| !a.is_empty()).map(str::to_string);
+                let title = data["title"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string);
+                return Ok(Some(Change::Status { pane_id: pane.to_string(), status: status.to_string(), agent, title }));
             }
         }
     }
@@ -901,17 +1035,19 @@ mod tests {
             "{\"id\":\"sesync-events\",\"result\":{\"type\":\"subscription_started\"}}\n",
             vec![
                 "{\"event\":\"pane.output_matched\",\"data\":{}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"working\"}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"idle\"",
-                "}}\n",
+                "}}\n{\"event\":\"pane.closed\",\"data\":{\"pane_id\":\"w1:p9\",\"workspace_id\":\"w1\"}}\n",
             ],
         );
         let mut events = StatusEvents::open(&path, &["w1:p1".to_string()]).unwrap();
         let wait = Duration::from_secs(2);
-        assert_eq!(events.next(wait).unwrap(), Some(("w1:p1".to_string(), "working".to_string())));
+        let status = |pane: &str, status: &str| Change::Status { pane_id: pane.into(), status: status.into(), agent: None, title: None };
+        assert_eq!(events.next(wait).unwrap(), Some(status("w1:p1", "working")));
         assert_eq!(
             events.next(wait).unwrap(),
-            Some(("w1:p1".to_string(), "idle".to_string())),
+            Some(status("w1:p1", "idle")),
             "a line split across writes is joined"
         );
+        assert_eq!(events.next(wait).unwrap(), Some(Change::Panes), "a closed pane changes the pane list");
         assert_eq!(events.next(Duration::from_millis(100)).unwrap(), None, "no change within the wait");
         drop(release);
         assert!(events.next(wait).is_err(), "a closed stream is an error the watcher reopens on");
@@ -930,5 +1066,59 @@ mod tests {
             Err(e) => assert!(e.contains("no such pane"), "{e}"),
         }
         drop(release);
+    }
+
+    fn listed(id: &str, title: &str) -> Pane {
+        Pane {
+            pane_id: id.into(),
+            terminal_id: format!("term_{id}"),
+            tab_id: "t1".into(),
+            focused: false,
+            agent_status: "idle".into(),
+            agent: Some("omp".into()),
+            title: Some(title.into()),
+            foreground_cwd: None,
+            rows: None,
+        }
+    }
+
+    #[test]
+    fn a_kept_reading_serves_a_pane_whose_processes_are_listed_as_they_were() {
+        let memo = ProcessMemo::new(Duration::from_secs(60));
+        let first = vec![vec!["omp".to_string(), "--resume".to_string()]];
+        let pane = listed("w1:p1", "π > one");
+        let mut reads = 0;
+        let got = memo.argvs(&pane, || {
+            reads += 1;
+            Ok(first.clone())
+        });
+        assert_eq!(got.unwrap(), first);
+        let again = memo.argvs(&pane, || panic!("a pane listed as it was is not read again"));
+        assert_eq!(again.unwrap(), first);
+        let retitled = listed("w1:p1", "π ! one");
+        let same_processes = memo.argvs(&retitled, || panic!("a title change does not change the processes"));
+        assert_eq!(same_processes.unwrap(), first);
+        let mut moved = listed("w1:p1", "π ! one");
+        moved.agent = Some("claude".into());
+        let changed = memo.argvs(&moved, || Ok(vec![vec!["claude".to_string(), "--resume".to_string(), "x".to_string()]]));
+        assert_eq!(changed.unwrap()[0].len(), 3, "a pane whose agent changed is read again");
+        assert_eq!(reads, 1);
+
+        let stale = ProcessMemo::new(Duration::ZERO);
+        stale.argvs(&pane, || Ok(first.clone())).unwrap();
+        let mut read_again = false;
+        stale.argvs(&pane, || {
+            read_again = true;
+            Ok(first.clone())
+        }).unwrap();
+        assert!(read_again, "a reading older than the maximum age is read again");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_kept() {
+        let memo = ProcessMemo::new(Duration::from_secs(60));
+        let pane = listed("w1:p2", "π > two");
+        assert!(memo.argvs(&pane, || Err("herdr refused".into())).is_err());
+        assert_eq!(memo.argvs(&pane, || Ok(Vec::new())).unwrap(), Vec::<Vec<String>>::new());
     }
 }

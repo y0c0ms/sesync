@@ -322,7 +322,7 @@ async fn the_real_catalog_groups_an_omp_session_under_its_project_directory() {
         "{\"type\":\"session\",\"cwd\":\"/work/proj-a\"}\n",
     )
     .unwrap();
-    let catalog = Arc::new(StateCatalog { roots, state_file: sb.join("state.json") });
+    let catalog = Arc::new(StateCatalog::new(roots, sb.join("state.json")));
 
     let b = start("state-catalog-bridge", catalog, LOOPBACK).await;
     let (_, token) = pair(&b.dir, "phone");
@@ -1034,7 +1034,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
 
     let dir = herdr.home.join("config/bridge");
     let resume = start::Resume::new(roots.locations.clone(), roots.home.clone(), &herdr.socket, None);
-    let catalog = Arc::new(StateCatalog { roots, state_file: herdr.home.join("state.json") });
+    let catalog = Arc::new(StateCatalog::new(roots, herdr.home.join("state.json")));
     let ctx = Ctx {
         catalog,
         herdr: Arc::new(herdr::Socket::new(herdr.socket.clone())) as Arc<dyn Herdr>,
@@ -1540,7 +1540,7 @@ fn fake_herdr(socket: &Path, answer: fn(&str, &Value) -> Value) -> Calls {
 async fn a_claude_and_an_opencode_session_open_on_the_phone_with_their_transcripts() {
     let fx = chat_fixture("chats-open");
     let _herdr_calls = fake_herdr(&fx.sb.join("herdr.sock"), chat_panes);
-    let catalog = StateCatalog { roots: fx.roots, state_file: fx.sb.join("state.json") };
+    let catalog = StateCatalog::new(fx.roots, fx.sb.join("state.json"));
     let listed = catalog.conversations().unwrap();
     let claude = listed.iter().find(|c| c.harness == "claude").expect("the Claude session is listed").worktree_id();
     let opencode = listed.iter().find(|c| c.harness == "opencode").expect("the OpenCode session is listed").worktree_id();
@@ -1595,7 +1595,7 @@ async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane
     let fx = chat_fixture("chats-live");
     let lock = granting_sesync_lock(&fx.sb);
     let herdr_calls = fake_herdr(&fx.sb.join("herdr.sock"), chat_panes);
-    let catalog = StateCatalog { roots: fx.roots, state_file: fx.sb.join("state.json") };
+    let catalog = StateCatalog::new(fx.roots, fx.sb.join("state.json"));
     let herdr: Arc<dyn Herdr> = Arc::new(herdr::Socket::new(fx.sb.join("herdr.sock")));
     let bridge_dir = fx.sb.join("bridge");
     let ctx = Ctx {

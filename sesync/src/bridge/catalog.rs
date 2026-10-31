@@ -5,8 +5,9 @@
 //! saves the state.
 
 use crate::harness::{self, Kind};
-use crate::manage::{self, Roots};
+use crate::manage::{self, Roots, StoreRows, TitleCache};
 use crate::state::State;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -85,7 +86,8 @@ pub fn conversation_id(harness: &str, key: &str) -> String {
 }
 
 fn hex16(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    Sha256::digest(bytes).iter().take(8).flat_map(|b| [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]).map(char::from).collect()
 }
 
 /// Anything that can list conversations. The server holds one behind an `Arc`, so a test can serve a
@@ -112,22 +114,43 @@ pub trait Catalog: Send + Sync {
     }
 }
 
-/// The real catalog: the saved sesync state plus the harness stores under `roots`.
+/// The real catalog: the saved sesync state plus the harness stores under `roots`. What a build reads that does not
+/// change between builds is kept: the titles, by file size and change time (`manage::TitleCache`), and each store's
+/// rows, while its files do not change (`manage::StoreRows`). So a build re-reads only what moved.
 pub struct StateCatalog {
     pub roots: Roots,
     pub state_file: PathBuf,
+    titles: Mutex<TitleCache>,
+    stores: Mutex<StoreRows>,
+    /// Each file conversation's project directory, read from its head, with the file's size and change time then.
+    dirs: Mutex<HashMap<String, (u64, u128, String)>>,
+}
+
+impl StateCatalog {
+    pub fn new(roots: Roots, state_file: PathBuf) -> StateCatalog {
+        StateCatalog {
+            roots,
+            state_file,
+            titles: Mutex::new(TitleCache::default()),
+            stores: Mutex::new(StoreRows::default()),
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl Catalog for StateCatalog {
     fn conversations(&self) -> Result<Vec<Conversation>, String> {
         let state = State::load(&self.state_file)
             .map_err(|e| format!("cannot read the sesync state: {e}"))?;
-        let groups = manage::list_groups(&self.roots, &state);
-        let store_dirs = self.store_directories();
+        let groups = {
+            let (mut titles, mut stores) = (self.titles.lock(), self.stores.lock());
+            manage::list_groups_kept(&self.roots, &state, &mut titles, &mut stores)
+        };
+        let store_dirs = self.store_directories(&mut self.stores.lock());
         let mut out = Vec::new();
         for g in groups.into_iter().filter(|g| !g.orphan) {
             let dir = match harness::get(&g.fmt) {
-                Some(h) if h.kind() == Kind::Files => h.cwd(Path::new(&g.key)).unwrap_or_default(),
+                Some(h) if h.kind() == Kind::Files => self.dir_of(h, &g.key),
                 Some(_) => store_dirs.get(&(g.fmt.clone(), g.key.clone())).cloned().unwrap_or_default(),
                 None => String::new(),
             };
@@ -143,6 +166,8 @@ impl Catalog for StateCatalog {
             out.push(Conversation { harness: g.fmt, key: g.key, title: g.title, dir, updated: g.updated, idents });
         }
         out.sort_by(|a, b| b.updated.total_cmp(&a.updated).then_with(|| a.key.cmp(&b.key)));
+        let listed: std::collections::HashSet<&str> = out.iter().map(|c| c.key.as_str()).collect();
+        self.dirs.lock().retain(|key, _| listed.contains(key.as_str()));
         Ok(out)
     }
 
@@ -163,11 +188,30 @@ impl Catalog for StateCatalog {
 }
 
 impl StateCatalog {
+    /// The project directory a file conversation records. Read from the file's head only when the file changed since
+    /// it was last read: its size or change time moved.
+    fn dir_of(&self, h: &dyn harness::Harness, key: &str) -> String {
+        let stamp = harness::stat(Path::new(key));
+        let mut dirs = self.dirs.lock();
+        if let Some((len, ns)) = stamp {
+            if let Some((kept_len, kept_ns, dir)) = dirs.get(key) {
+                if (*kept_len, *kept_ns) == (len, ns) {
+                    return dir.clone();
+                }
+            }
+        }
+        let dir = h.cwd(Path::new(key)).unwrap_or_default();
+        if let Some((len, ns)) = stamp {
+            dirs.insert(key.to_string(), (len, ns, dir.clone()));
+        }
+        dir
+    }
+
     /// Each store harness's session id to its project directory, from one read per store.
-    fn store_directories(&self) -> HashMap<(String, String), String> {
+    fn store_directories(&self, stores: &mut StoreRows) -> HashMap<(String, String), String> {
         let mut dirs = HashMap::new();
         for h in harness::ALL.iter().filter(|h| h.kind() == Kind::Store) {
-            for row in h.rows(self.roots.locations.of(h.id())) {
+            for row in stores.rows(*h, self.roots.locations.of(h.id())) {
                 dirs.insert((h.id().to_string(), row.id), row.directory);
             }
         }
@@ -250,6 +294,45 @@ mod tests {
         assert!(a.worktree_id().starts_with(&format!("{}::conv-", a.repo_id())));
         assert_eq!(a.repo_id(), repo_id("/work/a"), "the repo id matches what repo.list reports");
         assert!(!a.worktree_id().contains('/'), "no path characters in the id");
+    }
+
+    #[test]
+    fn a_store_is_read_again_once_its_files_change() {
+        let dir = std::env::temp_dir().join(format!("sesync-store-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let con = rusqlite::Connection::open(&db).unwrap();
+        con.execute_batch(
+            "pragma journal_mode=wal;
+             create table session (id text primary key, parent_id text, directory text not null, title text not null,
+                 time_created integer not null, time_updated integer not null, time_archived integer);
+             insert into session values ('ses_a', null, '/work/a', 'first', 1, 1000, null);",
+        )
+        .unwrap();
+        let loc = harness::Location { root: db.clone(), cli: None };
+        let opencode = harness::get("opencode").unwrap();
+        let mut stores = StoreRows::default();
+        assert_eq!(stores.rows(opencode, &loc).len(), 1);
+        con.execute("insert into session values ('ses_b', null, '/work/b', 'second', 2, 2000, null)", []).unwrap();
+        assert_eq!(stores.rows(opencode, &loc).len(), 2, "a write to the store shows at the next listing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_is_read_again_once_its_file_changes() {
+        let dir = std::env::temp_dir().join(format!("sesync-catalog-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"cwd\":\"/work/a\"}\n").unwrap();
+        let catalog = StateCatalog::new(manage::Roots::under(&dir, dir.join("sesync-conv")), dir.join("state.json"));
+        let omp = harness::get("omp").unwrap();
+        let key = file.display().to_string();
+        assert_eq!(catalog.dir_of(omp, &key), "/work/a");
+        std::fs::write(&file, "{\"type\":\"session\",\"cwd\":\"/work/moved\"}\n").unwrap();
+        assert_eq!(catalog.dir_of(omp, &key), "/work/moved", "a rewritten file is read again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

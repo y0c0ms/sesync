@@ -12,6 +12,7 @@ use super::catalog::Conversation;
 use super::ntfy;
 use super::rpc::{Ctx, Failure};
 use super::stream::{self, Conn, Sink, CATALOG_REFRESH};
+use super::herdr::{self, Change, StatusSource};
 use super::terminals::{self, Running};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -345,86 +346,198 @@ fn missed_reply(hub: &Hub, params: &Value) -> Result<Value, Failure> {
     Ok(reply)
 }
 
-/// Start the watcher: one background thread. It follows herdr's agent-status events and re-reads the pane
-/// list every `every` to follow panes that open or close.
+/// How long the pane list may go unread while nothing changes: the safety net for a change herdr reports on no
+/// event. Panes that open, close or change status are read as herdr reports them.
+const SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+
+/// Start the watcher: one background thread.
 pub fn spawn_watcher(ctx: Ctx, every: Duration) {
     thread::spawn(move || watch(&ctx, every));
 }
 
-/// The watcher loop. Each pass re-reads the catalog when due, then the panes, and observes them: that
-/// records the baseline and raises any transition since the last pass. It then subscribes to status events
-/// for those panes and applies each change as it arrives, until `every` passes or the stream ends. A change
-/// is applied to the pane it names, so every status herdr reports is seen, however short the turn.
-fn watch(ctx: &Ctx, every: Duration) {
-    let mut memory = Watch::default();
-    let mut conversations: Vec<Conversation> = Vec::new();
-    let mut refreshed: Option<Instant> = None;
-    let mut catalog_error: Option<String> = None;
-    let mut herdr_error: Option<String> = None;
-    loop {
-        let due = match refreshed {
-            Some(at) => at.elapsed() >= CATALOG_REFRESH,
-            None => true,
-        };
-        if due {
-            refreshed = Some(Instant::now());
-            match ctx.catalog.conversations() {
-                Ok(list) => {
-                    conversations = list;
-                    catalog_error = None;
-                }
-                Err(e) => {
-                    if catalog_error.as_deref() != Some(e.as_str()) {
-                        eprintln!("sesync bridge: notifications: cannot read conversations: {e}");
-                    }
-                    catalog_error = Some(e);
-                }
-            }
+/// What the watcher keeps between changes: the conversations (read while an agent runs), the panes with their
+/// processes (read when herdr reports a change to them), the status subscription, and the transition memory.
+#[derive(Default)]
+struct Watcher {
+    memory: Watch,
+    conversations: Vec<Conversation>,
+    catalog_at: Option<Instant>,
+    catalog_error: Option<String>,
+    panes: Vec<Running>,
+    labels: HashMap<String, String>,
+    snapshot_at: Option<Instant>,
+    herdr_error: Option<String>,
+    /// The pane ids the subscription names, and the subscription itself (None when herdr has none to give).
+    subscribed: Vec<String>,
+    events: Option<Box<dyn StatusSource>>,
+    /// A change asked for the pane list to be read again.
+    pending: bool,
+}
+
+impl Watcher {
+    /// Whether some pane has an agent in it. Only an agent's pane changes status, so only then are the
+    /// conversations needed to tell which conversation a change belongs to.
+    fn agents_run(&self) -> bool {
+        self.panes.iter().any(|r| r.pane.agent.is_some() || r.pane.agent_status != "unknown")
+    }
+
+    /// Whether the conversations are due: every `CATALOG_REFRESH` while an agent runs, and before a change is
+    /// observed, so a conversation that appeared since the last read is known when its pane changes.
+    fn catalog_due(&self) -> bool {
+        (self.pending || self.agents_run()) && self.catalog_at.is_none_or(|at| at.elapsed() >= CATALOG_REFRESH)
+    }
+
+    fn snapshot_due(&self) -> bool {
+        self.snapshot_at.is_none_or(|at| at.elapsed() >= SNAPSHOT_EVERY)
+    }
+
+    /// The time to wait for a change before the next timed read is due.
+    fn until_next_read(&self) -> Duration {
+        let snapshot = self.snapshot_at.map_or(Duration::ZERO, |at| (at + SNAPSHOT_EVERY).saturating_duration_since(Instant::now()));
+        if !self.agents_run() {
+            return snapshot;
         }
-        let mut panes = match terminals::running_panes(ctx.herdr.as_ref(), &conversations) {
-            Ok(panes) => {
-                herdr_error = None;
-                panes
+        let catalog = self.catalog_at.map_or(Duration::ZERO, |at| (at + CATALOG_REFRESH).saturating_duration_since(Instant::now()));
+        snapshot.min(catalog)
+    }
+
+    /// Re-read the conversations. True when what the pane rules match changed, so the panes must be read again.
+    fn read_catalog(&mut self, ctx: &Ctx) -> bool {
+        self.catalog_at = Some(Instant::now());
+        match ctx.catalog.conversations() {
+            Ok(list) => {
+                self.catalog_error = None;
+                let changed = !same_matching(&self.conversations, &list);
+                self.conversations = list;
+                changed
             }
             Err(e) => {
-                if herdr_error.as_deref() != Some(e.as_str()) {
+                if self.catalog_error.as_deref() != Some(e.as_str()) {
+                    eprintln!("sesync bridge: notifications: cannot read conversations: {e}");
+                }
+                self.catalog_error = Some(e);
+                false
+            }
+        }
+    }
+
+    /// Read the pane list and the processes of its panes. The status subscription names the panes listed, so a
+    /// pane that opened is subscribed to; the list is read once more after subscribing, so a pane that opened
+    /// meanwhile is not missed.
+    fn read_panes(&mut self, ctx: &Ctx) -> Result<(), String> {
+        let h = ctx.herdr.as_ref();
+        let mut listed = herdr::list_panes(h)?;
+        for _ in 0..3 {
+            let ids = watched_ids(&listed);
+            if self.events.is_some() && self.subscribed == ids {
+                break;
+            }
+            self.events = None;
+            self.subscribed = ids.clone();
+            // Without an event stream (a canned or unreachable herdr) the list is read on each pass.
+            self.events = ctx.herdr.status_events(&ids).ok();
+            if self.events.is_none() {
+                break;
+            }
+            let again = herdr::list_panes(h)?;
+            if watched_ids(&again) == ids {
+                break;
+            }
+            listed = again;
+        }
+        let (panes, labels) = terminals::running_listed(h, listed, &self.conversations)?;
+        self.panes = panes;
+        self.labels = labels;
+        self.snapshot_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Apply one status change to its pane. True when the pane list must be read again: a pane not listed, or a
+    /// status that moved (a turn started or ended, and its session may have changed). A title or agent change only
+    /// re-places the pane, from the rules over what is already read.
+    fn apply(&mut self, pane_id: &str, status: &str, agent: Option<String>, title: Option<String>) -> bool {
+        let Some(running) = self.panes.iter_mut().find(|r| r.pane.pane_id == pane_id) else { return true };
+        let moved = running.pane.agent_status != status;
+        running.pane.agent_status = status.to_string();
+        running.pane.agent = agent;
+        running.pane.title = title;
+        if moved {
+            return true;
+        }
+        terminals::reassign_fallbacks(&mut self.panes, &self.conversations, &self.labels);
+        false
+    }
+}
+
+/// The panes whose status is subscribed to, sorted: those with an agent or a status herdr reports. A pane with
+/// neither never changes status, and herdr polls each subscribed pane's status on its own, so a shell pane is not
+/// watched. An agent detected in one later is a pane list change, which subscribes to it.
+fn watched_ids(panes: &[herdr::Pane]) -> Vec<String> {
+    let mut ids: Vec<String> = panes
+        .iter()
+        .filter(|p| p.agent.is_some() || p.agent_status != "unknown")
+        .map(|p| p.pane_id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Whether two conversation lists hold the same conversations as the pane rules match them: the same titles,
+/// directories and session ids, in any order. A change of time alone does not count.
+fn same_matching(a: &[Conversation], b: &[Conversation]) -> bool {
+    let keys = |list: &[Conversation]| {
+        let mut keys: Vec<(String, String, String, String, Vec<String>)> = list
+            .iter()
+            .map(|c| (c.harness.clone(), c.key.clone(), c.title.clone(), c.dir.clone(), c.idents.clone()))
+            .collect();
+        keys.sort();
+        keys
+    };
+    keys(a) == keys(b)
+}
+
+/// The watcher loop. The pane list is read when herdr reports that it changed, when a pane's status moved, when
+/// the safety net is due, and when the stream is not there. The conversations are read every `CATALOG_REFRESH`
+/// while an agent runs. In between, the watcher waits on herdr's events: a title or agent change re-places its pane,
+/// and every status herdr reports is seen, however short the turn. Each observation records the baseline and raises
+/// the transitions since the last one. Without an event stream the pane list is read every `every`.
+fn watch(ctx: &Ctx, every: Duration) {
+    let mut w = Watcher { pending: true, ..Watcher::default() };
+    loop {
+        if w.catalog_due() && w.read_catalog(ctx) {
+            w.pending = true;
+        }
+        if w.pending || w.snapshot_due() || w.events.is_none() {
+            if let Err(e) = w.read_panes(ctx) {
+                if w.herdr_error.as_deref() != Some(e.as_str()) {
                     eprintln!("sesync bridge: notifications: herdr status unavailable: {e}");
                 }
-                herdr_error = Some(e);
+                w.herdr_error = Some(e);
                 thread::sleep(every);
                 continue;
             }
-        };
-        emit_raised(ctx, memory.observe(&panes, &conversations));
-        let ids: Vec<String> = panes.iter().map(|r| r.pane.pane_id.clone()).collect();
-        if ids.is_empty() {
-            thread::sleep(every);
-            continue;
+            w.herdr_error = None;
+            w.pending = false;
+            emit_raised(ctx, w.memory.observe(&w.panes, &w.conversations));
         }
-        // Without an event stream (a canned or unreachable herdr) the pane list is read on each pass only.
-        let Ok(mut events) = ctx.herdr.status_events(&ids) else {
+        let wait = w.until_next_read();
+        let Some(events) = w.events.as_mut() else {
             thread::sleep(every);
             continue;
         };
-        let until = Instant::now() + every;
-        loop {
-            let wait = until.saturating_duration_since(Instant::now());
-            if wait.is_zero() {
-                break;
+        match events.next(wait) {
+            Ok(Some(Change::Status { pane_id, status, agent, title })) => {
+                if w.apply(&pane_id, &status, agent, title) {
+                    w.pending = true;
+                }
             }
-            match events.next(wait) {
-                Ok(Some((pane_id, status))) => {
-                    if apply_status(&mut panes, &pane_id, &status) {
-                        emit_raised(ctx, memory.observe(&panes, &conversations));
-                    }
-                }
-                // A pane that opened after this list is picked up when the list is next read.
-                Ok(None) => break,
-                // The stream ended: pause a pass, then read the panes and subscribe again. A dead stream is never spun on.
-                Err(_) => {
-                    thread::sleep(every);
-                    break;
-                }
+            Ok(Some(Change::Panes)) => w.pending = true,
+            Ok(None) => {}
+            // The stream ended: pause a pass, then read the panes and subscribe again. A dead stream is never spun on.
+            Err(_) => {
+                w.events = None;
+                w.pending = true;
+                thread::sleep(every);
             }
         }
     }
@@ -433,17 +546,6 @@ fn watch(ctx: &Ctx, every: Duration) {
 fn emit_raised(ctx: &Ctx, raised: Vec<Raised<'_>>) {
     for r in raised {
         ctx.notify.emit(r.kind, r.conversation, &r.terminal_id, terminals::now_ms());
-    }
-}
-
-/// Apply one herdr status change to the pane it names. False when no listed pane has that id.
-fn apply_status(panes: &mut [Running], pane_id: &str, status: &str) -> bool {
-    match panes.iter_mut().find(|r| r.pane.pane_id == pane_id) {
-        Some(running) => {
-            running.pane.agent_status = status.to_string();
-            true
-        }
-        None => false,
     }
 }
 
@@ -545,17 +647,29 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_that_only_reorders_or_moves_in_time_is_the_same_for_the_pane_rules() {
+        let a = [conversation("a", "s1"), conversation("b", "s2")];
+        let mut moved = a.clone();
+        moved.reverse();
+        moved[0].updated = 99.0;
+        assert!(same_matching(&a, &moved), "a turn's new time reorders the list without changing what panes match");
+        let mut renamed = a.clone();
+        renamed[0].title = "renamed".into();
+        assert!(!same_matching(&a, &renamed), "a new title is a change the panes are placed by again");
+    }
+
+    #[test]
     fn a_status_event_moves_its_pane_and_raises_the_transition() {
         let convs = [conversation("t", "s1")];
-        let mut memory = Watch::default();
-        let mut panes = vec![running_conversation("term_a", "working", "s1"), pane("term_b", "working")];
-        assert!(memory.observe(&panes, &convs).is_empty());
-        assert!(apply_status(&mut panes, "p-term_a", "idle"));
-        let raised = memory.observe(&panes, &convs);
+        let mut w = Watcher::default();
+        w.panes = vec![running_conversation("term_a", "working", "s1"), pane("term_b", "working")];
+        assert!(w.memory.observe(&w.panes, &convs).is_empty());
+        assert!(w.apply("p-term_a", "idle", None, None), "a status that moved asks for the panes to be read");
+        let raised = w.memory.observe(&w.panes, &convs);
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].kind, FINISHED);
         assert_eq!(raised[0].terminal_id, "term_a");
-        assert!(!apply_status(&mut panes, "p-gone", "idle"), "an id no listed pane has is ignored");
+        assert!(w.apply("p-gone", "idle", None, None), "a pane no listing has asks for the panes to be read");
     }
 
     fn hub_with_three() -> Hub {

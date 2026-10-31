@@ -200,6 +200,28 @@ impl TitleCache {
     }
 }
 
+/// Each store harness's rows as the last listing read them, kept while the store's `Harness::rows_stamp` holds. A
+/// store that has not changed is not opened again: opening a WAL database writes its shared-memory index. A caller
+/// that lists often keeps one; a caller that lists once takes the default and reads every store.
+#[derive(Default)]
+pub struct StoreRows {
+    kept: HashMap<&'static str, (String, Vec<harness::Row>)>,
+}
+
+impl StoreRows {
+    pub fn rows(&mut self, h: &dyn harness::Harness, loc: &Location) -> Vec<harness::Row> {
+        let Some(stamp) = h.rows_stamp(loc) else { return h.rows(loc) };
+        if let Some((kept, rows)) = self.kept.get(h.id()) {
+            if *kept == stamp {
+                return rows.clone();
+            }
+        }
+        let rows = h.rows(loc);
+        self.kept.insert(h.id(), (stamp, rows.clone()));
+        rows
+    }
+}
+
 /// Every source on disk, with the mirrors recorded for it in state. Mirror files
 /// are never listed as sources. A source only in state (no file on disk) is kept
 /// as an orphan so it can still be cleaned up.
@@ -210,7 +232,12 @@ pub fn list_groups(roots: &Roots, state: &State) -> Vec<Group> {
 /// The same list, reusing titles already read for unchanged files. Callers that list once can
 /// use [`list_groups`]. Reads the title of every changed file before it returns.
 pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) -> Vec<Group> {
-    list_groups_with(roots, state, cache, None)
+    list_groups_with(roots, state, cache, None, &mut StoreRows::default())
+}
+
+/// The same list, reusing the titles in `cache` and the store rows in `stores` for stores that have not changed.
+pub fn list_groups_kept(roots: &Roots, state: &State, cache: &mut TitleCache, stores: &mut StoreRows) -> Vec<Group> {
+    list_groups_with(roots, state, cache, None, stores)
 }
 
 /// The same list without opening any conversation: a title comes from the cache when the file is
@@ -218,7 +245,7 @@ pub fn list_groups_cached(roots: &Roots, state: &State, cache: &mut TitleCache) 
 /// conversations whose title still has to be read come back as (key, harness), for a worker.
 pub fn list_groups_deferred(roots: &Roots, state: &State, cache: &mut TitleCache) -> (Vec<Group>, Vec<(String, String)>) {
     let mut wanted = Vec::new();
-    let groups = list_groups_with(roots, state, cache, Some(&mut wanted));
+    let groups = list_groups_with(roots, state, cache, Some(&mut wanted), &mut StoreRows::default());
     (groups, wanted)
 }
 
@@ -227,6 +254,7 @@ fn list_groups_with(
     state: &State,
     cache: &mut TitleCache,
     mut wanted: Option<&mut Vec<(String, String)>>,
+    stores: &mut StoreRows,
 ) -> Vec<Group> {
     let mut by_key: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
 
@@ -266,7 +294,7 @@ fn list_groups_with(
     // listed nothing was not read (absent or locked), so none of its sessions is called missing.
     let mut in_store: HashMap<&str, std::collections::HashSet<String>> = HashMap::new();
     for h in harness::ALL.iter().filter(|h| h.kind() == Kind::Store) {
-        in_store.insert(h.id(), h.rows(roots.locations.of(h.id())).into_iter().map(|r| r.id).collect());
+        in_store.insert(h.id(), stores.rows(*h, roots.locations.of(h.id())).into_iter().map(|r| r.id).collect());
     }
 
     // Sources recorded in state, with their mirrors. Keep orphans too.
