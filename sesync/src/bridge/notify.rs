@@ -640,6 +640,18 @@ mod tests {
     }
 
     #[test]
+    fn a_catalog_that_only_reorders_or_moves_in_time_is_the_same_for_the_pane_rules() {
+        let a = [conversation("a", "s1"), conversation("b", "s2")];
+        let mut moved = a.clone();
+        moved.reverse();
+        moved[0].updated = 99.0;
+        assert!(same_matching(&a, &moved), "a turn's new time reorders the list without changing what panes match");
+        let mut renamed = a.clone();
+        renamed[0].title = "renamed".into();
+        assert!(!same_matching(&a, &renamed), "a new title is a change the panes are placed by again");
+    }
+
+    #[test]
     fn a_status_event_moves_its_pane_and_raises_the_transition() {
         let convs = [conversation("t", "s1")];
         let mut w = Watcher::default();
