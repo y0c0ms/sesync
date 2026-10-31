@@ -428,7 +428,7 @@ impl Watcher {
         let h = ctx.herdr.as_ref();
         let mut listed = herdr::list_panes(h)?;
         for _ in 0..3 {
-            let ids = pane_ids(&listed);
+            let ids = watched_ids(&listed);
             if self.events.is_some() && self.subscribed == ids {
                 break;
             }
@@ -440,7 +440,7 @@ impl Watcher {
                 break;
             }
             let again = herdr::list_panes(h)?;
-            if pane_ids(&again) == ids {
+            if watched_ids(&again) == ids {
                 break;
             }
             listed = again;
@@ -469,8 +469,15 @@ impl Watcher {
     }
 }
 
-fn pane_ids(panes: &[herdr::Pane]) -> Vec<String> {
-    let mut ids: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+/// The panes whose status is subscribed to, sorted: those with an agent or a status herdr reports. A pane with
+/// neither never changes status, and herdr polls each subscribed pane's status on its own, so a shell pane is not
+/// watched. An agent detected in one later is a pane list change, which subscribes to it.
+fn watched_ids(panes: &[herdr::Pane]) -> Vec<String> {
+    let mut ids: Vec<String> = panes
+        .iter()
+        .filter(|p| p.agent.is_some() || p.agent_status != "unknown")
+        .map(|p| p.pane_id.clone())
+        .collect();
     ids.sort();
     ids
 }
