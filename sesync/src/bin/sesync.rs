@@ -3,7 +3,7 @@
 //! Continuous polling is the same pass repeated on an interval (not yet wired).
 
 use sesync::harness::{self, Harness, Kind, Locations, Row, Tools};
-use sesync::mirror::{copy_hash, copy_mtime, copy_stamp};
+use sesync::mirror::{copy_mtime, copy_stat, CopyHashes};
 use sesync::pass::{format_status, PassSource};
 use sesync::scan::{should_sync, ScanInput, MIN_BYTES};
 use sesync::state::{Mirror, Source, State};
@@ -111,7 +111,7 @@ fn release_records_logged(locations: &Locations, state: &mut State) {
 }
 
 /// Find sources that need a sync, and the title to give their mirror.
-fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
+fn scan(env: &Env, state: &mut State, hashes: &mut CopyHashes) -> Vec<PassSource> {
     let now = now_secs();
     let mut out = Vec::new();
     // One database read per store harness per pass: the rows are scan_store's input, and the ids
@@ -153,8 +153,9 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             }
             let Ok(meta) = std::fs::metadata(&path) else { continue };
             // A conversation of several files (a database and its WAL) changes in any of them:
-            // its time, stamp and hash cover them together.
-            let mtime = copy_mtime(fmt, &path);
+            // its time and hash cover them together.
+            let stat = copy_stat(fmt, &path);
+            let mtime = stat.mtime;
             let src = state.sources.entry(key.clone()).or_insert_with(|| Source::new(fmt, &key));
             if src.conv.is_empty() {
                 src.conv = sesync::manage::conversation_id(&key);
@@ -162,14 +163,7 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             if mtime > src.last_seen_change {
                 src.last_seen_change = mtime;
             }
-            let stamp = copy_stamp(fmt, &path);
-            let hash = if stamp == src.last_stamp && !src.last_hash.is_empty() {
-                src.last_hash.clone()
-            } else {
-                let h = copy_hash(fmt, &path).unwrap_or_default();
-                src.last_stamp = stamp;
-                h
-            };
+            let hash = hashes.hash(fmt, &path, &stat.identity).unwrap_or_default();
             let hash_changed = hash != src.last_hash;
             let live: Vec<&Mirror> = src.mirrors.values().filter(|m| !m.diverged).collect();
             let live_current = live.iter().all(|m| m.source_hash == hash);
@@ -214,6 +208,7 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
         out.extend(scan_store(env, state, now, *h, rows, &store_ids));
     }
     record_subagents(env, state);
+    hashes.end_pass();
     out
 }
 
@@ -296,7 +291,7 @@ fn scan_store(env: &Env, state: &mut State, now: f64, h: &dyn Harness, rows: &[R
 
 /// One pass: scan the stores and record what changed in sesync's own state. Nothing is written
 /// into any harness store, so a session stays exactly where its harness keeps it.
-fn one_pass(env: &Env, state: &mut State) -> usize {
+fn one_pass(env: &Env, state: &mut State, hashes: &mut CopyHashes) -> usize {
     // The TUI writes the same file while this loop runs. Adopt its choices before the scan
     // and once more before the save, so a keystroke is never rolled back by this pass.
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
@@ -305,7 +300,7 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     // A choice saved by an older TUI can still name a retired harness, and the TUI may have
     // deleted a session since the last pass.
     release_records_logged(&env.locations, state);
-    let changed = scan(env, state);
+    let changed = scan(env, state, hashes);
     let attempted = changed.len();
     // Un-choosing a target has to drop the copy, and that is not a content change, so it runs on
     // every pass rather than inside the `changed` loop.
@@ -704,7 +699,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--once") {
-        let attempted = one_pass(&env, &mut state);
+        let attempted = one_pass(&env, &mut state, &mut CopyHashes::default());
         println!("one pass done, {attempted} source(s) changed");
         return;
     }
@@ -755,8 +750,9 @@ fn main() {
         // The shares as the team step last saw them: a session the user just shared or unshared
         // is pushed on the next tick, not after the backed-off interval.
         let mut shares_seen = state.shares.clone();
+        let mut hashes = CopyHashes::default();
         loop {
-            one_pass(&env, &mut state);
+            one_pass(&env, &mut state, &mut hashes);
             if state.shares != shares_seen {
                 shares_seen = state.shares.clone();
                 next_team_at = None;

@@ -3,6 +3,8 @@
 //! copy of every mirror instead of replacing the existing one.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Same namespace as the Python daemon (`NAMESPACE`).
@@ -84,6 +86,70 @@ pub fn copy_stamp(fmt: &str, path: &std::path::Path) -> String {
 /// none can be read).
 pub fn copy_mtime(fmt: &str, path: &std::path::Path) -> f64 {
     copy_files(fmt, path).iter().map(|f| crate::divergence::mtime_secs(f)).fold(0.0, f64::max)
+}
+
+/// What one stat per file of a copy tells the daemon: the newest modification time of the copy in
+/// seconds (as `copy_mtime`), and its identity, the size, modification time in nanoseconds and
+/// inode of each file `copy_files` names ("missing" for a main file that is gone). Two identities
+/// that are equal name the same bytes as far as a stat can tell.
+pub struct CopyStat {
+    pub mtime: f64,
+    pub identity: String,
+}
+
+/// The `CopyStat` of a copy, with one stat per file.
+pub fn copy_stat(fmt: &str, path: &std::path::Path) -> CopyStat {
+    let mut mtime = 0.0_f64;
+    let mut parts = Vec::new();
+    for f in copy_files(fmt, path) {
+        match std::fs::metadata(&f) {
+            Ok(m) => {
+                let since = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                mtime = mtime.max(since.map_or(0.0, |d| d.as_secs_f64()));
+                parts.push(format!("{}:{}:{}", m.len(), since.map_or(0, |d| d.as_nanos()), inode(&m)));
+            }
+            Err(_) => parts.push("missing".to_string()),
+        }
+    }
+    CopyStat { mtime, identity: parts.join("+") }
+}
+
+#[cfg(unix)]
+fn inode(m: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(m)
+}
+
+/// Windows has no stable inode in std, so the identity there is size and modification time.
+#[cfg(not(unix))]
+fn inode(_m: &std::fs::Metadata) -> u64 {
+    0
+}
+
+/// Content hashes of the copies a daemon scans, carried from one pass to the next. A copy is read
+/// again only when its identity (`copy_stat`) moved since it was last hashed, so an unchanged
+/// session is never read twice. The hash is `copy_hash`'s. A copy the pass no longer sees is
+/// dropped, so the map holds only live files.
+#[derive(Default)]
+pub struct CopyHashes {
+    hashed: HashMap<PathBuf, (String, String)>,
+    seen: HashMap<PathBuf, (String, String)>,
+}
+
+impl CopyHashes {
+    /// The content hash of `path`, given its identity from this pass's `copy_stat`.
+    pub fn hash(&mut self, fmt: &str, path: &Path, identity: &str) -> std::io::Result<String> {
+        let hash = match self.hashed.get(path) {
+            Some((known, hash)) if known == identity => hash.clone(),
+            _ => copy_hash(fmt, path)?,
+        };
+        self.seen.insert(path.to_path_buf(), (identity.to_string(), hash.clone()));
+        Ok(hash)
+    }
+
+    /// Keep only the copies this pass hashed; call once per pass, after every `hash`.
+    pub fn end_pass(&mut self) {
+        self.hashed = std::mem::take(&mut self.seen);
+    }
 }
 
 /// Remove a copy's files: the main file first, then the rest `copy_files` names, plus the files

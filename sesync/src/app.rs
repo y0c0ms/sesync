@@ -1332,7 +1332,6 @@ impl App {
             if let Some(s) = self.state.sources.get_mut(key) {
                 s.last_seen_change = dsrc.last_seen_change;
                 s.last_hash = dsrc.last_hash.clone();
-                s.last_stamp = dsrc.last_stamp.clone();
                 s.failures = dsrc.failures;
                 s.sync = dsrc.sync.clone();
                 s.mirrors = dsrc.mirrors.clone();
