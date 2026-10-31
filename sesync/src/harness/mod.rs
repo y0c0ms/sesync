@@ -264,6 +264,11 @@ pub trait Harness: Send + Sync {
     fn rows(&self, _loc: &Location) -> Vec<Row> {
         Vec::new()
     }
+    /// A stamp that changes whenever `rows` would answer differently: the store's files, by size and change time.
+    /// None when the store cannot say, and its rows are read each time.
+    fn rows_stamp(&self, _loc: &Location) -> Option<String> {
+        None
+    }
     /// The name to show for a row: its own title, or what the harness falls back to.
     fn row_title(&self, _loc: &Location, row: &Row) -> String {
         row.title.clone()

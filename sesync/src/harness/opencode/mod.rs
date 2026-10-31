@@ -6,7 +6,7 @@
 pub mod rename;
 pub mod store;
 
-use super::{Harness, Kind, Location, Message, Row, Tools};
+use super::{stat, Harness, Kind, Location, Message, Row, Tools};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -74,6 +74,12 @@ impl Harness for OpenCode {
     }
     fn copy_exists(&self, loc: &Location, key: &str) -> bool {
         self.fingerprint(loc, key).is_some()
+    }
+    fn rows_stamp(&self, loc: &Location) -> Option<String> {
+        // The rows are the database's, plus the write-ahead log beside it, and a rollback journal while one exists.
+        let beside = |suffix: &str| PathBuf::from(format!("{}{suffix}", loc.root.display()));
+        let files = [loc.root.clone(), beside("-wal"), beside("-journal")];
+        Some(files.iter().map(|f| format!("{:?}", stat(f))).collect::<Vec<_>>().join("|"))
     }
     fn rows(&self, loc: &Location) -> Vec<Row> {
         if !loc.root.exists() {
