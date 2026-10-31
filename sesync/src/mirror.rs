@@ -32,12 +32,14 @@ pub fn is_file_key(key: &str) -> bool {
     std::path::Path::new(key).is_absolute()
 }
 
-/// Lowercase sha256 hex of a file, read in 1 MiB chunks (the Python file_hash).
+/// Lowercase sha256 hex of a file, read in 64 KiB chunks (the Python file_hash). The chunk is
+/// small on purpose: a daemon that hashes every session each pass must not hold a 1 MiB buffer per
+/// file in a process that can run out of memory.
 pub fn file_hash(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; 64 << 10];
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
