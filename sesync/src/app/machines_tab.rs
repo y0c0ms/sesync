@@ -40,6 +40,8 @@ pub struct MachinesTab {
 struct PendingAttach {
     argv: Vec<String>,
     label: String,
+    /// The machine the attach is for: its tab goes in that machine's herdr workspace.
+    machine: String,
 }
 
 impl App {
@@ -105,7 +107,7 @@ impl App {
         };
         let label = tab::tab_label(&c.machine, &c.title);
         self.say(format!("opening {label} in herdr…"));
-        self.machines_tab.pending = Some(PendingAttach { argv: tab::attach_argv(&exe, &c.machine, &c.worktree_id, open), label });
+        self.machines_tab.pending = Some(PendingAttach { argv: tab::attach_argv(&exe, &c.machine, &c.worktree_id, open), label, machine: c.machine.clone() });
     }
 
     /// Whether an attach waits for [`App::run_pending_attach`].
@@ -127,7 +129,15 @@ impl App {
         };
         let config = self.machines_tab.config_dir.as_ref().map(|dir| dir.display().to_string());
         let env: Vec<(&str, &str)> = config.iter().map(|dir| ("SESYNC_CONFIG_DIR", dir.as_str())).collect();
-        let (tab, pane) = match self.herdr.create_tab_with_env(&self.roots.home, &plan.label, &env) {
+        // Bridge tabs go in the machine's own workspace, created on first use; a failed lookup means herdr is not answering.
+        let workspace = match self.herdr.machine_workspace(&plan.machine, &self.roots.home) {
+            Ok(id) => id,
+            Err(e) => {
+                self.fail(format!("no herdr answers from here ({e}), so {} was not opened", plan.label));
+                return;
+            }
+        };
+        let (tab, pane) = match self.herdr.create_tab_in_workspace(Some(&workspace), &self.roots.home, &plan.label, &env) {
             Ok(ids) => ids,
             Err(e) => {
                 self.fail(format!("no herdr answers from here ({e}), so {} was not opened", plan.label));

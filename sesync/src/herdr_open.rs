@@ -207,14 +207,19 @@ impl Herdr {
     /// [`Herdr::create_tab`], with `env` set for the tab's process. herdr starts a tab with its own environment, not
     /// the caller's, so a tab that must read this sesync's configuration is given it here.
     pub fn create_tab_with_env(&self, cwd: &Path, label: &str, env: &[(&str, &str)]) -> Result<(String, String), String> {
+        self.create_tab_in_workspace(self.workspace.as_deref(), cwd, label, env)
+    }
+
+    /// A new tab labelled `label`, in `workspace` when given (else herdr's default), with `env` set for its shell.
+    pub fn create_tab_in_workspace(&self, workspace: Option<&str>, cwd: &Path, label: &str, env: &[(&str, &str)]) -> Result<(String, String), String> {
         let cwd = cwd.display().to_string();
         let assignments: Vec<String> = env.iter().map(|(key, value)| format!("{key}={value}")).collect();
         let mut args = vec!["tab", "create", "--cwd", cwd.as_str(), "--label", label, "--no-focus"];
         for assignment in &assignments {
             args.extend(["--env", assignment.as_str()]);
         }
-        if let Some(workspace) = &self.workspace {
-            args.extend(["--workspace", workspace.as_str()]);
+        if let Some(workspace) = workspace {
+            args.extend(["--workspace", workspace]);
         }
         let v = self.call(&args)?;
         match (v["result"]["tab"]["tab_id"].as_str(), v["result"]["root_pane"]["pane_id"].as_str()) {
@@ -226,6 +231,42 @@ impl Herdr {
     /// Type `command` into a pane and press Enter.
     pub fn run_in_pane(&self, pane_id: &str, command: &str) -> Result<(), String> {
         self.call(&["pane", "run", pane_id, command]).map(|_| ())
+    }
+
+    /// The workspace that holds every bridge tab to `machine`, created the first time one is needed. Matched by its
+    /// label (see [`machine_workspace_label`]), which herdr keeps across restarts.
+    pub fn machine_workspace(&self, machine: &str, cwd: &Path) -> Result<String, String> {
+        let want = machine_workspace_label(machine);
+        let v = self.call(&["workspace", "list"])?;
+        let found = v["result"]["workspaces"]
+            .as_array()
+            .and_then(|list| list.iter().find(|w| w["label"].as_str() == Some(want.as_str())))
+            .and_then(|w| w["workspace_id"].as_str().map(str::to_string));
+        match found {
+            Some(id) => Ok(id),
+            None => self.create_workspace_with_id(cwd, &want),
+        }
+    }
+
+    /// A new tab in `workspace`, not focused, with `label`, returning the tab and its root pane.
+    pub fn create_tab_in(&self, workspace: &str, cwd: &Path, label: &str) -> Result<(String, String), String> {
+        let cwd = cwd.display().to_string();
+        let v = self.call(&["tab", "create", "--cwd", cwd.as_str(), "--label", label, "--no-focus", "--workspace", workspace])?;
+        match (v["result"]["tab"]["tab_id"].as_str(), v["result"]["root_pane"]["pane_id"].as_str()) {
+            (Some(tab), Some(pane)) => Ok((tab.to_string(), pane.to_string())),
+            _ => Err("herdr's new tab has no tab or pane id".to_string()),
+        }
+    }
+
+    /// Create a workspace labelled `label` and return its id, as herdr reports it.
+    fn create_workspace_with_id(&self, cwd: &Path, label: &str) -> Result<String, String> {
+        let cwd = cwd.display().to_string();
+        let v = self.call(&["workspace", "create", "--cwd", cwd.as_str(), "--label", label, "--no-focus"])?;
+        v["result"]["root_pane"]["workspace_id"]
+            .as_str()
+            .or_else(|| v["result"]["tab"]["workspace_id"].as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "herdr's new workspace has no id".to_string())
     }
 
     /// Open a workspace in `cwd`, unfocused, for when herdr has none to open a tab in. Returns the workspace's first
@@ -254,6 +295,11 @@ fn text(v: &Value, key: &str) -> Option<String> {
 
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The label of the herdr workspace that holds every bridge tab to `machine`. Its suffix marks it as sesync's.
+pub fn machine_workspace_label(machine: &str) -> String {
+    format!("{machine} \u{00b7} sesync")
 }
 
 /// What opening one session takes.

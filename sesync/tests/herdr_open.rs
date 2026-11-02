@@ -627,3 +627,84 @@ fn a_run_that_answers_nothing_is_a_success() {
     assert_eq!(herdr_open::open(&herdr, &plan, herdr_open::PaneShell::Posix, SHOWS_PROGRAMS).unwrap(), Opened::Created { tab_id: "w9:t9".into() });
     assert!(calls.lock().iter().any(|c| c.get(1..3) == Some(&["pane".to_string(), "run".to_string()][..])));
 }
+
+// --- machine workspaces: one herdr workspace per bridged machine, found again by its label ---
+
+/// A herdr whose workspaces are `workspaces` (id, label). `workspace create` makes `w7` with the requested label;
+/// every tab create returns `w9:t9` in the workspace it was asked for.
+fn herdr_with_workspaces(workspaces: Vec<(&'static str, &'static str)>) -> (Herdr, Calls) {
+    let listed: Vec<serde_json::Value> = workspaces
+        .into_iter()
+        .map(|(id, label)| json!({ "workspace_id": id, "label": label, "tab_count": 1 }))
+        .collect();
+    let listed = Arc::new(Mutex::new(listed));
+    fake_herdr(move |args| {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        match a.as_slice() {
+            ["workspace", "list"] => Ok(json!({ "result": { "workspaces": *listed.lock() } }).to_string()),
+            ["workspace", "create", .., "--label", label, _] | ["workspace", "create", .., "--label", label] => {
+                listed.lock().push(json!({ "workspace_id": "w7", "label": label, "tab_count": 1 }));
+                Ok(json!({ "result": { "root_pane": { "pane_id": "w7:p1", "tab_id": "w7:t1", "workspace_id": "w7" },
+                                       "tab": { "tab_id": "w7:t1", "workspace_id": "w7" }, "type": "workspace_created" } })
+                    .to_string())
+            }
+            ["tab", "create", ..] => Ok(json!({ "result": { "tab": { "tab_id": "w9:t9", "workspace_id": "w9" },
+                                                       "root_pane": { "pane_id": "w9:p9", "tab_id": "w9:t9" } } })
+                .to_string()),
+            _ => Err(format!("unexpected herdr call: {a:?}")),
+        }
+    })
+}
+
+fn create_calls(calls: &Calls) -> Vec<Vec<String>> {
+    calls.lock().iter().filter(|c| c.get(1).map(String::as_str) == Some("workspace") && c.get(2).map(String::as_str) == Some("create")).cloned().collect()
+}
+
+#[test]
+fn the_first_open_for_a_machine_creates_its_workspace_with_the_machine_in_the_label() {
+    let (herdr, calls) = herdr_with_workspaces(vec![("w1", "PC Config")]);
+    let id = herdr.machine_workspace("yocomsMain", Path::new("/tmp")).expect("a workspace");
+    assert_eq!(id, "w7", "the id herdr reports for the new workspace");
+    let creates = create_calls(&calls);
+    assert_eq!(creates.len(), 1, "exactly one workspace is created");
+    let label = creates[0].iter().position(|a| a == "--label").map(|i| creates[0][i + 1].clone()).expect("a label");
+    assert_eq!(label, "yocomsMain · sesync", "the label names the machine and marks it as sesync's");
+}
+
+#[test]
+fn a_later_open_for_the_same_machine_reuses_its_workspace_and_creates_nothing() {
+    let (herdr, calls) = herdr_with_workspaces(vec![("w4", "yocomsMain · sesync")]);
+    let id = herdr.machine_workspace("yocomsMain", Path::new("/tmp")).expect("a workspace");
+    assert_eq!(id, "w4", "the existing workspace is found by its label");
+    assert!(create_calls(&calls).is_empty(), "no second workspace is created for the same machine");
+}
+
+#[test]
+fn two_machines_get_two_workspaces_and_neither_reuses_the_other() {
+    let (herdr, calls) = herdr_with_workspaces(vec![("w4", "yocomsMain · sesync")]);
+    let other = herdr.machine_workspace("laptop", Path::new("/tmp")).expect("a workspace");
+    assert_ne!(other, "w4", "a different machine never shares the first machine's workspace");
+    let creates = create_calls(&calls);
+    assert_eq!(creates.len(), 1, "only the second machine needs a workspace");
+}
+
+#[test]
+fn a_workspace_with_the_machine_name_but_no_sesync_suffix_is_not_taken_over() {
+    let (herdr, calls) = herdr_with_workspaces(vec![("w2", "yocomsMain")]);
+    let id = herdr.machine_workspace("yocomsMain", Path::new("/tmp")).expect("a workspace");
+    assert_ne!(id, "w2", "a user's own workspace with the bare name is left alone");
+    assert_eq!(create_calls(&calls).len(), 1, "sesync makes its own workspace instead");
+}
+
+#[test]
+fn a_machine_tab_is_created_in_the_machines_workspace_not_the_clients_default() {
+    let (herdr, calls) = herdr_with_workspaces(vec![("w4", "yocomsMain · sesync")]);
+    let ws = herdr.machine_workspace("yocomsMain", Path::new("/tmp")).expect("a workspace");
+    let (tab, pane) = herdr
+        .create_tab_in_workspace(Some(&ws), Path::new("/tmp"), "yocomsMain · Main agent", &[])
+        .expect("a tab");
+    assert_eq!((tab.as_str(), pane.as_str()), ("w9:t9", "w9:p9"));
+    let tab_call = calls.lock().iter().find(|c| c.get(1).map(String::as_str) == Some("tab")).cloned().expect("a tab call");
+    let at = tab_call.iter().position(|a| a == "--workspace").expect("the tab names its workspace");
+    assert_eq!(tab_call[at + 1], "w4", "the tab lands in the machine's workspace");
+}
