@@ -42,6 +42,15 @@ pub fn pick<'a>(rows: &'a [Value], query: &str) -> Result<&'a Value, String> {
     Err(format!("no conversation named {query:?} (see `sesync machine list`)"))
 }
 
+/// Write the screen for `frame` unless it is the screen already shown. `shown` is the last screen written.
+fn redraw(shown: &mut String, frame: &str, rows: u16, status: &str, out: &impl Fn(&str)) {
+    let next = render(frame, rows, status);
+    if next != *shown {
+        out(&next);
+        *shown = next;
+    }
+}
+
 /// One screen to draw: the remote `frame` (a repaint) cut to `rows` lines of this window, the bottom ones kept,
 /// with `status` on the last line. Drawn over the screen from the top: each row ends its colours and clears the
 /// rest of its line, and what is left below is cleared. Never a whole-screen clear (ED 2): some terminals keep a
@@ -158,6 +167,9 @@ async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal
     let mut frame = String::new();
     let mut size = crossterm::terminal::size().map_err(|e| e.to_string())?;
     let mut tick = tokio::time::interval(SIZE_EVERY);
+    // The last screen written. A refresh that would draw the same screen writes nothing, so an unchanged pane never
+    // flickers.
+    let mut shown = String::new();
     let out = |text: &str| {
         print!("{text}");
         let _ = std::io::stdout().flush();
@@ -190,7 +202,7 @@ async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal
                     Some("end") => return Err("the pane closed on that machine".into()),
                     _ => continue,
                 }
-                out(&render(&frame, size.1, status));
+                redraw(&mut shown, &frame, size.1, status, &out);
             }
             typed = keys.recv() => {
                 let Some(bytes) = typed else { return Ok(()) };
@@ -210,7 +222,8 @@ async fn mirror(writer: &mut Writer, reader: &mut Reader, stream: &str, terminal
                 let now = crossterm::terminal::size().map_err(|e| e.to_string())?;
                 if now != size {
                     size = now;
-                    out(&render(&frame, size.1, status));
+                    shown.clear();
+                    redraw(&mut shown, &frame, size.1, status, &out);
                 }
             }
         }
@@ -235,6 +248,28 @@ mod tests {
         assert!(twins.contains("r::a") && twins.contains("r::b"), "two equal titles list their ids: {twins}");
         assert!(pick(&rows, "main").is_err(), "a part that fits several is not guessed");
         assert!(pick(&rows, "nothing like it").is_err());
+    }
+
+    #[test]
+    fn a_refresh_that_draws_the_same_screen_writes_nothing() {
+        let mut shown = String::new();
+        let written = std::cell::RefCell::new(Vec::<String>::new());
+        let out = |text: &str| written.borrow_mut().push(text.to_string());
+        let frame = format!("{REPAINT}one\r\ntwo");
+        redraw(&mut shown, &frame, 5, "s", &out);
+        redraw(&mut shown, &frame, 5, "s", &out);
+        assert_eq!(written.borrow().len(), 1, "an identical second refresh writes nothing");
+    }
+
+    #[test]
+    fn a_refresh_with_new_content_is_drawn() {
+        let mut shown = String::new();
+        let written = std::cell::RefCell::new(Vec::<String>::new());
+        let out = |text: &str| written.borrow_mut().push(text.to_string());
+        redraw(&mut shown, &format!("{REPAINT}one"), 5, "s", &out);
+        redraw(&mut shown, &format!("{REPAINT}one\r\ntwo"), 5, "s", &out);
+        assert_eq!(written.borrow().len(), 2, "a changed screen is written");
+        assert!(written.borrow()[1].contains("two"), "the new line is in the write");
     }
 
     #[test]
