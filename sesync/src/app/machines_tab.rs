@@ -153,6 +153,8 @@ impl App {
             Ok(()) => self.say(format!("opened {} in a new herdr tab", plan.label)),
             Err(e) => self.fail(format!("opened {} in a new herdr tab, but could not switch to it ({e})", plan.label)),
         }
+        // The tab is open, so the popup has done its job: close it like the other herdr opens do.
+        self.quit = true;
     }
 
     /// Whether the Machines tab should ask its worker for a refresh now: the tab is shown, no refresh is in flight,

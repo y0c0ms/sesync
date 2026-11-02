@@ -28,3 +28,24 @@ fn the_machines_tab_is_remembered_across_runs() {
     assert_eq!(a.view(), View::Machines);
     let _ = fs::remove_dir_all(&sb);
 }
+
+#[test]
+fn leaving_the_machines_view_closes_the_popup() {
+    let sb = sandbox("leave-machines");
+    let mut a = app(&sb);
+    a.restore_prefs(None, Some(View::Machines));
+    a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
+    assert_eq!(a.view(), View::Sessions);
+    assert!(a.should_quit(), "moving off the Machines view ends the popup");
+    let _ = fs::remove_dir_all(&sb);
+}
+
+#[test]
+fn moving_between_sessions_and_team_keeps_the_popup_open() {
+    let sb = sandbox("keep-open");
+    let mut a = app(&sb);
+    a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
+    assert_eq!(a.view(), View::Team);
+    assert!(!a.should_quit(), "Sessions to Team does not end the popup");
+    let _ = fs::remove_dir_all(&sb);
+}
