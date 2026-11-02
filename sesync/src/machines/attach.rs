@@ -251,6 +251,16 @@ mod tests {
     }
 
     #[test]
+    fn a_row_wider_than_the_window_is_written_whole_with_no_width_handling() {
+        // The pane lays rows out at its own width (131 cells here); render takes no window width, so a row longer
+        // than the window reaches the terminal unchanged and the terminal cuts it at its edge.
+        let row: String = "x".repeat(131);
+        let out = render(&format!("{REPAINT}{row}"), 5, "s");
+        assert!(out.contains(&row), "the whole 131-cell row is written: {out:?}");
+        assert!(!out.contains(&"x".repeat(132)), "no more than the row is written");
+    }
+
+    #[test]
     fn a_refresh_that_draws_the_same_screen_writes_nothing() {
         let mut shown = String::new();
         let written = std::cell::RefCell::new(Vec::<String>::new());
