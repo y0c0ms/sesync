@@ -120,7 +120,7 @@ impl App {
     pub fn run_pending_attach(&mut self) {
         let Some(plan) = self.machines_tab.pending.take() else { return };
         let shell = PaneShell::current(&self.roots.home);
-        let command = match herdr_open::shell_line(&plan.argv, shell) {
+        let command = match herdr_open::attach_pane_line(&plan.argv, shell) {
             Ok(command) => command,
             Err(e) => {
                 self.fail(e);

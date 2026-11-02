@@ -464,6 +464,18 @@ pub fn shell_line(argv: &[String], shell: PaneShell) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
+/// The command a herdr tab runs for a bridge attach: `argv`, then the pane's shell exits when it succeeds, so herdr
+/// closes the pane and its tab. A failure keeps the shell open, so the message stays on screen. `shell_line` builds
+/// the argv part; this wraps it for the shell that runs it.
+pub fn attach_pane_line(argv: &[String], shell: PaneShell) -> Result<String, String> {
+    let line = shell_line(argv, shell)?;
+    Ok(match shell {
+        PaneShell::Posix => format!("{line}; [ $? -eq 0 ] && exit"),
+        PaneShell::PowerShell => format!("{line}; if ($LASTEXITCODE -eq 0) {{ exit }}"),
+        PaneShell::Cmd => format!("{line} & if not errorlevel 1 exit"),
+    })
+}
+
 /// One argument for a POSIX shell: bare when it is plain, else single-quoted.
 pub fn shell_quote(arg: &str) -> String {
     let plain = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));

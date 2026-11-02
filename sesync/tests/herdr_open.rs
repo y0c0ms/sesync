@@ -708,3 +708,30 @@ fn a_machine_tab_is_created_in_the_machines_workspace_not_the_clients_default() 
     let at = tab_call.iter().position(|a| a == "--workspace").expect("the tab names its workspace");
     assert_eq!(tab_call[at + 1], "w4", "the tab lands in the machine's workspace");
 }
+
+// --- a bridge attach's pane closes on success and stays open on failure ---
+
+#[test]
+fn a_posix_attach_pane_exits_only_when_the_attach_succeeds() {
+    let line = herdr_open::attach_pane_line(&["sesync".into(), "machine".into(), "attach".into()], herdr_open::PaneShell::Posix).unwrap();
+    assert!(line.ends_with("; [ $? -eq 0 ] && exit"), "{line}");
+}
+
+#[test]
+fn a_powershell_attach_pane_exits_only_when_the_attach_succeeds() {
+    let line = herdr_open::attach_pane_line(&["sesync".into(), "machine".into(), "attach".into()], herdr_open::PaneShell::PowerShell).unwrap();
+    assert!(line.ends_with("; if ($LASTEXITCODE -eq 0) { exit }"), "{line}");
+    assert!(line.starts_with("& "), "PowerShell runs a quoted program after &: {line}");
+}
+
+#[test]
+fn a_cmd_attach_pane_exits_only_when_the_attach_succeeds() {
+    let line = herdr_open::attach_pane_line(&["sesync".into(), "machine".into(), "attach".into()], herdr_open::PaneShell::Cmd).unwrap();
+    assert!(line.ends_with(" & if not errorlevel 1 exit"), "{line}");
+}
+
+#[test]
+fn an_attach_pane_refuses_an_argument_a_shell_line_cannot_carry() {
+    let bad = herdr_open::attach_pane_line(&["sesync".into(), "bad\nname".into()], herdr_open::PaneShell::Posix);
+    assert!(bad.is_err(), "a control character in the argv is refused, as shell_line refuses it");
+}
