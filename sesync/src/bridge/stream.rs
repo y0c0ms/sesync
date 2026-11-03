@@ -385,6 +385,14 @@ fn send_history(t: &Terminal, history: &[String]) -> bool {
     history_events(history).into_iter().all(|event| t.sink.json(&streamed(&t.request_id, event)))
 }
 
+/// The screen a JSON client starts from: a `scrollback` event carrying the whole screen, as `resized` does.
+fn send_first_screen(t: &Terminal, screen: &str) -> bool {
+    t.sink.json(&streamed(
+        &t.request_id,
+        json!({ "type": "scrollback", "cols": t.cols, "rows": t.rows, "displayMode": t.display_mode, "serialized": screen }),
+    ))
+}
+
 /// Send `screen` as a binary snapshot of `kind` (`scrollback` for a subscribe, `resized` for a size change):
 /// the start with its meta, the chunks, the end. False once the connection has gone.
 fn send_snapshot(t: &Terminal, kind: &str, seq: u64, screen: &str) -> bool {
@@ -422,7 +430,9 @@ pub fn run_terminal(mut t: Terminal) {
     let opened = if t.binary {
         send_snapshot(&t, "scrollback", 0, &snapshot_text(&history, &t.shown))
     } else {
-        send_history(&t, &history)
+        // A JSON client gets the history, then the screen once: without it the client draws nothing until the pane
+        // changes, so a new attach stays blank until the next key.
+        send_history(&t, &history) && send_first_screen(&t, &t.shown)
     };
     drop(history);
     if !opened {
@@ -870,8 +880,10 @@ mod tests {
         let mut s = Running::start(false, "one\ntwo", (57, 27), DESKTOP);
         s.set("one\ntwo", (40, 20));
         let after = s.sent_within(Duration::from_millis(1800));
-        assert_eq!(after.len(), 1, "one resized event and no repaint: {after:?}");
-        match &after[0] {
+        let resized: Vec<&Sent> = after.iter().filter(|e| matches!(e, Sent::Event(v) if v["type"] == "resized")).collect();
+        assert_eq!(resized.len(), 1, "one resized event: {after:?}");
+        assert_eq!(after.len(), 2, "the start screen, then the resize; no repaint: {after:?}");
+        match resized[0] {
             Sent::Event(e) => {
                 assert_eq!(e["type"], "resized");
                 assert_eq!((e["cols"].as_u64(), e["rows"].as_u64()), (Some(40), Some(20)));
@@ -891,6 +903,19 @@ mod tests {
         assert_eq!(starts(&initial)[0]["displayMode"], "auto", "{initial:?}");
         let later = s.sent_within(Duration::from_millis(1800));
         assert!(later.is_empty(), "no layout, no resize: {later:?}");
+        s.finish();
+    }
+
+    #[test]
+    fn a_json_client_gets_the_screen_on_subscribe_without_waiting_for_a_change() {
+        let mut s = Running::start(false, "one\ntwo", (57, 27), DESKTOP);
+        let initial = s.sent_within(Duration::from_millis(150));
+        let screens: Vec<&Value> = initial.iter().filter_map(|m| match m {
+            Sent::Event(v) if v["type"] == "scrollback" => Some(v),
+            _ => None,
+        }).collect();
+        assert_eq!(screens.len(), 1, "the screen is sent once on subscribe: {initial:?}");
+        assert_eq!(screens[0]["serialized"], "one\r\ntwo", "{initial:?}");
         s.finish();
     }
 
@@ -935,7 +960,8 @@ mod tests {
         let mut s = Running::start_with(false, "c\nd\ne", (10, 3), DESKTOP, &["a", "b"]);
         let initial = s.sent_within(Duration::from_millis(150));
         let events: Vec<Value> = initial.iter().filter_map(|e| if let Sent::Event(v) = e { Some(v.clone()) } else { None }).collect();
-        assert_eq!(events, vec![json!({ "type": "history", "lines": ["a", "b"] })]);
+        assert_eq!(events[0], json!({ "type": "history", "lines": ["a", "b"] }), "the history comes first");
+        assert_eq!(events[1]["type"], "scrollback", "then the screen, once: {events:?}");
 
         s.fake.set_history(&s.terminal, &["a", "b", "c"]);
         s.set("d\ne\nf", (10, 3));
