@@ -1785,11 +1785,8 @@ impl App {
 
     /// Switch between the local list and the team list. Each keeps its own cursor.
     fn switch_view(&mut self) {
-        // The popup closes when the user leaves the Machines view: a bridge tab just opened from it, or simply
-        // moving to another view, both end the popup, so the next herdr open is not blocked by a stale one.
-        if self.view == View::Machines {
-            self.quit = true;
-        }
+        // Tab only moves between the views: Sessions, Team, Machines, and back. Opening a bridge session from
+        // Machines ends the popup on its own (see `run_pending_attach`).
         self.view = match self.view {
             View::Sessions => View::Team,
             View::Team => View::Machines,

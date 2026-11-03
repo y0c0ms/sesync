@@ -225,8 +225,8 @@ fn the_screen_shows_both_tabs_and_points_at_the_palette() {
     write_session(&sb, SID_A, "one");
     let a = app(&sb);
     let text = screen(&a, 100, 10);
-    let tabs = line_with(&text, "Sessions");
-    assert!(tabs.contains("Team"), "the tab bar shows Team:\n{text}");
+    let tabs = line_with(&text, "Local");
+    assert!(tabs.contains("Team"), "the tab bar shows Local and Team:\n{text}");
     assert!(text.contains("ctrl+p"), "the footer points at the palette:\n{text}");
     let _ = fs::remove_dir_all(&sb);
 }

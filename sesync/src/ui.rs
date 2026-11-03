@@ -115,7 +115,7 @@ fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     };
     let (ok, failing) = app.sync_counts();
     let bar = Line::from(vec![
-        Span::styled(" Sessions ", style(View::Sessions)),
+        Span::styled(" Local ", style(View::Sessions)),
         Span::styled("│", Style::default().fg(th.dim)),
         Span::styled(format!(" Team ({}) ", app.team_rows().len()), style(View::Team)),
         Span::styled("│", Style::default().fg(th.dim)),
