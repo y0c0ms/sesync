@@ -171,15 +171,24 @@ fn config_dir(state_dir: &Path) -> PathBuf {
     state_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| state_dir.to_path_buf())
 }
 
-/// The folder files from a client arrive in: `inbox` in `<config>/transfer.json`, a leading `~/` meaning the home
-/// directory, or `~/sesync-inbox`. Read on every call, so the TUI's change applies at once.
-pub fn inbox_dir(state_dir: &Path) -> PathBuf {
-    let configured = std::fs::read_to_string(config_dir(state_dir).join(SETTINGS_FILE))
+/// The folder `<config>/transfer.json` names, if it names one.
+fn configured_inbox(state_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(config_dir(state_dir).join(SETTINGS_FILE))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|v| v.get("inbox").and_then(Value::as_str).map(str::to_string))
-        .filter(|s| !s.trim().is_empty());
-    expand(configured.as_deref().unwrap_or(&format!("~/{DEFAULT_INBOX}")))
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Whether a folder was chosen, as opposed to the default.
+pub fn is_configured(state_dir: &Path) -> bool {
+    configured_inbox(state_dir).is_some()
+}
+
+/// The folder files from a client arrive in: `inbox` in `<config>/transfer.json`, a leading `~/` meaning the home
+/// directory, or `~/sesync-inbox`. Read on every call, so the TUI's change applies at once.
+pub fn inbox_dir(state_dir: &Path) -> PathBuf {
+    expand(configured_inbox(state_dir).as_deref().unwrap_or(&format!("~/{DEFAULT_INBOX}")))
 }
 
 /// Expand a leading `~` to the home directory.

@@ -35,12 +35,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::Sessions => draw_sessions(f, app, th, chunks[1]),
         View::Team => draw_team(f, app, th, chunks[1]),
         View::Machines => draw_machines(f, app, th, chunks[1]),
+        View::Settings => draw_settings(f, app, th, chunks[1]),
     }
 
     let status_line = match app.mode() {
         // The status goes beside the input, so a refused rename is visible while the user edits.
         // A rename refusal is an error and does not fade, so the raw status is honest here too.
         Mode::Rename => Some((format!("Rename: {}_  {}", app.input(), app.status()), app.status_is_error())),
+        Mode::Settings => Some((format!("Folder: {}_  {}", app.input(), app.status()), app.status_is_error())),
         _ => app.status_line(Instant::now()).map(|(t, e)| (t.to_string(), e)),
     };
     // Both bottom rows sit on the theme's bar colour, like a statusline, so typed input and
@@ -120,6 +122,8 @@ fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Span::styled(format!(" Team ({}) ", app.team_rows().len()), style(View::Team)),
         Span::styled("│", Style::default().fg(th.dim)),
         Span::styled(format!(" Machines ({}) ", app.machine_count()), style(View::Machines)),
+        Span::styled("│", Style::default().fg(th.dim)),
+        Span::styled(" Settings ", style(View::Settings)),
         Span::styled(format!("   {daemon}"), Style::default().fg(daemon_color)),
         Span::styled(format!(" · {ok} copies in place, {failing} failing"),
             Style::default().fg(if failing > 0 { th.error } else { th.dim })),
@@ -584,6 +588,31 @@ const MACHINE_HARNESS_W: usize = 11;
 const MACHINE_PROJECT_W: usize = 40;
 const MACHINE_FIXED_W: usize = MACHINE_STATE_W + MACHINE_HARNESS_W + MACHINE_PROJECT_W + 6 + 2;
 
+/// The Settings tab: the folder files other machines and the phone send arrive in, and how to change it.
+fn draw_settings(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::session_cols::display_safe;
+    let folder = app.inbox_folder();
+    let origin = if app.inbox_is_default() { "default" } else { "chosen" };
+    let lines = vec![
+        Line::from(Span::styled("Files received over the bridge", Style::default().fg(th.text).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Folder  ", Style::default().fg(th.dim)),
+            Span::styled(display_safe(&folder), Style::default().fg(th.text)),
+            Span::styled(format!("  ({origin})"), Style::default().fg(th.dim)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Files and folders sent with `sesync machine send` or from the phone land here. A name that is taken gets a number; nothing is overwritten.",
+            Style::default().fg(th.dim),
+        )),
+        Line::from(Span::styled("The bridge reads this on every upload, so a change applies at once.", Style::default().fg(th.dim))),
+        Line::from(""),
+        Line::from(Span::styled("Enter changes the folder.", Style::default().fg(th.dim))),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
 /// The Machines tab: each saved machine with its address and status, then the conversations its last refresh listed,
 /// with their state, title, harness and project. Enter attaches the conversation under the cursor.
 fn draw_machines(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
@@ -978,6 +1007,7 @@ fn draw_help(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         View::Sessions => "Keys: sessions",
         View::Team => "Keys: team",
         View::Machines => "Keys: machines",
+        View::Settings => "Keys: settings",
     };
     let inner = dialog(f, title, th,
         centered(74, height, area));

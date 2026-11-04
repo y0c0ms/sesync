@@ -78,24 +78,24 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
             (View::Sessions, true) => Ok(()),
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("older sessions are on the Team tab; press tab"),
-            (View::Machines, _) => Err("local sessions are on the Sessions tab; press tab"),
+            (View::Machines | View::Settings, _) => Err("local sessions are on the Sessions tab; press tab"),
         },
         Action::Share => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
-            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines | View::Settings, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.team_configured { Ok(()) } else { Err("no team configured; join one first") },
         },
         Action::Unshare => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
-            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines | View::Settings, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.session_shared { Ok(()) } else { Err("this session is not shared with any team") },
         },
         Action::Import => match (ctx.view, ctx.team_selected) {
             (View::Team, true) => Ok(()),
             (View::Team, false) => Err("no team session selected"),
-            (View::Sessions | View::Machines, _) => Err("team sessions are on the Team tab; press tab"),
+            (View::Sessions | View::Machines | View::Settings, _) => Err("team sessions are on the Team tab; press tab"),
         },
         Action::RefreshTeam => {
             if ctx.team_configured || ctx.view == View::Machines {

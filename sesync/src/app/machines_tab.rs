@@ -47,7 +47,8 @@ struct PendingAttach {
 impl App {
     /// The config directory of this run (`SESYNC_CONFIG_DIR`, or the default). Attach tabs read their machines from it.
     pub fn set_config_dir(&mut self, dir: PathBuf) {
-        self.machines_tab.config_dir = Some(dir);
+        self.machines_tab.config_dir = Some(dir.clone());
+        self.set_settings_config_dir(dir);
     }
 
     /// The Machines tab's rows, as the view draws them.

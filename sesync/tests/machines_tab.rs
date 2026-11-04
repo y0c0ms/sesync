@@ -35,14 +35,16 @@ fn tab_moves_through_every_view_and_never_closes_the_popup() {
     let mut a = app(&sb);
     a.restore_prefs(None, Some(View::Machines));
     a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
-    assert_eq!(a.view(), View::Sessions, "Machines goes on to Sessions");
+    assert_eq!(a.view(), View::Settings, "Machines goes on to Settings");
     assert!(!a.should_quit(), "a Tab from Machines does not end the popup");
+    a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
+    assert_eq!(a.view(), View::Sessions, "Settings goes on to Sessions");
     a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
     assert_eq!(a.view(), View::Team);
     a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
     assert_eq!(a.view(), View::Machines);
     a.handle(sesync::app::Ev::Tab, std::time::Instant::now());
-    assert_eq!(a.view(), View::Sessions, "the cycle comes back to Sessions");
+    assert_eq!(a.view(), View::Settings, "the cycle runs on through Settings again");
     assert!(!a.should_quit(), "a full cycle keeps the popup open");
     let _ = fs::remove_dir_all(&sb);
 }
