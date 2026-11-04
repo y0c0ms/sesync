@@ -61,7 +61,8 @@ struct Upload {
     /// The sanitised name the client asked for.
     name: String,
     part: PathBuf,
-    file: std::fs::File,
+    /// The partial file, open while chunks arrive; closed at commit, before the file is published.
+    file: Option<std::fs::File>,
     expected: Option<u64>,
     /// Base64 characters received so far: the offset the next chunk must carry.
     chars: u64,
@@ -125,8 +126,8 @@ impl Upload {
         if self.bytes + bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(bad("File is too large"));
         }
-        self.file
-            .write_all(bytes)
+        let file = self.file.as_mut().ok_or_else(|| bad("File upload was already closed"))?;
+        file.write_all(bytes)
             .map_err(|e| unavailable(format!("cannot write {}: {e}", self.part.display())))?;
         self.bytes += bytes.len() as u64;
         Ok(())
@@ -139,9 +140,10 @@ impl Upload {
         }
         let rest = std::mem::take(&mut self.text).end()?;
         self.write(&rest)?;
-        self.file
-            .sync_all()
-            .map_err(|e| unavailable(format!("cannot write {}: {e}", self.part.display())))?;
+        // Flush, then close the part file: Windows will not link or move a file that is still open.
+        let file = self.file.take().ok_or_else(|| bad("File upload was already closed"))?;
+        file.sync_all().map_err(|e| unavailable(format!("cannot write {}: {e}", self.part.display())))?;
+        drop(file);
         let path = claim_name(&self.dir, &self.name, &self.part)?;
         Ok((path, self.bytes))
     }
@@ -250,8 +252,10 @@ pub fn sanitize_name(raw: &str) -> String {
     }
 }
 
-/// Move `part` to `<dir>/<name>`, or `<dir>/<stem> (n).<ext>` when that exists. The move cannot replace a file:
-/// the destination is reserved with `create_new` first.
+/// Publish the finished `part` as `<dir>/<name>`, or `<dir>/<stem> (n).<ext>` when that exists, and remove the part.
+/// A hard link is the publish step because it fails when the target exists on every platform, so a file is never
+/// replaced and two uploads of one name cannot take the same path. (A `rename` onto an existing file replaces it
+/// on Unix and fails on Windows; a placeholder created first and renamed over fails on Windows too.)
 fn claim_name(dir: &Path, name: &str, part: &Path) -> Result<PathBuf, Failure> {
     let (stem, ext) = match name.rfind('.') {
         Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
@@ -260,12 +264,10 @@ fn claim_name(dir: &Path, name: &str, part: &Path) -> Result<PathBuf, Failure> {
     for n in 0..10_000u32 {
         let candidate = if n == 0 { name.to_string() } else { format!("{stem} ({n}){ext}") };
         let target = dir.join(&candidate);
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
-            Ok(_) => {
-                return std::fs::rename(part, &target).map(|_| target.clone()).map_err(|e| {
-                    let _ = std::fs::remove_file(&target);
-                    unavailable(format!("cannot save {}: {e}", target.display()))
-                });
+        match std::fs::hard_link(part, &target) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(part);
+                return Ok(target);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(unavailable(format!("cannot save {}: {e}", target.display()))),
@@ -346,7 +348,7 @@ fn start_upload_in(store: &Store, state_dir: &Path, params: &Value) -> Result<Va
     let file = create_owner_only(&part).map_err(|e| unavailable(format!("cannot create {}: {e}", part.display())))?;
     uploads.insert(
         id.clone(),
-        Upload { dir, name, part, file, expected, chars: 0, bytes: 0, text: Base64Text::default(), expires: Instant::now() + IDLE_TTL },
+        Upload { dir, name, part, file: Some(file), expected, chars: 0, bytes: 0, text: Base64Text::default(), expires: Instant::now() + IDLE_TTL },
     );
     Ok(json!({ "uploadId": id }))
 }
