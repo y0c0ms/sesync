@@ -32,6 +32,7 @@ sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-cl
 sesync/        the sync daemon and manage TUI
 sesync-team/   team sync core (sealed records, leases, member list) and team-server
 hooks/         per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
+skills/        agent skills (SKILL.md) for models that work through the bridge; copy one into your agent's skills directory
 docs/          architecture, status, research notes
 ```
 
