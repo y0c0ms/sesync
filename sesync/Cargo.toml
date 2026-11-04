@@ -35,6 +35,9 @@ parking_lot = "0.12"
 # X25519. curve25519-dalek gives the raw X25519 secret the HKDF needs; it is in the lock file through crypto_box.
 ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
 curve25519-dalek = "4"
+# File transfer over the bridge (`bridge::transfer`): a directory is sent as a zip. Deflate only, no encryption,
+# bzip2 or lzma, so the crate pulls in as little as it can.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(windows)'.dependencies]
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's

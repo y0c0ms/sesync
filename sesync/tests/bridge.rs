@@ -10,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sesync::bridge::catalog::{Catalog, Conversation, StateCatalog};
 use sesync::bridge::devices;
-use sesync::bridge::{notify, ntfy, start, uploads, usage};
+use sesync::bridge::{notify, ntfy, start, transfer, uploads, usage};
 use sesync::bridge::dictation::{Dictation, Whisper};
 use sesync::bridge::keys;
 use sesync::bridge::net;
@@ -81,6 +81,7 @@ async fn start_with(dir: PathBuf, catalog: Arc<dyn Catalog>, herdr: Arc<dyn herd
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
+            transfers: transfer::Store::default(),
             dictation: Dictation::new(Whisper::from_env()),
             launch: start::Launch::default(),
         },
@@ -1046,6 +1047,7 @@ async fn live_world(name: &str, scenario: &str, push: Option<ntfy::Config>) -> O
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        transfers: transfer::Store::default(),
         dictation: Dictation::new(Whisper::from_env()),
         launch: start::Launch::resuming(resume),
     };
@@ -1609,6 +1611,7 @@ async fn a_claude_and_an_opencode_chat_follows_its_turns_and_sends_into_its_pane
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        transfers: transfer::Store::default(),
         dictation: Dictation::new(Whisper::from_env()),
         launch: start::Launch::default(),
     };
@@ -1727,6 +1730,7 @@ async fn dictation_bridge(name: &str, whisper: Whisper) -> Bridge {
         notify: notify::Hub::new(None),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        transfers: transfer::Store::default(),
         dictation: Dictation::new(whisper),
         launch: start::Launch::default(),
     };

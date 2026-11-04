@@ -32,6 +32,7 @@ pub mod notify;
 pub mod ntfy;
 pub mod start;
 pub mod transcript;
+pub mod transfer;
 pub mod uploads;
 pub mod usage;
 

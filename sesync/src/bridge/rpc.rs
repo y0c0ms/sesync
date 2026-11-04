@@ -27,6 +27,7 @@ use super::terminals::{self, Running};
 use super::transcript;
 use super::turns::{LockTools, Turns};
 use super::uploads;
+use super::transfer;
 use super::usage;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -68,6 +69,8 @@ pub struct Ctx {
     pub usage: usage::Store,
     /// Image uploads in progress, by upload id.
     pub uploads: uploads::Store,
+    /// File transfers in progress, both ways (`transfer.rs`).
+    pub transfers: transfer::Store,
     /// Phone dictation: the one dictation in progress, and the whisper server it transcribes through.
     pub dictation: Dictation,
     /// How this host starts agent sessions (`preflight.detectAgents`, `agentSession.create`).
@@ -109,6 +112,14 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn, caller: Kind) -> Option
         "clipboard.commitImageUpload" => uploads::commit(&params, ctx),
         "clipboard.abortImageUpload" => uploads::abort(&params, ctx),
         "clipboard.saveImageAsTempFile" => uploads::save_temp_file(&params, ctx),
+        "files.inbox" => transfer::inbox(ctx),
+        "files.startUpload" => transfer::start_upload(&params, ctx),
+        "files.appendUploadChunk" => transfer::append_upload(&params, ctx),
+        "files.commitUpload" => transfer::commit_upload(&params, ctx),
+        "files.abortUpload" => transfer::abort_upload(&params, ctx),
+        "files.startDownload" => transfer::start_download(&params, ctx),
+        "files.readDownloadChunk" => transfer::read_download_chunk(&params, ctx),
+        "files.endDownload" => transfer::end_download(&params, ctx),
         "preflight.detectAgents" => start::detect_agents(&params, ctx),
         "settings.get" => start::settings_get(&params, ctx),
         "session.tabs.createTerminal" => start::create_terminal_tab(&params, ctx),
@@ -641,6 +652,7 @@ mod tests {
             notify: notify::Hub::new(None),
             usage: usage::Store::default(),
             uploads: uploads::Store::default(),
+            transfers: transfer::Store::default(),
             dictation: crate::bridge::dictation::Dictation::new(crate::bridge::dictation::Whisper::from_env()),
             launch: start::Launch::default(),
         }

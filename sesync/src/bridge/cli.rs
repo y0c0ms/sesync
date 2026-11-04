@@ -6,7 +6,7 @@ use super::herdr::{self, Herdr};
 use super::offer::{self, Offer};
 use super::rpc::{self, Ctx};
 use super::turns::{LockTools, Turns};
-use super::{dictation, devices, keys, net, notify, ntfy, server, start, uploads, usage, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
+use super::{dictation, devices, keys, net, notify, ntfy, server, start, transfer, uploads, usage, DEFAULT_ALLOW, DEFAULT_ENDPOINT, DEFAULT_PORT};
 use crate::qr;
 use qrcodegen::QrCode;
 use std::collections::HashMap;
@@ -174,6 +174,7 @@ fn serve(args: &[String], dir: &Path, machines: &Path, sessions: Sessions, locks
         notify: notify::Hub::new(push),
         usage: usage::Store::default(),
         uploads: uploads::Store::default(),
+        transfers: transfer::Store::default(),
         dictation: dictation::Dictation::new(whisper),
         launch: start::Launch::from_env(locations, home, &herdr_socket),
     };

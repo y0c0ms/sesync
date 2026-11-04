@@ -12,7 +12,9 @@ const USAGE: &str = "usage: sesync machine add <name> <pairing link>   (from `se
        sesync machine list [<name>]
        sesync machine attach <name> <conversation title or id> [--open]   (Ctrl-] detaches)
        sesync machine remove <name>
-       sesync machine endpoint <name> <ws://address> | --clear   (dial that machine here, kept over a new grant)";
+       sesync machine endpoint <name> <ws://address> | --clear   (dial that machine here, kept over a new grant)
+       sesync machine send <name> <file or folder>   (into that machine's inbox; a folder goes as a zip)
+       sesync machine get <name> <path on that machine> [<folder here>]   (a folder comes as a zip; default folder: here)";
 
 enum Fail {
     Usage(String),
@@ -31,7 +33,10 @@ pub fn run(args: &[String], path: &Path) -> i32 {
         ["remove", name] => remove(path, name),
         ["endpoint", name, "--clear"] => endpoint(path, name, None),
         ["endpoint", name, address] => endpoint(path, name, Some(address)),
-        _ => Err(Fail::Usage("expected add, list, attach, remove or endpoint with their arguments".into())),
+        ["send", name, source] => send(path, name, source),
+        ["get", name, remote] => get(path, name, remote, "."),
+        ["get", name, remote, into] => get(path, name, remote, into),
+        _ => Err(Fail::Usage("expected add, list, attach, remove, endpoint, send or get with their arguments".into())),
     };
     match result {
         Ok(()) => 0,
@@ -96,6 +101,22 @@ fn named(path: &Path, name: &str) -> Result<Machine, Fail> {
 
 fn runtime() -> Result<tokio::runtime::Runtime, Fail> {
     tokio::runtime::Runtime::new().map_err(|e| Fail::Failed(format!("cannot start the runtime: {e}")))
+}
+
+/// `send`: a file, or a folder as a zip, into the other machine's inbox.
+fn send(path: &Path, name: &str, source: &str) -> Result<(), Fail> {
+    let machine = named(path, name)?;
+    let done = runtime()?.block_on(super::send::send(&machine, Path::new(source))).map_err(Fail::Failed)?;
+    println!("{}", super::send::describe_sent(&machine.name, &done));
+    Ok(())
+}
+
+/// `get`: a file, or a folder as a zip, from the other machine into a folder here.
+fn get(path: &Path, name: &str, remote: &str, into: &str) -> Result<(), Fail> {
+    let machine = named(path, name)?;
+    let done = runtime()?.block_on(super::send::get(&machine, remote, Path::new(into))).map_err(Fail::Failed)?;
+    println!("{}", super::send::describe_got(&done));
+    Ok(())
 }
 
 /// Each machine (or only `only`), then its conversations: state, title, harness, project, id.

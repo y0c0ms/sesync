@@ -6,5 +6,6 @@
 pub mod attach;
 pub mod cli;
 pub mod client;
+pub mod send;
 pub mod store;
 pub mod tab;
