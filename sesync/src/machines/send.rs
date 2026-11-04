@@ -1,7 +1,7 @@
 //! `sesync machine send` and `sesync machine get`: move a file or a folder between this machine and another one
 //! over the bridge link, the way the phone moves an image.
 //!
-//! `send <machine> <path>` uploads a file into the other machine's inbox (`files.startUpload` and its chunks,
+//! `send <machine> <path>` uploads a file into the other machine's inbox (`transfer.startUpload` and its chunks,
 //! `bridge::transfer`); a folder is zipped here first. `get <machine> <path-there> [<folder-here>]` downloads a
 //! file, or a folder as a zip, from the other machine into a folder on this one (the current directory by default).
 
@@ -45,15 +45,15 @@ async fn upload(machine: &Machine, file: &Path, name: &str) -> Result<Done, Stri
     let size = std::fs::metadata(file).map_err(|e| e.to_string())?.len();
     let (mut writer, mut reader) = client::connect(machine).await?;
     let announced = (size as f64 / 3.0).ceil() as u64 * 4;
-    let started = client::call(&mut writer, &mut reader, "files.startUpload", json!({ "name": name, "expectedBase64Length": announced })).await?;
+    let started = client::call(&mut writer, &mut reader, "transfer.startUpload", json!({ "name": name, "expectedBase64Length": announced })).await?;
     let id = started["uploadId"].as_str().ok_or("the machine did not return an upload id")?.to_string();
     match push_chunks(&mut writer, &mut reader, &id, file).await {
         Ok(()) => {
-            let done = client::call(&mut writer, &mut reader, "files.commitUpload", json!({ "uploadId": id })).await?;
+            let done = client::call(&mut writer, &mut reader, "transfer.commitUpload", json!({ "uploadId": id })).await?;
             Ok(Done { path: done["path"].as_str().unwrap_or("").to_string(), bytes: done["bytes"].as_u64().unwrap_or(size) })
         }
         Err(e) => {
-            let _ = client::call(&mut writer, &mut reader, "files.abortUpload", json!({ "uploadId": id })).await;
+            let _ = client::call(&mut writer, &mut reader, "transfer.abortUpload", json!({ "uploadId": id })).await;
             Err(e)
         }
     }
@@ -70,7 +70,7 @@ async fn push_chunks(writer: &mut Writer, reader: &mut Reader, id: &str, file: &
         }
         // A chunk of whole 3-byte groups encodes without padding, so the base64 offsets line up.
         let text = STANDARD.encode(&buffer[..n]);
-        client::call(writer, reader, "files.appendUploadChunk", json!({ "uploadId": id, "offset": offset, "contentBase64": text })).await?;
+        client::call(writer, reader, "transfer.appendUploadChunk", json!({ "uploadId": id, "offset": offset, "contentBase64": text })).await?;
         offset += text.len() as u64;
     }
 }
@@ -91,12 +91,12 @@ fn read_full(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize
 pub async fn get(machine: &Machine, remote: &str, into: &Path) -> Result<Done, String> {
     std::fs::create_dir_all(into).map_err(|e| format!("cannot create {}: {e}", into.display()))?;
     let (mut writer, mut reader) = client::connect(machine).await?;
-    let started = client::call(&mut writer, &mut reader, "files.startDownload", json!({ "path": remote })).await?;
+    let started = client::call(&mut writer, &mut reader, "transfer.startDownload", json!({ "path": remote })).await?;
     let id = started["downloadId"].as_str().ok_or("the machine did not return a download id")?.to_string();
     let name = safe_name(started["name"].as_str().unwrap_or("download"));
     let size = started["bytes"].as_u64().unwrap_or(0);
     let result = pull_chunks(&mut writer, &mut reader, &id, into, &name, size).await;
-    let _ = client::call(&mut writer, &mut reader, "files.endDownload", json!({ "downloadId": id })).await;
+    let _ = client::call(&mut writer, &mut reader, "transfer.endDownload", json!({ "downloadId": id })).await;
     result
 }
 
@@ -105,7 +105,7 @@ async fn pull_chunks(writer: &mut Writer, reader: &mut Reader, id: &str, into: &
     let mut offset = 0u64;
     let outcome: Result<(), String> = async {
         loop {
-            let part = client::call(writer, reader, "files.readDownloadChunk", json!({ "downloadId": id, "offset": offset })).await?;
+            let part = client::call(writer, reader, "transfer.readDownloadChunk", json!({ "downloadId": id, "offset": offset })).await?;
             let bytes = STANDARD
                 .decode(part["contentBase64"].as_str().ok_or("the machine sent a chunk without content")?)
                 .map_err(|_| "the machine sent a chunk that is not base64".to_string())?;

@@ -1,15 +1,15 @@
 //! Files moved over the bridge, in both directions, for any paired client: the phone and a `sesync machine`
 //! client such as the work PC.
 //!
-//! **Upload (client to this machine).** `files.startUpload {name, expectedBase64Length?}` opens an upload,
-//! `files.appendUploadChunk {uploadId, offset, contentBase64}` sends the base64 text in order, and
-//! `files.commitUpload {uploadId}` closes it and returns `{path, name, bytes}`. The file lands in the inbox
+//! **Upload (client to this machine).** `transfer.startUpload {name, expectedBase64Length?}` opens an upload,
+//! `transfer.appendUploadChunk {uploadId, offset, contentBase64}` sends the base64 text in order, and
+//! `transfer.commitUpload {uploadId}` closes it and returns `{path, name, bytes}`. The file lands in the inbox
 //! folder (see [`inbox_dir`]) under a sanitised name; an existing file is never overwritten, a counter is added
 //! to the name instead. Chunks are decoded as they arrive into `.<id>.part` in the inbox and renamed at commit.
 //!
-//! **Download (this machine to the client).** `files.startDownload {path}` names any file or directory on this
+//! **Download (this machine to the client).** `transfer.startDownload {path}` names any file or directory on this
 //! host. A directory is zipped to a staging file first. It returns `{downloadId, name, bytes}`;
-//! `files.readDownloadChunk {downloadId, offset}` returns the next piece, and `files.endDownload {downloadId}`
+//! `transfer.readDownloadChunk {downloadId, offset}` returns the next piece, and `transfer.endDownload {downloadId}`
 //! forgets it (and removes a staged zip). Reach is the same as for images: a paired client already types into
 //! shells on this host, so a file adds no reach (BRIDGE.md, "Security").
 //!
@@ -35,7 +35,7 @@ use super::ensure_owner_dir;
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// The largest chunk a client sends, in base64 characters (the same as images).
 const MAX_CHUNK_BASE64_CHARS: usize = 512 * 1024;
-/// The bytes `files.readDownloadChunk` returns at most: 384 KiB, so its base64 text stays under 512 Ki characters.
+/// The bytes `transfer.readDownloadChunk` returns at most: 384 KiB, so its base64 text stays under 512 Ki characters.
 const DOWNLOAD_CHUNK_BYTES: usize = 384 * 1024;
 /// Transfers in progress at once, each way.
 const MAX_CONCURRENT: usize = 8;
@@ -279,27 +279,27 @@ fn claim_name(dir: &Path, name: &str, part: &Path) -> Result<PathBuf, Failure> {
 // ---------------------------------------------------------------------------------------------------------
 // RPC entry points
 
-/// `files.inbox`: `{path}`, the folder files arrive in.
+/// `transfer.inbox`: `{path}`, the folder files arrive in.
 pub fn inbox(ctx: &Ctx) -> Result<Value, Failure> {
     Ok(json!({ "path": inbox_dir(&ctx.dir).to_string_lossy() }))
 }
 
-/// `files.startUpload`: `{uploadId}`.
+/// `transfer.startUpload`: `{uploadId}`.
 pub fn start_upload(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     start_upload_in(&ctx.transfers, &ctx.dir, params)
 }
 
-/// `files.appendUploadChunk`: `{ok: true}`.
+/// `transfer.appendUploadChunk`: `{ok: true}`.
 pub fn append_upload(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     append_upload_in(&ctx.transfers, params)
 }
 
-/// `files.commitUpload`: `{path, name, bytes}`.
+/// `transfer.commitUpload`: `{path, name, bytes}`.
 pub fn commit_upload(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     commit_upload_in(&ctx.transfers, params)
 }
 
-/// `files.abortUpload`: `{ok: true}`.
+/// `transfer.abortUpload`: `{ok: true}`.
 pub fn abort_upload(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     let id = id_of(params, "uploadId")?;
     let mut uploads = ctx.transfers.uploads.lock();
@@ -308,17 +308,17 @@ pub fn abort_upload(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     Ok(json!({ "ok": true }))
 }
 
-/// `files.startDownload`: `{downloadId, name, bytes}`.
+/// `transfer.startDownload`: `{downloadId, name, bytes}`.
 pub fn start_download(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     start_download_in(&ctx.transfers, &ctx.dir, params)
 }
 
-/// `files.readDownloadChunk`: `{offset, contentBase64, done}`.
+/// `transfer.readDownloadChunk`: `{offset, contentBase64, done}`.
 pub fn read_download_chunk(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     read_download_chunk_in(&ctx.transfers, params)
 }
 
-/// `files.endDownload`: `{ok: true}`.
+/// `transfer.endDownload`: `{ok: true}`.
 pub fn end_download(params: &Value, ctx: &Ctx) -> Result<Value, Failure> {
     let id = id_of(params, "downloadId")?;
     let mut downloads = ctx.transfers.downloads.lock();

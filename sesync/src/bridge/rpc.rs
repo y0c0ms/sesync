@@ -112,14 +112,14 @@ pub fn dispatch(request: &Value, ctx: &Ctx, conn: &Conn, caller: Kind) -> Option
         "clipboard.commitImageUpload" => uploads::commit(&params, ctx),
         "clipboard.abortImageUpload" => uploads::abort(&params, ctx),
         "clipboard.saveImageAsTempFile" => uploads::save_temp_file(&params, ctx),
-        "files.inbox" => transfer::inbox(ctx),
-        "files.startUpload" => transfer::start_upload(&params, ctx),
-        "files.appendUploadChunk" => transfer::append_upload(&params, ctx),
-        "files.commitUpload" => transfer::commit_upload(&params, ctx),
-        "files.abortUpload" => transfer::abort_upload(&params, ctx),
-        "files.startDownload" => transfer::start_download(&params, ctx),
-        "files.readDownloadChunk" => transfer::read_download_chunk(&params, ctx),
-        "files.endDownload" => transfer::end_download(&params, ctx),
+        "transfer.inbox" => transfer::inbox(ctx),
+        "transfer.startUpload" => transfer::start_upload(&params, ctx),
+        "transfer.appendUploadChunk" => transfer::append_upload(&params, ctx),
+        "transfer.commitUpload" => transfer::commit_upload(&params, ctx),
+        "transfer.abortUpload" => transfer::abort_upload(&params, ctx),
+        "transfer.startDownload" => transfer::start_download(&params, ctx),
+        "transfer.readDownloadChunk" => transfer::read_download_chunk(&params, ctx),
+        "transfer.endDownload" => transfer::end_download(&params, ctx),
         "preflight.detectAgents" => start::detect_agents(&params, ctx),
         "settings.get" => start::settings_get(&params, ctx),
         "session.tabs.createTerminal" => start::create_terminal_tab(&params, ctx),
@@ -185,13 +185,18 @@ pub fn error(id: &Value, code: &str, message: &str) -> Value {
     })
 }
 
+/// The capability string `status.get` lists when this bridge serves the `transfer.*` methods (docs/BRIDGE.md, "File
+/// transfer"). The app's other features read `capabilities` with `includes(<their own string>)`, so an unfamiliar entry
+/// changes nothing else. A client checks for it before offering to send a file, instead of calling and failing.
+pub const FILE_TRANSFER_CAPABILITY: &str = "sesync.file-transfer.v1";
+
 fn status(host: &Host) -> Value {
     json!({
         "runtimeId": RUNTIME_ID,
         "appVersion": env!("CARGO_PKG_VERSION"),
         "protocolVersion": PROTOCOL_VERSION,
         "minCompatibleMobileVersion": MIN_COMPATIBLE_MOBILE_VERSION,
-        "capabilities": [],
+        "capabilities": [FILE_TRANSFER_CAPABILITY],
         "floatingWorkspaceEnabled": false,
         "hostPlatform": host.platform,
         "machineName": host.machine_name,
@@ -708,7 +713,9 @@ mod tests {
         assert_eq!(result["protocolVersion"], 3);
         assert_eq!(result["minCompatibleMobileVersion"], 2);
         assert_eq!(result["hostPlatform"], "linux");
-        assert_eq!(result["capabilities"], json!([]));
+        // The one capability this bridge advertises: the phone shows its Send file action only when it is listed.
+        assert_eq!(result["capabilities"], json!([FILE_TRANSFER_CAPABILITY]));
+        assert_eq!(FILE_TRANSFER_CAPABILITY, "sesync.file-transfer.v1");
         assert!(result["appVersion"].is_string());
     }
 
