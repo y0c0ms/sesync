@@ -150,7 +150,7 @@ fn esc_closes_the_palette() {
 }
 
 #[test]
-fn tab_cycles_sessions_team_machines_and_settings() {
+fn tab_cycles_sessions_team_and_machines() {
     let sb = sandbox("tab");
     let mut a = app(&sb);
     assert_eq!(a.view(), View::Sessions);
@@ -158,8 +158,6 @@ fn tab_cycles_sessions_team_machines_and_settings() {
     assert_eq!(a.view(), View::Team);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Machines);
-    a.handle(Ev::Tab, Instant::now());
-    assert_eq!(a.view(), View::Settings);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Sessions);
     let _ = fs::remove_dir_all(&sb);

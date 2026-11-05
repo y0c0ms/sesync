@@ -35,7 +35,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::Sessions => draw_sessions(f, app, th, chunks[1]),
         View::Team => draw_team(f, app, th, chunks[1]),
         View::Machines => draw_machines(f, app, th, chunks[1]),
-        View::Settings => draw_settings(f, app, th, chunks[1]),
     }
 
     let status_line = match app.mode() {
@@ -123,7 +122,6 @@ fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Span::styled("│", Style::default().fg(th.dim)),
         Span::styled(format!(" Machines ({}) ", app.machine_count()), style(View::Machines)),
         Span::styled("│", Style::default().fg(th.dim)),
-        Span::styled(" Settings ", style(View::Settings)),
         Span::styled(format!("   {daemon}"), Style::default().fg(daemon_color)),
         Span::styled(format!(" · {ok} copies in place, {failing} failing"),
             Style::default().fg(if failing > 0 { th.error } else { th.dim })),
@@ -1007,7 +1005,6 @@ fn draw_help(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         View::Sessions => "Keys: sessions",
         View::Team => "Keys: team",
         View::Machines => "Keys: machines",
-        View::Settings => "Keys: settings",
     };
     let inner = dialog(f, title, th,
         centered(74, height, area));

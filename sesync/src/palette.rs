@@ -16,6 +16,7 @@ pub enum Action {
     SwitchView,
     Quit,
     Theme,
+    Folder,
     Enroll,
     Register,
     Invite,
@@ -42,6 +43,7 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::SwitchView, title: "Switch tab", key: "tab", event: Ev::Tab },
     Def { action: Action::Quit, title: "Quit", key: "q", event: Ev::Char('q') },
     Def { action: Action::Theme, title: "Colour scheme", key: "ctrl+t", event: Ev::Theme },
+    Def { action: Action::Folder, title: "Files folder", key: "", event: Ev::OpenFolder },
     Def { action: Action::Enroll, title: "Join a team", key: "", event: Ev::OpenEnroll },
     Def { action: Action::Register, title: "Start a team", key: "", event: Ev::OpenRegister },
     Def { action: Action::Members, title: "Team members", key: "", event: Ev::OpenMembers },
@@ -78,24 +80,24 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
             (View::Sessions, true) => Ok(()),
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("older sessions are on the Team tab; press tab"),
-            (View::Machines | View::Settings, _) => Err("local sessions are on the Sessions tab; press tab"),
+            (View::Machines, _) => Err("local sessions are on the Sessions tab; press tab"),
         },
         Action::Share => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
-            (View::Machines | View::Settings, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.team_configured { Ok(()) } else { Err("no team configured; join one first") },
         },
         Action::Unshare => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
-            (View::Machines | View::Settings, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.session_shared { Ok(()) } else { Err("this session is not shared with any team") },
         },
         Action::Import => match (ctx.view, ctx.team_selected) {
             (View::Team, true) => Ok(()),
             (View::Team, false) => Err("no team session selected"),
-            (View::Sessions | View::Machines | View::Settings, _) => Err("team sessions are on the Team tab; press tab"),
+            (View::Sessions | View::Machines, _) => Err("team sessions are on the Team tab; press tab"),
         },
         Action::RefreshTeam => {
             if ctx.team_configured || ctx.view == View::Machines {
@@ -113,7 +115,7 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
         },
         Action::Leave => if ctx.teams_here { Ok(()) } else { Err("no team on this machine") },
         Action::Resolve => ctx.resolve,
-        Action::SwitchView | Action::Quit | Action::Theme | Action::Enroll | Action::Register => Ok(()),
+        Action::SwitchView | Action::Quit | Action::Theme | Action::Folder | Action::Enroll | Action::Register => Ok(()),
     }
 }
 

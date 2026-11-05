@@ -76,7 +76,7 @@ impl App {
 
     /// Whether the Settings tab is the one shown.
     pub fn on_settings(&self) -> bool {
-        self.view == View::Settings
+        false
     }
 
     /// The config directory of this run, for the Settings tab.

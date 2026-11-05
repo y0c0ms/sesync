@@ -16,12 +16,10 @@ fn sandbox(name: &str) -> PathBuf {
     d
 }
 
-/// An app whose config directory is `<sb>/config`, already on the Settings tab.
+/// An app whose config directory is `<sb>/config`. The folder is chosen from the command palette: "Files folder".
 fn on_settings(sb: &Path) -> App {
     let mut a = App::new(Roots::under(sb, sb.join("no-sesync-conv")), State::default(), sb.join("locks"), sb.join("no-sesync_lock"));
     a.set_config_dir(sb.join("config"));
-    a.restore_prefs(None, Some(View::Settings));
-    assert_eq!(a.view(), View::Settings);
     a
 }
 
@@ -42,7 +40,7 @@ fn enter_types_a_folder_and_the_bridge_uses_it_from_the_next_upload() {
     let mut a = on_settings(&sb);
     assert!(a.inbox_is_default(), "nothing is chosen yet");
     let chosen = sb.join("received files");
-    a.handle(Ev::Enter, Instant::now());
+    a.handle(Ev::OpenFolder, Instant::now());
     assert_eq!(a.mode(), Mode::Settings);
     // The buffer starts at the current folder; clear it and type the new one.
     while !a.input().is_empty() {
@@ -62,7 +60,7 @@ fn a_folder_that_cannot_be_used_is_refused_and_the_old_one_stays() {
     let sb = sandbox("refuse");
     let mut a = on_settings(&sb);
     let before = bridge_inbox(&sb);
-    a.handle(Ev::Enter, Instant::now());
+    a.handle(Ev::OpenFolder, Instant::now());
     while !a.input().is_empty() {
         a.handle(Ev::Backspace, Instant::now());
     }
@@ -88,9 +86,13 @@ fn esc_leaves_the_folder_as_it_was() {
 }
 
 #[test]
-fn the_settings_tab_is_remembered_across_runs() {
-    let sb = sandbox("prefs");
-    let config = sb.join("config");
-    prefs::save(&config, "", View::Settings).unwrap();
-    assert_eq!(prefs::load(&config).view, Some(View::Settings));
+fn the_files_folder_is_in_the_command_palette_and_opens_the_edit() {
+    let sb = sandbox("palette");
+    let mut a = on_settings(&sb);
+    a.handle(Ev::CtrlP, Instant::now());
+    // Type the title: it is the only entry the query matches, so Enter runs it.
+    type_text(&mut a, "Files folder");
+    a.handle(Ev::Enter, Instant::now());
+    assert_eq!(a.mode(), Mode::Settings, "choosing Files folder opens the folder edit");
+    let _ = fs::remove_dir_all(&sb);
 }

@@ -326,8 +326,6 @@ fn the_last_tab_and_theme_come_back_on_the_next_run() {
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Machines);
     a.handle(Ev::Tab, Instant::now());
-    assert_eq!(a.view(), View::Settings);
-    a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Sessions);
     a.restore_prefs(None, Some(View::Team));
     assert_eq!(a.view(), View::Team, "restore brings the last tab back");

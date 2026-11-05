@@ -49,7 +49,6 @@ pub mod prefs {
                 Some("team") => Some(View::Team),
                 Some("sessions") => Some(View::Sessions),
                 Some("machines") => Some(View::Machines),
-                Some("settings") => Some(View::Settings),
                 _ => None,
             },
         }
@@ -62,7 +61,7 @@ pub mod prefs {
         }
         let v = json!({
             "theme": theme_name,
-            "view": match view { View::Sessions => "sessions", View::Team => "team", View::Machines => "machines", View::Settings => "settings" },
+            "view": match view { View::Sessions => "sessions", View::Team => "team", View::Machines => "machines" },
         });
         std::fs::write(&file, serde_json::to_vec_pretty(&v)?)?;
         Ok(())
@@ -163,7 +162,6 @@ pub enum View {
     Sessions,
     Team,
     Machines,
-    Settings,
 }
 
 /// The `f` cycle on the Sessions tab: which subset of sessions is listed.
@@ -214,6 +212,8 @@ pub enum Ev {
     Theme,
     /// Open the join-a-team dialog (from the command list).
     OpenEnroll,
+    /// The files folder, from the command palette: the same edit the settings tab used to host.
+    OpenFolder,
     /// Open the start-a-team dialog (from the command list).
     OpenRegister,
     /// Open the invite dialog (from the command list, admin only).
@@ -778,7 +778,6 @@ impl App {
                 }
                 View::Team => "i import · enter resolve · ctrl+r pull · ? help · ctrl+p cmds · tab machines · q quit".to_string(),
                 View::Machines => "enter attach · o attach, opening a closed one · ctrl+r refresh · ? help · ctrl+p cmds · tab settings · q quit".to_string(),
-                View::Settings => "enter change folder · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
             },
         }
     }
@@ -1491,9 +1490,9 @@ impl App {
                 View::Sessions => self.refresh_local(),
                 View::Team => self.refresh_requested = true,
                 View::Machines => self.refresh_machines_now(),
-                View::Settings => {}
             },
             Ev::OpenEnroll => self.open_form(Kind::Enroll, &[]),
+            Ev::OpenFolder => self.begin_inbox_edit(),
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
             Ev::OpenInvite => self.open_invite(),
             Ev::OpenMembers => self.open_members(),
@@ -1532,11 +1531,10 @@ impl App {
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
             Ev::Enter if self.view == View::Team => self.enter_team(),
             Ev::Enter if self.view == View::Machines => self.enter_machine(false),
-            Ev::Enter if self.view == View::Settings => self.begin_inbox_edit(),
             Ev::Enter | Ev::CtrlP => self.open_palette(),
             Ev::Tab => self.switch_view(),
             Ev::Char('i') => match self.view {
-                View::Sessions | View::Machines | View::Settings => self.say("team sessions are on the Team tab; press tab"),
+                View::Sessions | View::Machines => self.say("team sessions are on the Team tab; press tab"),
                 View::Team => self.ask_import(),
             },
             Ev::Char('m') => {
@@ -1638,7 +1636,6 @@ impl App {
             View::Sessions => self.move_selection(delta),
             View::Team => self.move_team(delta),
             View::Machines => self.move_machines(delta),
-            View::Settings => {}
         }
     }
 
@@ -1790,12 +1787,6 @@ impl App {
                 ("enter", "attach to the selected conversation in a new herdr tab (a closed one stays closed)"),
                 ("o", "attach to it, and open a closed conversation there"),
                 ("ctrl+r", "refresh every machine's conversation list now"),
-                ("tab", "switch to the settings"),
-                ("ctrl+p", "open the command list"),
-                ("q / esc", "quit"),
-            ],
-            View::Settings => vec![
-                ("enter", "change the folder files from other machines and the phone arrive in"),
                 ("tab", "switch to the sessions list"),
                 ("ctrl+p", "open the command list"),
                 ("q / esc", "quit"),
@@ -1805,13 +1796,12 @@ impl App {
 
     /// Switch between the local list and the team list. Each keeps its own cursor.
     fn switch_view(&mut self) {
-        // Tab only moves between the views: Sessions, Team, Machines, Settings, and back. Opening a bridge session from
+        // Tab only moves between the views: Sessions, Team, Machines, and back. Opening a bridge session from
         // Machines ends the popup on its own (see `run_pending_attach`).
         self.view = match self.view {
             View::Sessions => View::Team,
             View::Team => View::Machines,
-            View::Machines => View::Settings,
-            View::Settings => View::Sessions,
+            View::Machines => View::Sessions,
         };
         self.prefs_dirty = true;
         // Opening the Team tab shows what the team holds now, not what this run saw a while ago.
