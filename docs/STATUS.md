@@ -23,6 +23,12 @@ earlier sessions is in `git log`.
 - Live team acceptance suite (`TEAM_REQUIRE_PG=1`, real Postgres and team-server): 1174 passed, 0 failed.
 - CI (`.github/workflows/ci.yml`) builds and tests Linux, macOS and Windows on pushes to `main` and on pull requests.
 
+### Published
+
+- GitHub release `v0.1.0`: Linux x64 (built in a Debian 12 container, glibc 2.36 or newer, smoke-tested on Ubuntu 24.04) and Windows x64 (cargo-xwin, smoke-tested under Wine) archives with `SHA256SUMS`, packaged the way `release.yml` does. No macOS archive: GitHub Actions does not run for this repository at the moment, so `release.yml`, `ci.yml` and `pages.yml` have not run on GitHub.
+- Project page `https://y0c0ms.github.io/sesync/`: served from the `gh-pages` branch (a build of `site/`) until Actions runs; then switch Pages to "GitHub Actions" and `pages.yml` deploys it.
+- The GIFs are recorded by `site/demo` (see `make-demo.sh`'s header).
+
 ### Not verified
 
 - Windows and macOS outside CI: the login-start paths, attach in Windows Terminal, and machine prompts from a Windows host.
