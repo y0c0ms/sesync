@@ -105,7 +105,7 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
 
     // The writer's daemon pass: the session is marked and quiet, so it is sealed and pushed.
     std::env::set_var("SESYNC_TEAM_URL", &base);
-    let journal = b"{\"type\":\"session\"}\nthe team pass session\n".to_vec();
+    let journal = b"{\"type\":\"session\",\"version\":3,\"id\":\"ses_pass\",\"cwd\":\"/tmp\"}\n{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n{\"type\":\"message\",\"id\":\"a1\",\"parentId\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"the team pass session\"}]}}\n".to_vec();
     let mut state = State::default();
     state.share("ses_pass", "personal");
     let content = |id: &str| -> Result<Vec<u8>, String> {
@@ -117,7 +117,7 @@ fn the_daemon_team_pass_delivers_a_marked_session_to_the_reader() {
     assert_eq!(passes.len(), 1, "the machine belongs to one team here");
     let pass = &passes[0];
     assert_eq!(pass.pushed, vec!["ses_pass".to_string()], "the shared, quiet session is pushed: {pass:?}");
-    assert!(state.team_hash("team-a", "ses_pass").is_some(), "the push is recorded in state");
+    assert!(state.team_hash("personal", "ses_pass").is_some(), "the push is recorded in state");
     let _ = writer_cred;
 
     // The database holds the session only as ciphertext.

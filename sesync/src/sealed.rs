@@ -18,7 +18,7 @@ use sesync_team::membership::{SignedList, Verifier};
 use sesync_team::session_keys::{
     open_session_bound, seal_session_bound, session_aad, unwrap_for, wrap_for, DataKey, Wrap,
 };
-use sesync_team::signed_records::{open_record, seal_record, Binding, Opened, RecordError};
+use sesync_team::signed_records::{authorship, open_own, open_record, seal_record, Binding, Opened, RecordError};
 
 use crate::device_keys::DeviceFile;
 
@@ -138,15 +138,43 @@ pub fn open_for_device(reader: &DeviceFile, trust: &Trust, expect: &Binding, rec
 {
     let verifier = trust.verifier()?;
     let opened = open_record(&verifier, expect, record)?;
-    let (wraps, body) = decode_payload(&opened.content).ok_or(SealError::Malformed)?;
+    let text = unseal_content(reader, &expect.space, &expect.conversation, opened.sequence, &opened.content)?;
+    Ok(Opened { content: text, sequence: opened.sequence, list_version: opened.list_version })
+}
+
+/// The session text of a record this device wrote itself, whatever member list it was sealed under:
+/// the record's own signature proves the author (`signed_records::open_own`). Any other author is
+/// refused. Only a writer reading back its own last push uses this; readers use `open_for_device`.
+pub fn open_own_for_device(reader: &DeviceFile, expect: &Binding, record: &[u8]) -> Result<Vec<u8>, SealError> {
+    let opened = open_own(expect, reader.public_signing(), record)?;
+    unseal_content(reader, &expect.space, &expect.conversation, opened.sequence, &opened.content)
+}
+
+/// The session text of a stored record, for a writer checking it before it writes (the team push
+/// guard). A record this device signed is read back as `open_own_for_device`; anyone else's must
+/// pass `open_for_device` under the current verified list, exactly as for a reader.
+pub fn open_stored_for_writer(reader: &DeviceFile, trust: &Trust, expect: &Binding, record: &[u8])
+    -> Result<Vec<u8>, SealError>
+{
+    if let Ok(a) = authorship(expect, record) {
+        if a.author == reader.public_signing() {
+            return open_own_for_device(reader, expect, record);
+        }
+    }
+    open_for_device(reader, trust, expect, record).map(|o| o.content)
+}
+
+/// Unwrap this device's key from a record's payload and open the body. The body's associated data
+/// is built from the space, conversation and sequence the record was checked against.
+fn unseal_content(reader: &DeviceFile, space: &str, conversation: &str, sequence: u64, payload: &[u8])
+    -> Result<Vec<u8>, SealError>
+{
+    let (wraps, body) = decode_payload(payload).ok_or(SealError::Malformed)?;
     let me = as_device(reader)?;
     let key = unwrap_for(&me, &wraps).map_err(|_| SealError::NotForThisDevice)?;
-    // open_record has checked the record's space and conversation against `expect`, so the body's
-    // associated data is built from the same values the writer used, with the record's sequence.
-    let aad = session_aad(&expect.space, &expect.conversation, opened.sequence);
+    let aad = session_aad(space, conversation, sequence);
     let framed = open_session_bound(&key, &aad, &body).map_err(|e| SealError::Crypto(format!("{e:?}")))?;
-    let text = decode_body(&framed)?;
-    Ok(Opened { content: text, sequence: opened.sequence, list_version: opened.list_version })
+    decode_body(&framed)
 }
 
 /// Frame the session for the body AEAD: one codec byte, then the bytes. zstd is used when it makes

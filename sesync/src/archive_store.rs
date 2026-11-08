@@ -4,7 +4,7 @@
 //! and read back through the archive's checksum, so a damaged copy is an error, never
 //! silently returned. A parent id must be a plain name; it cannot climb out of the store.
 
-use crate::archive::{pack, unpack, ArchiveError};
+use crate::archive::{pack, pack_file, unpack, ArchiveError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,12 +26,9 @@ pub fn store_session(store: &Path, parent: &str, src: &Path) -> Result<PathBuf, 
     let name = src.file_name().and_then(|n| n.to_str()).ok_or("source has no file name")?;
     let dir = store.join(parent);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let original = fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    let packed = pack(&original, LEVEL);
+    // Streamed: the transcript is read in chunks and never held whole in memory.
     let dst = dir.join(format!("{name}.hsar"));
-    let tmp = dir.join(format!(".{name}.hsar.tmp"));
-    fs::write(&tmp, &packed).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &dst).map_err(|e| e.to_string())?;
+    pack_file(src, &dst, LEVEL).map_err(|e| format!("{}: {e}", src.display()))?;
     Ok(dst)
 }
 

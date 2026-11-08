@@ -10,12 +10,14 @@
 //! agy replays a tool call and its result only if the result's StepMetadata
 //! carries the matching ToolCall in payload field 5; the column alone is not enough.
 //!
-//! Dropped and counted: tool-result images (a counted placeholder line instead:
-//! agy has no slot), assistant images, other block types, non-conversation roles,
-//! results whose call never appeared (agy would replay a functionResponse with no
-//! functionCall) and second results for one call.
+//! An attachment agy has no slot for leaves a note in its place (`attach::judge`): a tool-result
+//! image, an assistant image, an image over the limit or with unreadable bytes. Dropped and
+//! counted: other block types, non-conversation roles, results whose call never appeared (agy
+//! would replay a functionResponse with no functionCall) and second results for one call.
 
 use crate::antigravity::{self as ag, with_suffix};
+use crate::attach;
+use crate::fit::Window;
 use crate::journal::{parse_iso_ms, Journal};
 use crate::protobuf::{timestamp, Writer};
 use base64::Engine;
@@ -25,6 +27,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Why a note stands in for an image this agy step does not carry.
+const REPLY_IMAGE_WHY: &str = "Antigravity's planner steps have no slot for images; kept in the source session";
+const TOOL_IMAGE_WHY: &str = "Antigravity has no slot for tool-result images; kept in the source session";
+const UNREADABLE_IMAGE_WHY: &str = "its base64 data does not decode; kept in the source session";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -97,8 +104,8 @@ fn user_step(text: &str, images: &[(String, Vec<u8>)], ms: i64) -> Step {
 }
 
 /// The steps for the journal's live window, plus the trajectory start time (ms).
-pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
-    let msgs = j.messages();
+pub fn build_steps(j: &Journal, win: &Window) -> Result<(Vec<Step>, Stats, i64), String> {
+    let msgs = &win.msgs;
     if !msgs.iter().any(|m| m.role == "user" || m.role == "assistant") {
         return Err("empty conversation: the journal has no user or assistant message".into());
     }
@@ -109,7 +116,7 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
         .unwrap_or(0);
     let mut st = Stats::default();
     let mut steps = Vec::new();
-    if let Some(note) = j.compaction_note() {
+    if let Some((note, _)) = win.note() {
         steps.push(user_step(&note, &[], start_ms));
         st.user_steps += 1;
     }
@@ -119,28 +126,37 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
     let mut answered: HashSet<String> = HashSet::new();
     let mut call_seq = 0usize;
 
-    for m in &msgs {
+    for m in msgs {
         let ms = m.timestamp_ms;
         match m.role {
             "user" => {
-                let mut texts: Vec<&str> = Vec::new();
+                let mut texts: Vec<String> = Vec::new();
                 let mut images = Vec::new();
                 for b in &m.content {
                     match b {
-                        Value::String(s) => texts.push(s),
+                        Value::String(s) => texts.push(s.clone()),
                         _ => match block_type(b) {
-                            Some("text") => texts.push(b.get("text").and_then(Value::as_str).unwrap_or("")),
-                            Some("image") => {
-                                let data = b.get("data").and_then(Value::as_str).unwrap_or("");
-                                match b64.decode(data) {
-                                    Ok(bytes) if !bytes.is_empty() => {
-                                        let mime = b.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
-                                        images.push((mime.to_string(), bytes));
-                                        st.images += 1;
+                            Some("text") => texts.push(b.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
+                            Some("image") => match attach::judge(&attach::ANTIGRAVITY, b, false) {
+                                attach::Verdict::Carry => {
+                                    let data = b.get("data").and_then(Value::as_str).unwrap_or("");
+                                    match b64.decode(data) {
+                                        Ok(bytes) if !bytes.is_empty() => {
+                                            let mime = b.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
+                                            images.push((mime.to_string(), bytes));
+                                            st.images += 1;
+                                        }
+                                        _ => {
+                                            texts.push(attach::image_note(b, UNREADABLE_IMAGE_WHY));
+                                            st.dropped_blocks += 1;
+                                        }
                                     }
-                                    _ => st.dropped_blocks += 1,
                                 }
-                            }
+                                attach::Verdict::Withhold(note) => {
+                                    texts.push(note);
+                                    st.dropped_blocks += 1;
+                                }
+                            },
                             _ => st.dropped_blocks += 1,
                         },
                     }
@@ -154,14 +170,14 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
                 st.user_steps += 1;
             }
             "assistant" => {
-                let mut texts: Vec<&str> = Vec::new();
+                let mut texts: Vec<String> = Vec::new();
                 let mut thinking: Vec<&str> = Vec::new();
                 let mut call_protos = Vec::new();
                 for b in &m.content {
                     match b {
-                        Value::String(s) => texts.push(s),
+                        Value::String(s) => texts.push(s.clone()),
                         _ => match block_type(b) {
-                            Some("text") => texts.push(b.get("text").and_then(Value::as_str).unwrap_or("")),
+                            Some("text") => texts.push(b.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
                             Some("thinking") => {
                                 let t = b.get("thinking").and_then(Value::as_str).unwrap_or("");
                                 if !t.is_empty() {
@@ -183,6 +199,10 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
                                 calls.insert(id.clone(), c);
                                 pending.push(id);
                                 st.tool_calls += 1;
+                            }
+                            Some("image") => {
+                                texts.push(attach::image_note(b, REPLY_IMAGE_WHY));
+                                st.dropped_blocks += 1;
                             }
                             _ => st.dropped_blocks += 1,
                         },
@@ -234,20 +254,18 @@ pub fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
                 pending.retain(|p| p != &id);
                 let call = &calls[&id];
                 let mut texts: Vec<String> = Vec::new();
-                let mut imgs = 0usize;
                 for b in &m.content {
                     match b {
                         Value::String(s) => texts.push(s.clone()),
                         _ => match block_type(b) {
                             Some("text") => texts.push(b.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
-                            Some("image") => imgs += 1,
+                            Some("image") => {
+                                texts.push(attach::image_note(b, TOOL_IMAGE_WHY));
+                                st.tool_result_images_dropped += 1;
+                            }
                             _ => st.dropped_blocks += 1,
                         },
                     }
-                }
-                if imgs > 0 {
-                    texts.push(format!("[{imgs} image(s) omitted: Antigravity has no slot for tool-result images]"));
-                    st.tool_result_images_dropped += imgs;
                 }
                 let is_error = m.message.get("isError").and_then(Value::as_bool).unwrap_or(false);
                 let mut g = Writer::new();
@@ -527,13 +545,13 @@ fn check_id(id: &str) -> Result<(), String> {
 }
 
 /// Convert and install. Returns the installed `.db` path, stats and stderr notes.
-pub fn install(j: &Journal, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
+pub fn install(j: &Journal, win: &Window, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
     check_id(id)?;
     let cwd = j.cwd().unwrap_or("").trim();
     if cwd.is_empty() {
         return Err("the journal header has no cwd: Antigravity lists conversations by workspace".into());
     }
-    let (steps, stats, start_ms) = build_steps(j)?;
+    let (steps, stats, start_ms) = build_steps(j, win)?;
     let dir = store.join("conversations");
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let db = dir.join(format!("{id}.db"));
@@ -557,6 +575,15 @@ pub mod tests {
     use super::*;
     use crate::from_antigravity;
     use crate::protobuf::{timestamp_ms, Msg};
+
+    /// The writer on a journal's whole live window, nothing fitted.
+    fn install(j: &Journal, store: &Path, id: &str, title: &str) -> Result<(PathBuf, Stats, Vec<String>), String> {
+        super::install(j, &j.window(), store, id, title)
+    }
+
+    fn build_steps(j: &Journal) -> Result<(Vec<Step>, Stats, i64), String> {
+        super::build_steps(j, &j.window())
+    }
 
     /// A scratch directory whose path has a space and an accent, like real Windows profiles.
     pub fn scratch(name: &str) -> PathBuf {
@@ -664,7 +691,10 @@ pub mod tests {
         assert_eq!(r1["content"][0]["text"], "line \"one\"\nline two");
         let r2 = &m[3]["message"];
         assert_eq!((r2["toolCallId"].as_str(), r2["isError"].as_bool()), (Some("call-2"), Some(true)), "result without toolCallId pairs with the pending call");
-        assert_eq!(r2["content"][0]["text"], "ls: denied\n[1 image(s) omitted: Antigravity has no slot for tool-result images]");
+        assert_eq!(
+            r2["content"][0]["text"],
+            "ls: denied\n[attachment not carried: image (image/png, 24 B) \u{2014} Antigravity has no slot for tool-result images; kept in the source session]"
+        );
         assert_eq!(m[4]["message"]["content"][0]["text"], "Done reading.");
         assert_eq!((rst.tool_calls, rst.tool_results, rst.images, rst.thinking_blocks, rst.opaque_steps), (2, 2, 1, 1, 0));
         let _ = fs::remove_dir_all(&dir);

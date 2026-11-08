@@ -485,6 +485,7 @@ fn post(base: &str, path: &str, token: Option<&str>, body: serde_json::Value) ->
 /// POST and return the status with the JSON body (Null when the body is not JSON). Err only when
 /// the server cannot be reached or a success reply is not JSON.
 fn post_status(base: &str, path: &str, token: Option<&str>, body: serde_json::Value) -> Result<(u16, serde_json::Value), String> {
+    crate::team_url::check_scheme(base)?;
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
     let mut req = agent.post(&format!("{}{path}", base.trim_end_matches('/')));
     if let Some(t) = token {

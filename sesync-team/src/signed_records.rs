@@ -218,3 +218,27 @@ pub fn authorship(expect: &Binding, rec: &[u8]) -> Result<Authorship, RecordErro
     }
     Ok(Authorship { author: p.author.to_vec(), list_version: p.list_version, sequence: p.sequence })
 }
+
+/// The checks of `open_record` for a record `me` signed, without the member list: the record must be
+/// bound to `expect`, carry `me`'s own signature, and be at or above the floor. Its content is then
+/// this writer's own text, sealed under a list it may no longer hold. Any other author is refused,
+/// so this never accepts another member's content; use `open_record` for that.
+pub fn open_own(expect: &Binding, me: &[u8], rec: &[u8]) -> Result<Opened, RecordError> {
+    let p = parse(rec)?;
+    if p.space != expect.space {
+        return Err(RecordError::WrongSpace);
+    }
+    if p.conversation != expect.conversation {
+        return Err(RecordError::WrongConversation);
+    }
+    if p.author != me {
+        return Err(RecordError::UnknownAuthor);
+    }
+    if !Device::verify(p.author, &signed_part(rec, p.sig_at), p.sig) {
+        return Err(RecordError::BadSignature);
+    }
+    if p.sequence < expect.min_sequence {
+        return Err(RecordError::Rollback { have: expect.min_sequence, got: p.sequence });
+    }
+    Ok(Opened { content: p.content.to_vec(), sequence: p.sequence, list_version: p.list_version })
+}

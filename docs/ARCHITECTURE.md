@@ -92,6 +92,14 @@ flowchart TD
     F --> SV
 ```
 
+A pass does no work for what did not change. Each session file is stat'ed once per pass. A copy's content hash is
+kept for the daemon's run, keyed by the file's identity (size, mtime in ns and inode), and dropped for copies a pass
+did not see (`mirror::CopyHashes`), so an unchanged session is read once per run, not every 5 s. A subagent transcript
+is archived once per change, streamed (`archive::pack_file`), not read whole every pass. `state.json` is written
+(temp file, fsync, rename) only when its bytes change. Measured on a real workstation's data, an idle pass went from 0.107 to
+0.004 CPU-s; with large subagent transcripts (4 × 28 MB, 1 × 340 MB) from 2.86 CPU-s and 432 MB peak RSS to 0.0035 CPU-s
+and 15 MB. The first pass after a start hashes and archives everything once.
+
 ### Writing a copy into Y
 
 ```mermaid
@@ -327,7 +335,7 @@ names a harness: outside `harness/`, no production code contains a harness id.
 | `claude/` | Claude Code | files | `~/.claude/projects/<bucket>/<uuid>.jsonl`; `CLAUDE_CONFIG_DIR` |
 | `opencode/` | OpenCode | store | `~/.local/share/opencode/opencode.db`, read-only, and the `opencode` CLI; `OPENCODE_DB`, `OPENCODE_BIN` |
 | `antigravity/` | Antigravity (`agy`) | files | `~/.gemini/antigravity-cli/conversations/<id>.db` plus its WAL; `ANTIGRAVITY_CLI_HOME`, `AGY_BIN` |
-| `journal.rs` | shared | | JSONL helpers for omp, Pi and Claude: file names, listing, windowed titles, prompt times, install through `sesync-conv to-<id>` |
+| `window.rs` | shared | | the context window of each message-based target and the `--context-*` flags of a copy (see "Context fit") |
 | `retired.rs` | Gemini CLI | retired | released at load, never deleted |
 
 The trait, by what sesync does with a harness:
@@ -340,6 +348,7 @@ The trait, by what sesync does with a harness:
 | List and read a database | `rows`, `row_title`, `fingerprint`, `export`, `remove` |
 | Move a conversation | `to_journal`, `install`, `mirror_id`, `id_in`, `copy_exists` |
 | Follow the user | `newest_prompt` (turn-taking), `rename`, `recent_messages` (the TUI's preview) |
+| Resume it | `resume_argv` (the resume command, the conversation's identifier last), `project_dir` (where it starts; `cwd` by default) |
 
 The TUI's details pane previews the highlighted session's last turns (`preview::Worker`, a
 thread of its own): `recent_messages` reads the end of the canonical journal by default (the
@@ -397,6 +406,151 @@ crate: with `harness/opencode/` deleted and a throwaway `dummy` harness added (P
 `~/.dummy`: one new file and two changed lines in `harness/mod.rs`), the library and the daemon
 compiled with no other change, and a `--once` pass mirrored an omp session into `~/.dummy` and
 recorded the copy and its sync time.
+
+## Context fit
+
+A copy written for a message-based harness (Claude Code, OpenCode, Antigravity) must fit that
+harness's context window. Before this rule the live window was written as it was: an omp session
+compacted to about 30k tokens was once exported to OpenCode as 3.4M, and a Claude transcript of
+millions of tokens was copied whole into omp.
+
+**What is kept.** `sesync-conv` builds the copy from the live window (the active branch cut at
+the last compaction, `Journal::messages`), in `sesync-conv/src/fit.rs`:
+
+1. The note, first: the compaction summary when the conversation was compacted, and a line saying
+   that turns were left out when the fit cut some.
+2. The newest user turns that fit, oldest first. A cut falls only on a user message, and only
+   where every tool result after it answers a call after it, so a call and its result always
+   travel together. A user message sent between a call and its result is not a cut point.
+3. When the note and the newest valid turn alone do not fit, the fit refuses. `sesync-conv` exits
+   with `context fit for <target>: ... nothing was written`; sesync reports it as a mirror failure
+   (`sesync-conv to-<id> failed: ...`), and the copy already in the store is left alone.
+
+**Budget.** `limit = window x share - overhead`. Defaults: share 0.75 and overhead 16384 tokens
+(the target's own prompt, tool definitions and reply). The converter takes `--context-window`,
+`--context-share` and `--context-overhead`; sesync passes them, and a run without
+`--context-window` assumes 128000.
+
+**Estimate.** No tokenizer is loaded. A string costs `ceil(bytes / 3)` tokens (only its content:
+record keys and the envelope are not counted, since the target does not show them to the model),
+an image the larger of two bounds read from its header (see "Attachments"; 1600 when the header cannot
+be read), and each message 8. Bytes per token are about 4 for English prose and about 3 for code and
+JSON, so the estimate errs high. An image the copy withholds costs its note instead. Every converter
+run prints what the fit did: `fit: <target>: kept K of N user turn(s), ~A of ~B estimated tokens (limit L)`.
+
+**Where the window comes from** (`sesync/src/harness/window.rs`, first match wins):
+
+| Source | Window | Origin |
+|---|---|---|
+| `SESYNC_CONTEXT_WINDOW_<TARGET>` | any | operator override for one target (`CLAUDE`, `OPENCODE`, `ANTIGRAVITY`) |
+| `SESYNC_CONTEXT_WINDOW` | any | operator override for every target |
+| OpenCode: `provider.<p>.models.<m>.limit.context` | the model's own | OpenCode's config, `opencode.json` or `opencode.jsonc` under `$XDG_CONFIG_HOME/opencode` (else `~/.config/opencode`), for the provider and model the journal's last assistant turn names. Comments are stripped; a file that does not parse is skipped |
+| Claude: 200000 | Anthropic's standard window for the Claude models Claude Code runs | built-in `TABLE` |
+| Anything else: 128000 | the smallest window in the table | `CONSERVATIVE_WINDOW`. Antigravity has no config to read, and its Gemini models are larger, so its large conversations are cut sooner than needed until an override is set |
+
+The model reaches the window lookup through the journal: omp and Pi name it on each assistant
+turn, `from-opencode` keeps `provider` and `model`, and `from-claude` keeps `model`.
+
+**Sources record their compactions.** Claude Code writes a `system` record with
+`subtype: "compact_boundary"` and a user record with `isCompactSummary: true` that holds the
+summary. `from-claude` turns that summary into a compaction record, so the live window starts at
+it. OpenCode writes a user message with a `compaction` part and, after it, a finished assistant
+message with `summary: true`; `from-opencode` turns the summary into a compaction record and drops
+the marker. Both journals keep the turns before the compaction, for copies that keep the whole
+file. `from-claude` also emits a user's tool results before the text in the same record (the order
+Claude's API requires), and no longer links a result to itself: the self-link broke the live
+chain of any transcript with such a record.
+
+**omp and Pi are not fitted.** `to-pi` and `to-omp` copy the whole journal, archive included.
+What the omp binary shows (read from its embedded strings; no model was called, and omp was not
+run): before each prompt, `runPrePromptCompactionIfNeeded` compares the session's token count
+with a threshold (a token count, a percentage, or the window less a reserve) and runs an
+auto-compaction when it is crossed. The summary input is rendered under frame budgets (`maxFrames`
+80), with snapcompact as the fallback, which can fail with "kept history alone exceeds the context
+budget". So a stored session over its window is expected to compact before the next prompt. Not
+verified: that an omp copy of several million tokens resumes cleanly. That needs a real resume, so
+no omp opt-in ships. If an over-window omp resume is seen to fail, the fit can be applied to omp by
+writing a fitted journal (a compaction record plus the kept turns) from `to-omp` and `to-pi`.
+
+**Where it is checked.** `sesync-conv/src/fit/tests.rs`: long omp, Claude and OpenCode sessions
+through every message-based target, the cut rule at every position, both refusals, a budget that
+fits without a cut, and image-heavy windows (whole turns with their images, the estimate from a
+known size, a withheld image costing its note). `sesync-conv/src/attach/tests.rs`: header sizes,
+tokens, limits, notes, the round trips, and the tool-result, URL, OpenCode file and many-image
+cases. `sesync/tests/context_fit.rs`: the daemon's own install path through the real converter.
+`sesync/src/harness/window.rs`: the window rules and the OpenCode config reader.
+
+## Attachments
+
+A copy written for a message-based target carries an image as that target's own image block when
+the target takes it. Anything it does not carry leaves a text note **in the same message, at the same
+position**, so the reader sees that something was there. The note is ordinary text, so every
+converter and target carries it. The counters of each converter still count what was dropped.
+Code: `sesync-conv/src/attach.rs` (the one decision, `judge`, plus the note format, limits, header
+sizes and token bounds); tests in `sesync-conv/src/attach/tests.rs`.
+
+**The note.** `[attachment not carried: <name> (<mime>, <size>) — <reason>; kept in the source session]`.
+The name is the source's own `filename` only. A path or a URL is never written, because a path can hold
+private directories and a URL a query. Sizes are decimal (`1.2 KB`, `5 MB`). Never content.
+
+**What is not carried, and what leaves a note:**
+
+| Attachment | Source | Target | Note reason |
+|---|---|---|---|
+| File, path, http URL, non-image data URL | OpenCode `file` part | all | kept in the source session |
+| Image by URL, or by Files API id | Claude `image` source `url` / `file` | all | kept in the source session |
+| Image with no bytes, or a blob reference the journal does not hold | any | all | the journal holds no bytes / only a blob reference |
+| Image with no inline bytes, file or thumbnail | Antigravity user step | all | the conversation holds no bytes for it |
+| Image whose base64 does not decode | any | Antigravity | its base64 data does not decode |
+| Image over a target limit (below) | any | that target | over the limit; kept in the source session |
+| Tool-result image | any | Claude, OpenCode, Antigravity | this copy does not carry tool-result images (Antigravity: no slot for them) |
+| Image in a reply (assistant turn) | any | Claude, Antigravity | the planner step has no slot for images |
+
+OpenCode carries an image in a reply as a file part, as it does a user image.
+
+**Limits**, checked on the image's base64 text (`attach::CLAUDE`, `OPENCODE`, `ANTIGRAVITY`):
+
+| Target | Bytes per image | Pixels per side | Rule | Source (checked 2026-10-26) |
+|---|---|---|---|---|
+| Claude | 5 MB base64 | 8000 | above 20 images in one request, 2000 | Claude vision docs, "Request limits": 10 MB on the API, 5 MB on Bedrock, 8000 px, the 2000 px rule above 20 images (`platform.claude.com/docs/en/build-with-claude/vision`) |
+| OpenCode | 5 MB base64 | 8000 | none | OpenCode sends to whichever provider the session uses; the copy keeps to the smallest documented limit (Claude on Bedrock) |
+| Antigravity | 20 MB base64 | none | none | Gemini: "inline image data limits your total request size ... to 20MB" (`ai.google.dev/gemini-api/docs/image-understanding`); no per-image pixel limit documented |
+
+Claude runs on Bedrock too, so the copy keeps to Bedrock's 5 MB. The Claude 2000 px rule applies to
+every image of a request above 20 images, and the copy is one request, so the writer counts the
+user images it carries (`attach::carried_count`) and withholds only the ones above 2000 px when the
+count exceeds 20. The request-size limit (32 MB on Claude's standard endpoints) applies to the whole
+request, not to one image, and is **not** enforced: the fit budgets tokens, not bytes.
+
+**Image tokens** (`attach::image_tokens`). The estimate is the larger of two upper bounds, read from the
+image's header (PNG, JPEG, GIF, WebP; `attach::dims`):
+
+- Claude: one token per 28 x 28 pixel patch, `ceil(w/28) * ceil(h/28)`, capped at 4784, the
+  high-resolution tier (Claude 4.7 and later). The standard tier caps at 1568. The copy does not
+  know which model resumes it, so the larger cap is used. Downscaling only lowers the count, so this
+  bounds the cost after any resize.
+- OpenAI tiles (`gpt-4o` family, `detail: high`): scale to fit 2048 px, scale the shorter side to 768
+  px, then `85 + 170` per 512 px tile.
+
+A header that cannot be read costs 1600 (`FALLBACK_IMAGE_TOKENS`). Examples: 1920 x 1080 costs 2691,
+1000 x 1000 costs 1296, 100 x 100 costs 255. The patch rule is the one the current Claude documentation
+gives; an earlier `w x h / 750` estimate is superseded.
+
+**Round trips.** `to-claude`, `to-opencode`, `to-antigravity` and their `from-*` readers carry a user
+image's bytes, MIME type, turn and place among the text byte for byte (checked in
+`attach/tests.rs`: omp to Claude to OpenCode and back, and omp to Antigravity and back). Antigravity
+stores an image apart from the text, so it keeps the order of the images, not their place among the
+text.
+
+**Real data** (read-only check, 2026-10-26, the five omp sessions with images, copies written to a
+temp dir with `--context-window 100000000`): the user-turn images carried into each copy equal the
+images the source holds on its live branch, in count and in the SHA-256 of their bytes, for both
+Claude and OpenCode. Tool-result images (27 in two sessions) are not carried by either target and
+leave a note. Images on inactive or archived branches are not in the live window and are not copied.
+
+**Not carried, and why it is still open.** Tool-result images could be carried into a Claude copy
+(its `tool_result` content takes images); they are noted for now. The request-size limit is not
+enforced (see above).
 
 ## Local sync
 
@@ -593,23 +747,109 @@ Membership levels: the server's admin token authorizes `/admin/*`; a device toke
 (machine-scoped) authorizes member routes only while the machine is bound to a key the current
 signed list names. A write also needs the record signed by a device the current list names.
 
+## Completed turns (what team sync compares)
+
+A conversation is compared with its team copy by its **completed turns**, never by its bytes or
+file times (`sesync/src/turns.rs`). A turn is one user message and everything the assistant did
+in answer to it: text, tool calls and their results. It is completed when it ends with an
+assistant message that has no tool call (the final answer). A prompt still waiting for a reply, a
+reply still running tools, and an aborted or failed reply with no content are not turns yet.
+
+The turn hash is taken over normalized content, so one conversation hashes the same whichever
+harness it was read through:
+
+- **Kept:** the role sequence; text parts of user and assistant messages; tool calls by name and
+  arguments (a non-object argument compares as `{"input": v}`, as `sesync-conv` writes it); tool
+  results by their text, parts joined by a newline; a result counts only when it answers a call
+  seen earlier and not answered yet.
+- **Dropped:** ids, parent ids, timestamps, usage, model, stop reasons, thinking blocks and their
+  signatures, images, and any text that is blank or starts with `<`. The `<` rule is how a Claude
+  transcript marks wrappers and reasoning (`sesync-conv from-claude` drops them, or keeps reasoning
+  as a `<prior_reasoning>` text), so both sides drop it and a copy that went through Claude stays
+  equal. A prompt that starts with `<` is therefore not a turn of its own; its reply joins the turn
+  before it.
+- **Active branch:** the chain from the last message record in the file, followed by `parentId`,
+  through every record. It is **not** cut at a compaction: archived turns stay in the file, and a
+  copy made before the compaction still compares as a prefix.
+
+`compare(local, team)` is the longest common prefix of the two turn lists:
+`Identical`, `Ahead(n)` (local has n more), `Behind(n)` (the team copy has n more), or
+`Diverged { common, local_new, team_new }` (neither is a prefix of the other). A `fingerprint` of
+a turn list changes exactly when its completed turns change.
+
+```mermaid
+flowchart LR
+    J["journal bytes<br/>(omp/Pi form)"] --> P["active chain<br/>message records only"]
+    P --> N["normalize: text, calls, results<br/>drop ids, times, thinking, '<' text"]
+    N --> T["completed turns<br/>hash each"]
+    T --> C{"compare with<br/>the team copy's turns"}
+    C -->|same list| I["Identical"]
+    C -->|local is a prefix| A["Ahead n"]
+    C -->|team is a prefix| B["Behind n"]
+    C -->|neither| D["Diverged: common, both new parts"]
+```
+
+Known limits, all of them safe (a difference is reported, never written over): a conversation
+compacted in omp and copied through Claude loses its archived turns on the Claude side, so it
+compares as diverged; images and tool-call ids are not compared; a text part that a converter
+rewrites in another way than the rules above would show as a change.
+
 ## Push path (exactly what runs)
 
-1. `State::marked` holds the sessions the user marked. Nothing else is eligible.
-2. `team_sync::is_due` requires the source to be quiet for `SESYNC_TEAM_QUIET` (default
-   120 s) and the plaintext hash to differ from the last successful push.
-3. `team_sync::canonical_for_source` produces the team copy: the omp/Pi journal as-is for
-   omp/Pi sources, `sesync-conv from-claude` for Claude, `from-antigravity` for Antigravity, and
-   `opencode export` + `sesync-conv from-opencode` for OpenCode. Reasoning is kept only where
-   the converter can carry it as ordinary text; signed Claude thinking is dropped.
-4. `team_push` acquires the lease. **The lease version is the record sequence.**
-5. `sealed::seal_for_devices` compresses, encrypts, wraps the key to every listed device,
-   and signs a v2 record bound to `(space, conversation, sequence)`.
-6. `HttpTeam::put` posts to `/record/sealed?space&conversation&machine&version`. The server
-   checks the token, the exact lease version, the signature, the author's place in the
-   current list and the record's sequence equal to that version, then stores the bytes.
-7. On success the daemon records `{hash, pushed_at}` in `State::team`. Sealing is randomized,
-   so the change check must never hash sealed bytes (there is a regression test for this).
+1. `State::shares` holds the sessions the user shared with a team. Nothing else is eligible.
+2. The canonical journal is built (`team_sync::canonical_for_source`: the omp/Pi file as it is, or
+   converted: `sesync-conv from-claude` for Claude, `from-antigravity`, and `opencode export` +
+   `sesync-conv from-opencode`). Its **completed turns** are parsed and fingerprinted
+   (`turns::turns_of`, `turns::fingerprint`). When the bytes equal the recorded push bytes
+   (`State::team[].hash`), the recorded fingerprint is used without parsing again.
+3. A session with no completed turn yet is not sent (`TeamPass::waiting_for_turn`).
+4. Migration: a session whose recorded push has no fingerprint (a state file from before turns) and
+   whose bytes still equal the recorded hash records its fingerprint and sends nothing. No mass
+   re-push on upgrade.
+5. Due: the turns differ from the recorded fingerprint, the source has been quiet for
+   `SESYNC_TEAM_QUIET` (default 120 s), and no held conflict (`State::team_conflict`) applies to these
+   exact turns. Metadata appended to a journal, a trailing prompt and a reply still running tools
+   never make a session due. `team_sync::is_due` is the pure rule.
+6. `team_push` takes the conversation's lease. Then the guard (`team_sync::check_stored`) reads the
+   stored record under the lease and compares its turns with this machine's:
+   - nothing stored: push;
+   - the stored copy opens (`sealed::open_stored_for_writer`: this machine's own records under any
+     member list, anyone else's under the current verified list) and `turns::compare` says
+     **Identical**: nothing is written, the fingerprint is recorded;
+   - **Ahead** (the stored copy is a prefix of this machine's): push, as the next sequence, even if
+     the stored sequence is newer than the last one this machine accepted;
+   - **Behind** (this machine's turns are a prefix of the team copy) or **Diverged**: nothing is
+     written. `State::team_conflict` records the reason, and pushes for these turns stay paused until
+     the local turns change or the user decides (the TUI shows it);
+   - the stored copy cannot be opened or read as a journal: nothing is written; the conflict says why
+     (`unverified`), never the content.
+   - **Keep mine** (`State::team_force`): the user chose to push this machine's copy over the team's.
+     It applies only to the exact local turns and the exact stored sequence the user reviewed. Any
+     other stored sequence leaves the guard above in charge, so a decision made about an older team
+     copy never overwrites a newer push.
+7. The record is sealed for the listed devices (`sealed::seal_for_devices`) under the lease version,
+   which is its sequence, and written (`HttpTeam::put`, `POST /record/sealed`). The server checks the
+   token, the exact lease version, the signature, the author's place in the current list and that the
+   sequence equals the version, then stores the bytes. Sealing is randomized, so the change check
+   never hashes sealed bytes.
+8. On success `State::team[]` records the bytes hash, the push time, the list version and the turn
+   fingerprint, and the conflict is cleared. A check that found the copy identical records the
+   fingerprint and bytes without a push time.
+
+```mermaid
+flowchart TD
+    A["shared session: quiet, turns changed"] --> H{"held for these turns?"}
+    H -->|yes| P["paused: nothing read, nothing written"]
+    H -->|no| L["take the lease"]
+    L --> R{"stored copy?"}
+    R -->|none| W["seal and write"]
+    R -->|opens| C{"compare the completed turns"}
+    R -->|"cannot open or read"| U["nothing written<br/>conflict: unverified, with the reason"]
+    C -->|identical| I["nothing written<br/>fingerprint recorded"]
+    C -->|"local is ahead"| W
+    C -->|"team is ahead or diverged"| B["nothing written<br/>conflict recorded, pushes paused"]
+    K["keep mine, for the reviewed<br/>local turns and team sequence"] -.-> W
+```
 
 ## Pull path (exactly what runs)
 
@@ -636,6 +876,61 @@ signed list names. A write also needs the record signed by a device the current 
    line and on the team's card, and the pull never reads as an empty team. "Leave a team"
    (`team_actions::leave`) removes the credential, which is the only way out of a declined join:
    the server answers a declined key as it answers a pending one.
+8. The TUI's Team tab is one list: one row per conversation this machine shares or the team holds
+   (`app/team_tab.rs`). Each row's state comes from the completed turns the comparison read
+   (`team_compare`, a worker; the TUI never reads a conversation itself), and is drawn as one marker:
+   `=` in step, `↑` waiting to push (this machine has completed turns the team lacks), `↓` behind (the
+   team has more) or not here (the team holds it and this machine does not), `≠` diverged (neither copy
+   is a prefix), `•` shared by this machine with nothing to send yet, or still being compared. A `•`
+   before the marker means this machine shares it. Columns: title, state, harness, project folder, LATEST
+   BY (`this machine`; a teammate's device fingerprint from the verified list; `member@machine` for the
+   admin when a roster read this run maps it), and UPDATED. The title takes the remaining width and
+   carries the short id only when two titles are equal. The TUI pulls without a ctrl+r: at start, on
+   opening the tab when its last pull is over 30 s old (`TEAM_LIST_FRESH`), and when the daemon's state
+   shows a push newer than any it had (`App::absorb_daemon_state`).
+9. Enter on a `≠` or `↓` (held here) row opens the divergence dialog: both copies' new turns after
+   their common history, side by side when wide and stacked when narrow. Five choices. Every choice but
+   "decide later" keeps both histories: the continued side keeps the conversation id, and the other side
+   is a fork, a new omp session (forks install into omp, the first native journal harness).
+   - Take theirs, keep mine here: the team copy replaces the session (the old copy is archived and read
+     back first; `State::superseded` is written before the file changes); this machine's version is a
+     fork titled "<title> (mine, forked)", not shared.
+   - Take theirs, keep mine on team: as above, and that fork is shared with the team as its own conversation.
+   - On a **behind** copy (this machine's turns are a prefix of the team copy: the conversation went on and was
+     closed on another machine), both "take theirs" choices catch it up: the team copy replaces it (archived first,
+     as above) and no fork is written or shared, because this copy has no turns of its own to keep. The dialog says
+     so. "Open in herdr" refuses a copy the Team tab shows behind until it is caught up, so a resume never starts
+     from the older turns and the next turn never diverges.
+   - Keep mine, keep theirs here: this machine's copy is pushed over the team copy (`State::team_force`,
+     for the exact turns and team record reviewed); the team's version is a fork titled
+     "<title> (<who>, forked)", not shared.
+   - Keep mine, keep theirs on team: as above, and the team's fork is shared with the team as its own conversation.
+   - Decide later (or esc): nothing moves; pushes stay paused until the turns change.
+   Take theirs needs a file-backed omp or Pi journal as the local copy. The bin runs the replacement after
+   the key, with the state saved first and under the conversation's claim (`App::run_pending_replace`).
+   A turn-taking mirror of the replaced copy cannot undo it: a copy's answer typed at or before the
+   replacement is superseded and dropped by `turn::promote_changed`; answers after it still count.
+10. Pulls the TUI makes on its own and the daemon's push are unchanged.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant T as TUI
+    participant F as state.json
+    participant D as daemon
+    participant S as Team server
+    U->>T: m on a session (share it)
+    T->>F: save the share
+    T->>U: Shared from this machine: waiting for the daemon
+    D->>F: next local pass reads the share
+    D->>D: shares changed: team step now, backoff reset
+    D->>S: push (once the session is quiet)
+    D->>F: record the push
+    T->>F: reads the daemon's state (about once a second)
+    T->>U: on the team, pushed just now
+    T->>S: pull, because a newer push appeared
+    T->>U: On the team: the copy, from this machine
+```
 
 ## Trust model
 
@@ -660,13 +955,15 @@ theirs (`RecordError::StaleList`), and a device added to the list was never a re
 records sealed before it, so after any approve, revoke or removal every stored record is unreadable
 until it is sealed again. Content pushes alone would leave a quiet conversation hidden for good. So
 each push step also asks, once per conversation and list version (`TeamPush::list`), whether an
-unchanged shared conversation needs it (`team_sync::needs_reseal`): it reads the stored record back
-and re-seals the same content under the current list only when the record's own signature proves
-this machine wrote it (`signed_records::authorship`, which needs no list and also refuses a sequence
-below this machine's floor, so a forged header or a replayed older record of its own cannot trigger
-it) and it is sealed under an older list. A record written last by someone else is left alone, so an
-older copy never replaces newer content; that author re-seals it, and until that machine runs again
-its records stay unreadable. The daemon logs `N re-sealed under the current member list`.
+unchanged shared conversation needs it. It takes the conversation's lease first and reads the stored
+record back under it (`team_sync::needs_reseal`); it re-seals the same content under the current list
+only when the record's own signature proves this machine wrote it (`signed_records::authorship`, which
+needs no list and also refuses a sequence below this machine's floor, so a forged header or a replayed
+older record of its own cannot trigger it) and it is sealed under an older list. A push another member
+lands after an earlier read is therefore seen, not replaced. A record written last by someone else gives
+the lease back without a write, so an older copy never replaces newer content; that author re-seals it,
+and until that machine runs again its records stay unreadable. The daemon logs `N re-sealed under the
+current member list`.
 
 Admission. The team code is a shared secret, so the server never admits on it: a code holder can
 ask to join and re-authenticate a key the admin already listed, nothing more. A new key waits as a
@@ -731,13 +1028,16 @@ Client state (`<SESYNC_DIR>/state.json`, default `~/.local/share/sesync/state.js
 
 | Key | Meaning |
 |---|---|
-| `sources` | per `(fmt,key)`: `conv`, `last_seen_change`, `last_hash`, `last_stamp`, `failures`, `last_failure`, `mirrors`, `chosen_targets`, `title`, `turn_at` |
+| `sources` | per `(fmt,key)`: `conv`, `last_seen_change`, `last_hash`, `failures`, `last_failure`, `mirrors`, `chosen_targets`, `title`, `turn_at`. A file written before 2026-10-31 may carry `last_stamp`; it is ignored |
 | `sources[].sync` | per chosen copy: `{ok_at, problem, problem_at}`, the daemon's last good write and last failure. Settled on every pass (`settle_sync_records`): a copy no longer chosen loses its record at once, and a file copy written before the record existed gets `ok_at` once from its mtime (never for a diverged copy or bytes sesync did not write; an OpenCode copy waits for its next write, since its row time is the imported conversation's). A problem that says "will retry" (the copy was in use) shows as waiting, not failing |
 | `mirror_keys` | every path/id the daemon created; never treated as a source |
 | `subagents` | parent session → subagent transcript paths |
 | `deleted` | user-owned, written by the TUI: source key → when the user deleted it. Every load and merge (daemon and TUI) forgets each such session that is gone (`State::forget_deleted`): the record goes and its copies are released, so it is never listed as missing and the daemon does not bring it back. Kept for a day, which any running daemon outlasts |
 | `shares` | user-owned, written by the TUI: conversation id → the teams it is shared into; merged per conversation (see "The user's choices merge per key"). A file written before teams were per session carries a `marked` list instead, folded into `shares` once the machine's teams are known |
-| `team` | per session: `{hash, pushed_at, list}` of the last successful push; `list` is the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once) |
+| `team` | per session: `{hash, pushed_at, list, turns}`. `hash`: the canonical bytes at the last push, or at the last check that found the turns unchanged (used only to skip re-parsing). `pushed_at`: the last successful push. `list`: the member-list version the record was last sealed under, or confirmed to need no re-seal at (0 in older files: checked once). `turns`: the turn fingerprint the team copy agreed with at the last push or check (`turns::fingerprint`); empty in older files, which migrate on their first pass without a push (see "Push path" step 4) |
+| `team_conflict` | daemon-written, per (space, conversation): `{local, at, kind, count, local_new, team_new, why}`. Present while a push is held back: `kind` is `behind`, `diverged` or `unverified`; `local` is the turn fingerprint when it was found, and pushes stay paused while the local turns still equal it. Cleared by a push or by a check that finds the copies identical; once the local turns change, the next guard run replaces or clears it |
+| `team_force` | user-owned, written by the TUI's "keep mine": per (space, conversation): `{local, team_seq}`. It applies only to that local fingerprint and that team sequence (`push_due`, step 6), so it goes inert once either moves. Merged like the shares: a save adds this process's new requests, and the daemon reads the file |
+| `superseded` | user-owned, written by the TUI's "take theirs": per conversation id: the time the local copy was replaced. A copy's answer typed at or before that time is dropped by `turn::promote_changed`, so a turn-taking mirror of the replaced copy never promotes back over the team's copy. Merged by the latest time and never removed, like `deleted` |
 | `team_seen` | per conversation: highest accepted team sequence (rollback floor) |
 
 A missing state file is empty state; a corrupt one is an error (silently dropping it would
@@ -812,14 +1112,138 @@ Server store (`sesync-team/src/pg.rs`), one schema per deployment:
 | `SESYNC_CONFIG_DIR` | `~/.config/sesync` | team credentials, device key and admin key (CLI, TUI, daemon) |
 | `SESYNC_TEAM_URL` | unset | team server base URL for a credential that predates recording its server, and for a team configured only by the environment; a joined credential uses the server it was joined on |
 | `SESYNC_TEAM_TOKEN`, `SESYNC_TEAM_MACHINE`, `SESYNC_TEAM_SPACE` | from credential | optional overrides |
+| `SESYNC_TEAM_ALLOW_HTTP` | unset | `1` allows a token to travel over plain `http://` to a non-loopback team server (a deliberately private network such as a WireGuard mesh); otherwise only `https://` or loopback is accepted (`team_url.rs`) |
 | `SESYNC_TEAM_QUIET` | `120` | team quiet seconds before a push is due |
 | `SESYNC_TEAM_POLL_MAX` | `60` | cap for the team poll backoff |
 | `SESYNC_ADMIN_TOKEN_FILE` | unset | admin token for `sesync team` commands |
+| `SESYNC_CONTEXT_WINDOW` | per target, see "Context fit" | context window in tokens for every message-based target |
+| `SESYNC_CONTEXT_WINDOW_CLAUDE`, `SESYNC_CONTEXT_WINDOW_OPENCODE`, `SESYNC_CONTEXT_WINDOW_ANTIGRAVITY` | unset | the same, for one target; wins over `SESYNC_CONTEXT_WINDOW` |
+| `SESYNC_CONTEXT_SHARE` | `0.75` | share of the window a copy may fill, above 0 and at most 1 |
+| `SESYNC_CONTEXT_OVERHEAD` | `16384` | tokens reserved for the target's own prompt and reply |
 | `HS_TEAM_URL`, `HS_TEAM_TOKEN`, `HS_TEAM_MACHINE` | unset | TUI remote view (legacy names) |
 | `HS_E2E`, `HS_REQUIRE_CLAUDE` | unset | opt-in real-CLI tests |
+| `HERDR_BIN_PATH` | `herdr` on PATH | herdr CLI used by "Open in herdr"; herdr sets it in its panes and popups |
+| `HERDR_ACTIVE_WORKSPACE_ID` | unset | workspace new herdr tabs open in; herdr sets it for a custom command |
+| `SESYNC_USAGE_FIXTURE` | unset | bridge only: a file holding an `omp usage --json` report, read instead of running omp (the e2e backend uses it). Flags for the bridge are in `docs/BRIDGE.md` |
 
 Unknown or malformed values fall back to the default; a bad env var must never panic the
 daemon.
+
+`~` in the defaults above is the home directory: `HOME` when it is set and usable, else
+`USERPROFILE` on Windows. On Windows a `HOME` that is not a drive or UNC path (an MSYS shell's
+`/c/Users/...`) is skipped (`sesync/src/home.rs`; `sesync-lock` applies the same rule). Before
+this, a daemon started at logon, with no `HOME`, put its state under the working directory.
+
+## Opening a session in herdr
+
+`sesync/src/herdr_open.rs` is the only code that talks to herdr. "Open in herdr" (the session
+menu's first row, or `o`) builds a plan from the harness: `resume_argv` (the command, the
+conversation's identifier last) and `project_dir` (the new tab's directory; the home directory when
+it is unknown or gone, and the status line says so). The key only plans it and says "opening …
+in herdr…"; the TUI draws that and then runs the open (`App::run_pending_open`), because every
+herdr call is a process of its own (about half a second each on Windows). The open asks:
+
+- **The tab list, once.** sesync labels its tabs `harness: title · <tag>` (the tag: 8 hex digits of
+  the session key's SHA-256), so a tab it opened is found without asking about every pane.
+- **Linux and macOS** (`Detect::Programs`: herdr reports a pane's foreground programs): process
+  info only for the panes of the tagged tab and the panes in the session's project directory
+  (`pane list` gives each pane's directory). A pane whose foreground process was started with the
+  identifier as a flag's value (`omp --resume <path>`, `claude --resume <uuid>`, `opencode
+  --session <id>`) is that session; a tagged pane with no foreground program is too. A bare picker,
+  or a program that only names the file, is not.
+- **Windows** (`Detect::ShellOnly`: herdr reports only the pane's shell and its `shell_pid`): for the
+  tagged tab's panes, sesync reads the process list itself (`proc_tree::program_running_under`): any
+  process below the shell except a console host counts, a child shell and git included (`bash script.sh`,
+  a nested pwsh, git at a credential prompt, a cmd shim), if it is present in two snapshots 250 ms apart
+  (a prompt starts short-lived tools while it draws, so one snapshot is not enough). A
+  pane running something is the session: its tab is focused. A tagged tab back at its prompt (herdr
+  restarted and restored the tab, or the harness was quit) gets the command typed again, so the
+  session resumes in its own tab instead of a second one.
+- A pane whose processes cannot be read, or whose process list cannot be read, stops the open or
+  counts as running: a copy that might be the session is never started.
+- **Otherwise a new tab**, created unfocused in the directory, the command typed into its root
+  pane, then the tab focused. Keys pressed meanwhile stay in the popup instead of reaching the new
+  shell in front of the command. If the typing fails, the tab is closed again.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant T as sesync TUI (herdr popup)
+    participant H as herdr CLI
+    participant W as Windows process list
+    U->>T: o, or Enter on "Open in herdr"
+    T->>U: "opening … in herdr…"
+    T->>H: tab list
+    alt Linux and macOS
+        T->>H: pane list, process info for the tagged tab's panes and the project directory's only
+    else Windows, a tab carries the session's tag
+        T->>H: pane list, process info of that tab's panes (the shell's pid)
+        T->>W: a program below that shell?
+    end
+    alt the session runs in a pane
+        T->>H: tab focus
+    else Windows: its tab is back at the prompt
+        T->>H: pane run in that tab: the resume command
+        T->>H: tab focus
+    else not open anywhere
+        T->>H: tab create --no-focus, in the project directory
+        T->>H: pane run: the resume command
+        T->>H: tab focus
+    end
+    T->>U: quits, so the popup closes onto that tab
+```
+
+On Windows that is four calls to open a new tab and four or five to focus or resume the session's
+own tab, whatever the number of panes (it was one process-info call per pane, about eight seconds
+with 16 panes, and could never match there because herdr reports only the shell). Each herdr call
+times out after five seconds. Matching is per tab: the tab of the matched pane is focused, even when
+other panes share it. `tests/herdr_open_live.rs` checks this against a real herdr on every
+platform (opt-in, `--ignored`), including the resume into an idle tab on Windows.
+
+### Checking a herdr build, and guarding `herdr update`
+
+`sesync herdr check --herdr <exe>` (`herdr_check.rs`) tells whether a herdr build still does what
+sesync needs, without touching the user's herdr. It starts that build's server headless under a
+throwaway session name, with a copy of the user's herdr config (so the pane shell and the
+ctrl+alt+s popup binding are the user's), and drives the real `herdr_open::open` with a stand-in
+session: `sesync herdr probe`, which records its folder and `HERDR_BIN_PATH` and stays until
+asked to stop. Steps: the binary runs; a server starts; `config check` accepts the config; a
+workspace is created; "Open in herdr" opens a new tab and the typed command runs in the session's
+folder with `HERDR_BIN_PATH` set; the tab keeps its label; a second open focuses that tab; on
+Windows, once the probe ends, a third open types the command into the same tab. It stops at the
+first failure, then stops the probe and the server and deletes the session. Exit 0 when all pass.
+
+`sesync herdr guard` writes `update-guard.toml` in herdr's configuration directory (`name` and
+the `check` command, the candidate binary appended). Our herdr build (branch
+`fix/windows-split-mouse-report`, `src/update_guard.rs`) reads it in `herdr update`: after finding
+a newer release and before downloading, it warns that sesync relies on this build, lists the build's
+own fixes an official release may lack, and asks: test first, install anyway, or cancel (the
+default; without a terminal it refuses, `--skip-integration-check` skips the question). Test first
+downloads the release, unpacks it (Windows: `Expand-Archive`), runs the check on its binary, and
+asks again (default no). Official herdr builds do not read the file, so once one is installed, later
+updates do not warn.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant H as herdr update (our build)
+    participant S as sesync herdr check
+    participant N as candidate herdr (throwaway session)
+    U->>H: herdr update
+    H->>H: newer release found, update-guard.toml present
+    H->>U: warning: sesync relies on this build; [t] test first, [i] install anyway, [c] cancel
+    alt cancel (default)
+        H->>U: Herdr was not updated
+    else install anyway
+        H->>H: download and install, as upstream
+    else test first
+        H->>H: download, unpack, nothing installed
+        H->>S: run the check with the candidate binary
+        S->>N: server, config check, workspace, Open in herdr with a probe
+        S-->>H: exit 0 (all passed) or 1
+        H->>U: passed/failed: install? [y/N]
+    end
+```
 
 ## Failure behaviour
 
@@ -844,6 +1268,9 @@ daemon.
 | Approve with a fingerprint that does not match the request | refused locally; nothing is signed |
 | Revoke or remove that would drop the admin's own key | refused locally; nothing is signed |
 | A pending device's token on any member route | 403, as for a revoked device |
+| The team copy is ahead of this machine (or diverged from it) | nothing is written; the conversation is held (`team_conflict`) and its pushes stay paused until its local turns change or the user decides on the Team tab |
+| The stored copy cannot be opened or read (sealed under an older list by another member, not sealed to this device, not a journal) | nothing is written; held as `unverified` with the reason, never its content; the author re-seals it, or the user decides |
+| A conversation with no completed turn yet | nothing is sent; it waits for the first completed turn |
 
 ## Live vs test-only modules
 

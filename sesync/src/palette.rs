@@ -16,11 +16,13 @@ pub enum Action {
     SwitchView,
     Quit,
     Theme,
+    Folder,
     Enroll,
     Register,
     Invite,
     Members,
     Leave,
+    Resolve,
 }
 
 struct Def {
@@ -38,14 +40,16 @@ const ACTIONS: &[Def] = &[
     Def { action: Action::Share, title: "Share with teams", key: "s", event: Ev::Char('s') },
     Def { action: Action::Unshare, title: "Stop sharing", key: "u", event: Ev::Char('u') },
     Def { action: Action::RefreshTeam, title: "Refresh team", key: "ctrl+r", event: Ev::CtrlR },
-    Def { action: Action::SwitchView, title: "Switch Sessions/Team", key: "tab", event: Ev::Tab },
+    Def { action: Action::SwitchView, title: "Switch tab", key: "tab", event: Ev::Tab },
     Def { action: Action::Quit, title: "Quit", key: "q", event: Ev::Char('q') },
     Def { action: Action::Theme, title: "Colour scheme", key: "ctrl+t", event: Ev::Theme },
+    Def { action: Action::Folder, title: "Files folder", key: "", event: Ev::OpenFolder },
     Def { action: Action::Enroll, title: "Join a team", key: "", event: Ev::OpenEnroll },
     Def { action: Action::Register, title: "Start a team", key: "", event: Ev::OpenRegister },
     Def { action: Action::Members, title: "Team members", key: "", event: Ev::OpenMembers },
     Def { action: Action::Invite, title: "Invite a member", key: "", event: Ev::OpenInvite },
     Def { action: Action::Leave, title: "Leave a team", key: "", event: Ev::OpenLeave },
+    Def { action: Action::Resolve, title: "Resolve this conversation", key: "enter", event: Ev::OpenResolve },
 ];
 
 /// What a command can see when deciding whether it may run.
@@ -65,6 +69,8 @@ pub struct Ctx {
     pub teams_here: bool,
     /// Whether this machine holds the team's admin key.
     pub admin: bool,
+    /// Whether the selected Team row can be resolved now (behind or diverged, held here), or why not.
+    pub resolve: Result<(), &'static str>,
 }
 
 /// Ok, or the reason the action cannot run right now, shown beside it in the list.
@@ -74,24 +80,27 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
             (View::Sessions, true) => Ok(()),
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("older sessions are on the Team tab; press tab"),
+            (View::Machines, _) => Err("local sessions are on the Sessions tab; press tab"),
         },
         Action::Share => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.team_configured { Ok(()) } else { Err("no team configured; join one first") },
         },
         Action::Unshare => match (ctx.view, ctx.session_selected) {
             (View::Sessions, false) => Err("no local session selected"),
             (View::Team, _) => Err("sharing a session starts from the Sessions tab"),
+            (View::Machines, _) => Err("sharing a session starts from the Sessions tab"),
             (View::Sessions, true) => if ctx.session_shared { Ok(()) } else { Err("this session is not shared with any team") },
         },
         Action::Import => match (ctx.view, ctx.team_selected) {
             (View::Team, true) => Ok(()),
             (View::Team, false) => Err("no team session selected"),
-            (View::Sessions, _) => Err("team sessions are on the Team tab; press tab"),
+            (View::Sessions | View::Machines, _) => Err("team sessions are on the Team tab; press tab"),
         },
         Action::RefreshTeam => {
-            if ctx.team_configured {
+            if ctx.team_configured || ctx.view == View::Machines {
                 Ok(())
             } else {
                 Err("no team server configured")
@@ -105,7 +114,8 @@ pub fn enabled(action: Action, ctx: &Ctx) -> Result<(), &'static str> {
             Ok(())
         },
         Action::Leave => if ctx.teams_here { Ok(()) } else { Err("no team on this machine") },
-        Action::SwitchView | Action::Quit | Action::Theme | Action::Enroll | Action::Register => Ok(()),
+        Action::Resolve => ctx.resolve,
+        Action::SwitchView | Action::Quit | Action::Theme | Action::Folder | Action::Enroll | Action::Register => Ok(()),
     }
 }
 

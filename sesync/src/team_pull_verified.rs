@@ -40,6 +40,12 @@ pub trait RecordSource {
 pub struct PulledRecord {
     pub conversation: String,
     pub text: Vec<u8>,
+    /// Written by this device: its signature is this device's key (`signed_records::authorship`).
+    pub mine: bool,
+    /// The device that wrote it, as the verified member list's fingerprint for that device (the form
+    /// admins see on the roster), or empty when the list does not name it. Member names are not in the
+    /// list, so this is the name a member can check.
+    pub by: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,7 +127,10 @@ fn pull_with(source: &dyn RecordSource, reader: &DeviceFile, trust: Option<&Trus
             Ok(opened) => {
                 let best = out.accepted.entry(conv.clone()).or_insert(0);
                 *best = (*best).max(opened.sequence);
-                out.shown.push(PulledRecord { conversation: conv, text: opened.content });
+                let author = sesync_team::signed_records::authorship(&expect, &record).ok().map(|a| a.author);
+                let mine = author.as_deref() == Some(reader.public_signing());
+                let by = author.as_deref().map(|a| author_fingerprint(t, a)).unwrap_or_default();
+                out.shown.push(PulledRecord { conversation: conv, text: opened.content, mine, by });
             }
             Err(SealError::Rollback { .. }) => {
                 out.dropped += 1;
@@ -131,4 +140,15 @@ fn pull_with(source: &dyn RecordSource, reader: &DeviceFile, trust: Option<&Trus
         }
     }
     out
+}
+
+/// The fingerprint of the verified list's entry for `author`'s signing key, or empty when the list does
+/// not name it. Only the signature was checked on the record's author, so this is read from the list.
+fn author_fingerprint(t: &Trust, author: &[u8]) -> String {
+    let Ok(verifier) = t.verifier() else { return String::new() };
+    let Some((_, devices)) = verifier.current_view() else { return String::new() };
+    devices.iter()
+        .find(|e| e.len() >= author.len() && &e[..author.len()] == author)
+        .map(|e| sesync_team::membership::fingerprint(e))
+        .unwrap_or_default()
 }

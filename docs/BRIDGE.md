@@ -1,0 +1,521 @@
+# Phone bridge (`sesync bridge`)
+
+A WebSocket server that lets the Orca-derived Android app (agent-hub) pair with this machine and work
+with its sesync conversations: list them, read each transcript, open its herdr pane live, type prompts, answer approvals, send images, start sessions and receive notifications. Phase 2 adds the chat, approval, image, new-session, notification and usage methods.
+Phase 1 (agent-hub, native host screens, option A). The app renders the host screens itself; the bridge
+serves data RPCs only. Only the `sesync bridge` subcommand runs any of this. The daemon, the TUI and the
+team client never load it.
+
+Orca is MIT-licensed (stablyai/orca). Its protocol is read from the source at the commit in
+`~/projects/orca-phone` (`mobile/src/transport/*`, `mobile/src/session/*`, `src/shared/rpc-contract/*`,
+`src/main/runtime/rpc/methods/terminal/*`). The shared contract with the app is
+the section "Wire contract" below and the app's `src/shared/rpc-contract/*`.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `sesync bridge pair [--endpoint ws://HOST:PORT] [--label NAME]` | Pairs a new device. Prints the pairing offer (v2 JSON), the `agenthub://pair?code=` URL and a terminal QR. The device token is in that output and nowhere else. |
+| `sesync bridge serve [--listen ADDR:PORT] [--allow CIDR,…] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]` | Serves in the foreground until Ctrl-C. Defaults: `0.0.0.0:6768`, allowed networks loopback, private and shared-VPN ranges, herdr socket `$HERDR_SOCKET_PATH` else `$HOME/.config/herdr/herdr.sock`, ntfy off (topic `agents` once a server is set), plan usage every 600 s from `omp`. |
+| `sesync bridge devices` | Lists paired devices: id, kind (`phone` or `machine`), label, creation time. Never prints tokens. |
+| `sesync bridge revoke <device-id>` | Removes a device. Its token is refused on the next frame, with no restart. |
+
+`--endpoint` is the address the pairing offer tells the phone to dial (`ws://HOST:6768`): the machine's LAN or VPN
+address that the phone reaches. With no flag, `endpoint` from the settings file is used; with neither, `pair` stops
+and asks for it. Nothing here opens a firewall port: the host's firewall decides what is reachable.
+
+### Settings file
+
+`~/.config/sesync/bridge/settings.json` (the bridge state directory, `$SESYNC_CONFIG_DIR/bridge`) holds this
+machine's values, all optional: `endpoint`, `allow`, `ntfyUrl`, `ntfyTopic`, `ntfyTokenCommand`, `whisperUrl`,
+`whisperModel`, `whisperLanguage`. A flag wins over the file, and for dictation the `SESYNC_WHISPER_*` variables do
+too. An unknown field or broken JSON stops the bridge with the file's name, so a typo never falls back silently.
+With no file the defaults are generic: no endpoint, the allowlist `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10`
+(loopback, the private ranges, the shared VPN range), no ntfy push and no dictation.
+
+```json
+{ "endpoint": "ws://10.0.0.3:6768", "allow": "10.0.0.0/24,192.168.1.0/24,127.0.0.0/8",
+  "ntfyUrl": "https://ntfy.example.net", "ntfyTopic": "agents", "ntfyTokenCommand": "cat ~/.config/ntfy-token",
+  "whisperUrl": "http://10.0.0.3:8080/v1/audio/transcriptions" }
+```
+
+`serve` takes the sesync-lock binary and its claim directory from the same environment the daemon uses
+(`SESYNC_LOCK`, else the binary beside `sesync`; `SESYNC_LOCK_DIR`, else the stored locks directory). If
+the lock binary is not installed, prompts are sent without a claim, as the daemon's own writes are.
+
+`serve` also runs the phase-2 background work. Push needs an ntfy server (`--ntfy-url` or `ntfyUrl`) and a token command (`--ntfy-token-command` or `ntfyTokenCommand`); without both it is off and the log says which is missing. The token command runs once at startup (20 s limit). Its output is the publish token and is never logged; a failure leaves push off and says why. `--no-ntfy` turns push off. Plan usage runs `<omp> usage --json` every `--usage-every` seconds (no model call); `--no-usage` turns it off. `SESYNC_USAGE_FIXTURE=<file>` makes the refresh read that file instead of running omp; the e2e backend uses it. The notification watcher follows herdr's agent-status events (see Notifications).
+
+Exit codes: 0 success, 2 usage, 1 failure (as in `sesync team`).
+
+### Machines: this machine as another machine's client
+
+`sesync machine` uses another machine's bridge the way the phone does, so a machine sees and drives the
+conversations of the others.
+
+| Command | What it does |
+|---|---|
+| `sesync machine add <name> <pairing link>` | Saves a pairing made on the other machine with `sesync bridge pair --endpoint ws://ITS-ADDRESS:6768 --label <this machine>` (the `agenthub://pair?code=` link or the offer JSON), then checks that it answers. A name is 1 to 32 letters, digits, `-`, `_` or `.`; adding it again replaces it. |
+| `sesync machine list [<name>]` | For each machine, its conversations as its bridge lists them: state (the open pane's, else `closed`), title, harness, project directory, worktree id. |
+| `sesync machine attach <name> <conversation> [--open]` | Mirrors the conversation's pane in this terminal and types into it. The conversation is named by its worktree id, its title (any case), or a part of the title that fits only one; two that fit list their ids. One not open there is refused unless `--open` is given, which resumes it in that machine's herdr first, as the phone's Resume: a bridge that misses an open pane (an older one, or a pane it cannot place) would otherwise start a second agent on a running conversation. Attach draws on the main screen, and the pane's history (the stream's `history` events, see Terminal streams) goes into this terminal's own scrollback, in colour: scroll back as through any output (in a herdr tab, herdr's scrolling). Ctrl-] detaches, and the last screen stays above the prompt. Run inside a herdr tab, this is a remote terminal tab. |
+| `sesync machine remove <name>` | Forgets the machine here. Its device stays paired there until `sesync bridge revoke` on it. |
+| `sesync machine endpoint <name> <ws://address>` / `--clear` | Dials that machine at this address from here instead of the endpoint its pairing or grant names (a tunnel such as wireproxy's `ws://127.0.0.1:16768`). Kept when a phone grant replaces the entry, since the phone only knows the address it dials; `--clear` goes back to the paired endpoint. `list` shows both. |
+| `sesync machine send <name> <file or folder>` | Uploads a file (a folder as a zip) into that machine's inbox folder and prints the path it landed at. A name that is taken gets a number; nothing is overwritten. See File transfer. |
+| `sesync machine get <name> <path there> [<folder here>]` | Downloads a file, or a folder as a zip, from that machine into a folder here (default: the current directory). Nothing is overwritten. See File transfer. |
+| `sesync machine prompt <name> <conversation> <text \| -> [--open] [--wait[=<seconds>]]` | Sends a prompt turn to that conversation's agent: `terminal.send` with `enter`, the phone composer's call, so the other bridge claims the conversation in sesync-lock for the turn, prompts a detected agent through herdr's agent API, and refuses a pane waiting on a question (`agent_waiting_on_prompt`) or a conversation whose pane no longer runs its agent. `-` reads the text from stdin. A closed conversation is refused unless `--open` is given, which resumes it there first (`session.tabs.createTerminal`, as attach `--open`): under its own session, never a fresh one, and refused when its agent already runs there. `--wait` polls `worktree.ps` every 2 s until the agent is no longer `working` and its transcript has an assistant answer newer than the one before the prompt, then prints that answer (`Settled::Answered`); a `blocked` agent or the time limit (default 600 s) exits 1 with what to do. This is how an agent on one machine hands work to an agent on another: `skills/prompt-agent-over-bridge`. |
+| `sesync machine read <name> <conversation> [<count>]` | Prints the conversation's last messages (default 10, at most 200), oldest first: role, text, and each tool call by name; tool output is left out. Reads `nativeChat.readSession` by the conversation's journal session id: `worktree.ps` rows carry it as `sessionId` (also for a closed conversation); a bridge too old to list it answers only for an open pane, through `session.tabs.list`. |
+
+`machines.json` sits in `$SESYNC_CONFIG_DIR` (default `~/.config/sesync/`), `0600`, written atomically: it holds
+each machine's endpoint, public key and device token, and for a granted link the id of its grant (`grantDeviceId`; null for a pairing made by hand) and the local override (`localEndpoint`, absent when none). Attach reads the JSON terminal stream (full repaints), draws
+each repaint cut to the window with the bottom rows kept and autowrap off (the remote pane keeps its own size, as on
+the phone), and sends keys as `terminal.send` text, as the phone's terminal keyboard does: Enter there is typing,
+not a prompt turn, so it takes no conversation claim. A machine connects with the hybrid handshake (Framing below):
+X25519 + ML-KEM-768, AES-256-GCM frames. A bridge that answers with only the phone's legacy channel is refused.
+
+The TUI's Machines tab (`sesync --tui`, reached with tab from Team) lists each saved machine: a header with its endpoint
+and either `loading…` or `unreachable: <reason>`, then its conversations (state, title, harness, project). A worker asks
+every machine's bridge for `worktree.ps` at once, each with an 8 s timeout, while the tab is shown: every 5 s, and at
+once on ctrl+r. The TUI never waits on it. Enter on a conversation opens a herdr tab labelled `<machine> · <title>` that
+runs `sesync machine attach <machine> <worktree id>` on it. A closed conversation is not opened by Enter; the status line
+says that `o` opens it, and `o` runs the same tab with `--open`. herdr starts a tab with its own environment, so the tab
+is given this run's `SESYNC_CONFIG_DIR` (the machines it reads are the same). With no herdr answering, the status line
+says so and no tab starts.
+
+### Machines the phone grants
+
+The phone decides which machines see each other . In the phone's Settings → Machines, each paired host A has an "A can see" section with one switch per other host B. Switching it on:
+
+1. On B: `machines.grant {label: <A's name>}` → `{deviceId, deviceToken, publicKeyB64}`. B makes a `machine` device labelled with A's name.
+2. On A: `machines.accept {name: <B's name>, endpoint, deviceToken, publicKeyB64, grantDeviceId: deviceId}`, with the endpoint the phone dials for B. A saves B in `machines.json` with the grant id, then asks B for `status.get`. `answers` says whether B answered and `error` why not; the phone shows both under the switch. The save stands either way.
+
+Switching it off: `machines.forget {name: <B's name>}` on A (it returns `grantDeviceId`), then `devices.revoke {deviceId: grantDeviceId}` on B when that is not null. A's client is refused on its next frame. A host that is offline shows its section disabled. A bridge that answers `method_not_found` for these methods is one that predates them: the phone says to update sesync on that machine.
+
+A machine's name for another is that machine's `machineName` from `status.get`, cut to the store's rule (`machines::store::sanitize_name`, which the phone mirrors): each character outside `[A-Za-z0-9._-]` becomes `-`, the result is cut to 32 characters, its leading and trailing `-` are trimmed, and an empty result is `machine`. `machines.accept` checks a name against the same rule (`bad_request` otherwise) and does not trust the phone's copy.
+
+A granted machine connects and authenticates as a phone does, with the hybrid handshake and the token in `machines.json`, and reads and drives the bridge the same way. It is refused the five grant methods (`forbidden`): a machine cannot grant or forget a link. Granting a machine a name it already has replaces that entry on A; the earlier grant's device stays on B until the phone revokes it there.
+
+## Files
+
+Under `$SESYNC_CONFIG_DIR/bridge/` (default `~/.config/sesync/bridge/`). The directory is `0700`.
+
+- `server.key`: `0600`. The bridge's X25519 secret, base64. Created on first use, never replaced
+  silently (a new key would strand every paired phone). The public key is derived from it.
+- `devices.json`: `0600`. Per device: `id`, `label`, `created` (unix seconds), `token_sha256`, and `kind`: `phone` (paired by `sesync bridge pair`) or `machine` (granted by `machines.grant`). A record without `kind` is a phone, so a store written before the field still loads.
+  The token itself is never stored: it is 256 random bits, and only its SHA-256 is kept.
+- `pins.json`: `0600`. The pinned conversations (`worktree.set`) as `{"pinned":["<worktree id>", …]}`. A
+  damaged file fails the next pin write rather than being replaced.
+
+Writes are atomic (temp file, then rename) and created owner-only from the start.
+
+## Pairing offer v2
+
+The offer is the JSON below, encoded as unpadded base64url and carried as `agenthub://pair?code=…`
+(the same encoding Orca's `encodePairingOffer` produces under `orca://`). The QR code carries the same
+URL. The phone app registers the `agenthub` scheme and still reads `orca://pair?code=` links printed
+before this change; `sesync bridge` prints only `agenthub://`.
+
+```json
+{"v":2,"endpoint":"ws://10.0.0.3:6768","deviceToken":"<43 chars>","publicKeyB64":"<44 chars>"}
+```
+
+- `publicKeyB64` pins the bridge's identity; it is the only server key the phone is given.
+- There is no `relay` block and no `scope`: direct offers only.
+
+## Wire protocol
+
+Frames are WebSocket messages. A plaintext frame is JSON. An encrypted text frame is
+`base64(nonce ‖ box)`, where `box` is NaCl's `crypto_box` output under
+`shared = nacl.box.before(serverPublic, clientSecret)` with a random 24-byte nonce. An encrypted
+**binary** frame is the same `nonce ‖ box` without base64: the layout Orca's legacy channel reads with
+`openLegacyBinary`, which the direct transport routes to its terminal stream router.
+
+1. Client → `{"type":"e2ee_hello","publicKeyB64":…}` (plaintext). Bridge → `{"type":"e2ee_ready"}`. A sesync
+   client sends the hybrid hello instead (`"v":3`, see Framing); later frames then use that channel's layout.
+2. Client → encrypted `{"type":"e2ee_auth","deviceToken":…}`. Bridge → encrypted
+   `{"type":"e2ee_authenticated"}`, or encrypted `{"type":"e2ee_error","error":{"code":"unauthorized"}}`
+   and close `4001`.
+3. Client → encrypted `{"id","deviceToken","method","params"}`. Bridge → encrypted
+   `{"id","ok":true,"result",…}` or `{"id","ok":false,"error":{"code","message"}}`. Each request
+   carries the token; it is checked on every frame.
+4. A request that opens a stream gets encrypted `{"id","ok":true,"streaming":true,"result":{…}}`
+   replies, all with the request's `id`, until `result:{"type":"end"}` or an unsubscribe.
+
+Served methods:
+
+| Method | Result |
+|---|---|
+| `status.get` | `{runtimeId, appVersion, protocolVersion:3, minCompatibleMobileVersion:2, capabilities:["sesync.file-transfer.v1"], floatingWorkspaceEnabled:false, hostPlatform, machineName}`. `sesync.file-transfer.v1` says the `transfer.*` methods are served (see File transfer); the phone offers Send file only when it is listed. The app reads each capability with `includes(<its own string>)`, so this entry changes no other feature. |
+| `worktree.ps` | `{worktrees:[…], totalCount, truncated:false}`: one row per sesync conversation, newest first. `status` and `agents` come from the herdr panes running it (see Mapping). Without herdr the rows still load, as not open. `isPinned` is the conversation's pin. |
+| `worktree.set` `{worktree, isPinned}` | `{worktree, isPinned}`: pins a conversation. The pin is kept in `pins.json` under the bridge's state directory, never in sesync's store. Any other non-null field is refused as `bad_request`. |
+| `repo.list` | `{repos:[…]}`: the conversations' project directories, for grouping. Ids match the rows' `repoId`. |
+| `session.tabs.list` `{worktree:"id:<wt>"}` | `{worktree, publicationEpoch, snapshotVersion, tabs:[…], activeTabId, activeTabType}`: one `type:"terminal"` tab per pane running the conversation (see Mapping for what "running" means). Empty when none is open. |
+| `session.tabs.subscribe` `{worktree}` | Streams `{type:"snapshot", …tabs}` then `{type:"updated", …tabs}` when the tab list changes. `session.tabs.unsubscribe {worktree, subscriptionId?}` ends it. |
+| `terminal.list` `{worktree?, handles?}` | `{terminals:[…], totalCount, truncated:false}`: one row per pane (`handle` = herdr's terminal id). |
+| `terminal.read` `{terminal}` | `{terminal:{handle, status:"running", tail:[…lines], source:"screen", …}}`: the last 200 rows as text. |
+| `terminal.subscribe` `{terminal, client:{id}, viewport?, capabilities?}` | The screen, then live changes. See Terminal streams. `terminal.unsubscribe {subscriptionId, client, requestId}` ends it. |
+| `terminal.send` `{terminal, text?, enter?, interrupt?}` | `{send:{handle, accepted:true, bytesWritten}}`. A prompt (`text` with `enter:true`) takes the conversation's claim first; see Prompt turns. Approval keys are `text` with `enter:false` (see Approvals). |
+| `terminal.clearBuffer` `{terminal}` | `{terminal:{handle, cleared:true}}` after Ctrl-L is sent into the pane. Not a prompt turn, so it claims nothing. |
+| `agentSession.subscribeStatus` | Streams `{type:"snapshot", sessions:[…]}` then `{type:"status", session}` on change: one session per pane running a conversation. |
+| `nativeChat.readSession` `{agent, sessionId, limit?, beforeOffset?}` | `{messages, hasMore, beforeOffset?}` (or `{error}`): the conversation's journal from its live window, paged by row cursor. See Chat view. |
+| `nativeChat.subscribe` `{agent, sessionId, subscriptionId, limit?, capabilities?}` | Streams `snapshot`, then `appended` or `replacement`, with `error` and `end` as the app reads them. `nativeChat.unsubscribe {subscriptionId}` ends it. |
+| `clipboard.startImageUpload`, `appendImageUploadChunk`, `commitImageUpload`, `abortImageUpload`, `saveImageAsTempFile` | Staged images. Commit and save return the path string the app puts in the prompt. See Images. |
+| `transfer.inbox`, `transfer.startUpload`, `transfer.appendUploadChunk`, `transfer.commitUpload`, `transfer.abortUpload`, `transfer.startDownload`, `transfer.readDownloadChunk`, `transfer.endDownload` | Any file or folder in or out. See File transfer. |
+| `preflight.detectAgents` | A bare array of installed agent ids. |
+| `settings.get` | `{settings:{}}`: no default agent and none disabled. |
+| `session.tabs.createTerminal` `{worktree, agent}` | `{tab:{type:"terminal", id, terminal, title}}`: for a conversation's worktree, the pane running that conversation (an open one is reused, otherwise it is resumed with the harness's resume command); for a project's worktree, a new tab running the agent with no resume. See New sessions. |
+| `notifications.subscribe` `{includeDesktopSuppressed?}` | Streams `{type:"ready", subscriptionId, epoch}`, then `{type:"notification", agentState, paneKey, notificationId, …}` frames: `agentState` is `done` for finished and `blocked` for needs input. `notifications.getMissedSince {lastSeenSeq, epoch?}` replays from memory. See Notifications. |
+| `notifications.registerPush`, `unregisterPush` | `{registered:false}`: there is no FCM. |
+| `notifications.testPush` | `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no `notifications.subscribe` stream is open. A synthetic in-app notification (see Notifications). |
+| `accounts.list` | `AccountsSnapshot`. See Plan usage. |
+| `accounts.subscribe` | Streams `{type:"ready", subscriptionId, snapshot}`, then `{type:"snapshot", snapshot}` on change. `accounts.unsubscribe` ends it. |
+| `files.readDir` `{worktree, relativePath?}` | A bare array `[{name, isDirectory, isSymlink}]`: one directory's entries, directories first. More than 5 000 entries is `directory_too_large`. |
+| `files.read` `{worktree, relativePath}` | `{worktree, relativePath, content, truncated, byteLength}`: a text file, cut to 1 MiB (`truncated` says so; `byteLength` is the full size). A binary file is `binary_file`. |
+| `files.readPreview` `{worktree, relativePath}` | `{worktree, relativePath, content (base64), isBinary:true, isImage:true, mimeType}` for png, jpg, jpeg, gif or webp up to 2 MiB whose bytes open with that format's signature (a mismatch is `binary_file`). An absolute `relativePath` names an image anywhere on the host instead: a staged upload (the path `clipboard.commitImageUpload` returned) or a picture an agent made and showed in its reply. The path is resolved through `..` and symlinks first; what it reaches must still be an image by extension and signature. The reply has the same shape. |
+| `files.resolveTerminalPath` `{worktree, pathText, cwd?}` | `{worktree, relativePath, absolutePath, exists, isDirectory, openTarget?}`: a path a pane printed, resolved inside the project. A file has `openTarget: {kind:"worktree-file", relativePath, absolutePath}`. |
+| `files.searchPaths` `{worktree, query?, limit?, excludePaths?}` | `{worktree, files:[{relativePath, basename, kind}], totalCount, truncated}`: project files whose path matches the query, `.gitignore` honoured. `limit` defaults to 16 and tops out at 200. |
+| `git.status` `{worktree, includeLineStats?}` | `{entries:[{path, status, area, oldPath?, conflictStatus?, conflictStatusSource?, added?, removed?}], branch?, head?, upstreamStatus?}`. `area` is `staged`, `unstaged` or `untracked`. |
+| `git.diff` `{worktree, filePath, staged}` | `{kind:"text", originalContent, modifiedContent}`, `{kind:"binary"}`, or `{kind:"too-large", byteLength}` when a side is over 1 MiB. |
+| `git.history` `{worktree, limit?, baseRef?}` | `{items:[{id, parentIds, subject, displayId, author, timestamp}]}`, newest first. `timestamp` is milliseconds; `limit` defaults to 50 and tops out at 200. |
+| `git.commitCompare` `{worktree, commitId}` | `{entries:[…]}`: the files one commit changed against its first parent. |
+| `git.branchCompare` `{worktree, baseRef}` | `{summary:{baseRef, compareRef, changedFiles, status, baseOid, headOid, mergeBase, commitsAhead, errorMessage?}, entries:[…]}`. `status` is `ready`, `invalid-base`, `unborn-head`, `no-merge-base` or `error`. `compareRef` is the checked-out branch, `HEAD` when detached. |
+| `speech.models.list` | `{enabled, selectedModelId, dictationMode:"toggle", models:[{id, label, provider, status:"ready", sizeBytes, progress}]}`: the one whisper model, always ready. See Dictation. |
+| `speech.dictation.start` `{dictationId, modelId?}` | `{dictationId, modelId}`. `dictation_already_active` when this phone already holds one. See Dictation. |
+| `speech.dictation.chunk` `{dictationId, audioBase64, sampleRate}` | `{dictationId}`: 16 kHz mono PCM, s16le, at most 5 s per chunk. |
+| `speech.dictation.finish` `{dictationId}` | `{dictationId, text}`: `[TRANSCRIBED] <text>`, or `""` when nothing was heard. |
+| `speech.dictation.cancel` `{dictationId}` | `{dictationId}`. A no-op unless this phone holds that dictation. |
+| `machines.grant` `{label}` | `{deviceId, deviceToken, publicKeyB64}`: a new `machine` device labelled `label` (the granted machine's name for this one), and this bridge's public key. See Machines the phone grants. |
+| `machines.accept` `{name, endpoint, deviceToken, publicKeyB64, grantDeviceId}` | `{name, answers, error?}`: saves that machine in this machine's `machines.json`, replacing one of the same name, then asks it for `status.get` over the hybrid handshake (10 s at most). `answers` is false, with `error`, when it does not answer; the save stands. `bad_request` for an invalid name, endpoint or key. |
+| `machines.list` | `{machines:[{name, endpoint, grantDeviceId}]}`: the saved machines, never their tokens. `grantDeviceId` is null for a pairing made by hand. |
+| `machines.forget` `{name}` | `{grantDeviceId}`: removes that machine; `not_found` for an unknown name. |
+| `devices.revoke` `{deviceId}` | `{revoked:true}`: removes a `machine` device; `forbidden` for a phone device, `not_found` for an unknown id. |
+
+Every other method, including the structured `agentSession.*` calls (`send`, `currentRequests`, `respondToApproval`, `respondToQuestion`, `create`, `createSupport`) and `worktree.create` and `agent.launch`, answers `error.code: "method_not_found"` with the request's `id`. Terminal-backed chat never calls them: its prompts ride `terminal.send`, its cards ride `interactivePrompt`, and new sessions ride `session.tabs.createTerminal` (the app falls through when `agentSession.create` is refused). Orca reads that as
+"not available here" (`isMobileMethodUnavailableError`) and skips the read. Errors the bridge raises:
+`bad_request`, `worktree_not_found`, `terminal_not_found`, `herdr_unavailable` (herdr's socket cannot be
+reached or a pane's processes cannot be read), `unavailable` (the sesync state cannot be read, a chat's transcript cannot be converted, or the speech server cannot transcribe a dictation),
+`send_failed`, `conversation_locked` (a turn holds the conversation; the message names the holder),
+`forbidden` (a machine device calls a grant method, or `devices.revoke` names a phone), and `not_found` for an unknown machine name or device id.
+`not_running_agent` (the conversation's tab is left with a shell) and `agent_waiting_on_prompt` (the pane is blocked on a prompt), both refused before anything is typed,
+`agent_not_started` (a create's agent did not come up),
+`invalid_relative_path`, `not_found`, `binary_file`, `file_too_large`, `not_a_file`, `not_a_directory` and
+`directory_too_large` (file reads), `not_a_repository`, `git_refused` and `git_failed` (git reads).
+
+Protocol version: the bridge speaks Orca's mobile protocol 3 (`MOBILE_PROTOCOL_VERSION`), and the
+phone accepts a host with `minCompatibleMobileVersion` 2 or lower.
+
+## Mapping
+
+| Orca / app | sesync / herdr |
+|---|---|
+| host | this machine (the bridge) |
+| worktree | one sesync conversation: its parent session and that session's mirrors. `worktreeId = <repoId>::<conversation id>`; `repoId = sesync-<hash of the project directory>`, the same id `repo.list` reports; `conversation id = conv-<hash of harness and parent key>`. Both hashes are stable while the parent session's file or store id is. |
+| tab / terminal | one herdr pane running the conversation. A pane runs it when its foreground argv carries one of the conversation's session ids as a flag's value (`argv_carries`, the rule "open in herdr" uses), when no foreground argument names any conversation's session and the pane's agent reported one of this conversation's session ids to herdr (`agent.list`'s `agent_session`, as `omp --resume` started from omp's picker does; on Windows compared with `/` and `\` unified and case ignored, since herdr's path is all backslashes and sesync's resume path is mixed), or the bridge opened the pane for it. When no pane does, the pane runs it when the conversation is the one its tab tag or title names: the Open-in-herdr tag ends the pane's tab label; else the pane's agent is the conversation's harness and its terminal title, with the harness's prefix removed (omp `π` then a spinner or `>`; Claude Code a glyph such as `✳`; OpenCode `OC \| `), is the conversation's title, and when several conversations share that title, the one in the pane's foreground directory. Never ambiguous: a conversation a pane already runs directly takes no fallback, and a fallback two panes both fit goes to neither. Handle and terminal id = herdr's `terminal_id`, which stays with the terminal when its pane moves. |
+| agent status | herdr `agent_status`: `working` → `working`; `blocked` → `blocked`; `done` → `done`; `idle` or `unknown` → `waiting`. A tab row's `agentStatus` carries that `state`, `paneKey` (`tabId:terminalId`), `terminalHandle`, `agentType` (the conversation's harness), `providerSession.id` (the journal session id `nativeChat` reads by), and `interactivePrompt` when the pane is blocked on a recognised approval or question. Worktree status: working → `working`, blocked → `permission`, done → `done`, otherwise `active`/`waiting`. Session status (`agentSession.subscribeStatus`): working → `working`, blocked → `attention`, idle or done → `idle`, unknown → null. |
+
+## Terminal streams
+
+`terminal.subscribe` sends the screen as herdr renders it (`pane.read`, `source:"visible"`,
+`format:"ansi"`, `strip_ansi:false`), with every line break as CR LF.
+
+The size is the pane's real size. The bridge reads it from herdr's `pane.layout` (the rect's width and height) and
+announces it with `displayMode:"desktop"`. The phone's viewport is not used: herdr cannot fit a pane to the phone
+without changing the desktop layout, so the terminal is shown at the pane's own width and its lines do not wrap at
+the phone's width. Only when herdr gives no layout for the pane is the phone's viewport announced, with `displayMode:"auto"`.
+
+The size is read every second. A change sends the screen again as a resize: in binary mode a SnapshotStart whose meta
+has `kind:"resized"`, its chunks and a SnapshotEnd; in JSON mode `{type:"resized", cols, rows, displayMode, serialized}`.
+The stream then carries on with repaints from that screen. A screen change read in the tick before a size change still
+goes out as a repaint first; a size change never sends a repaint in the same tick.
+
+With `capabilities.terminalBinaryStream: 1` (what the app sends), the reply is a streamed JSON
+`{type:"subscribed", streamId, lines:[], truncated:false, cols, rows, displayMode:"desktop", seq:0}`, then
+binary frames tagged with that `streamId`. Each frame is `header ‖ payload`, 16-byte header:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | kind `0x74` |
+| 1 | 1 | version `0x01` |
+| 2 | 1 | opcode |
+| 3 | 1 | `0x00` |
+| 4 | 4 | streamId (u32 LE) |
+| 8 | 4 | seq high (u32 LE) |
+| 12 | 4 | seq low (u32 LE) |
+
+Opcodes used: `1` Output (UTF-8), `2` SnapshotStart (JSON meta `{kind:"scrollback", cols, rows, displayMode, truncated:false, truncatedByByteBudget:false, seq}`),
+`3` SnapshotChunk (UTF-8), `4` SnapshotEnd (empty). Text is cut into pieces of at most 48 KiB on character
+boundaries. Snapshot = SnapshotStart, its chunks, SnapshotEnd. A change is an Output carrying the full
+repaint `ESC[H ESC[2J` followed by the new screen, so no row from the previous frame survives.
+
+Without the capability the same screen goes as JSON: a `scrollback` result with `serialized`, then
+`{type:"data", chunk}` events, each a full repaint. A phone without the capability is served either way.
+
+**History.** The stream also carries the pane's history, the rows herdr keeps above the screen (`pane.read` "recent"
+with colours, at most 1000 rows with the screen), so the client can scroll back; only at the pane's real size
+(`displayMode:"desktop"`). Binary: every snapshot (`scrollback` and `resized`) is the history, one row per line, then
+the screen; the phone resets its terminal for a snapshot, so the history scrolls into its scrollback (5000 rows) and
+the screen stays in view. When the first row of the screen changes, the bridge reads the history again and finds the
+rows after the last 12 it sent (`HistoryMark`; three screens first, then all 1000); those rows lead the next Output,
+drawn from the top of a screen cleared with `ESC[H ESC[J` and scrolled off by line feeds at the bottom row, then the
+repaint. JSON: `{type:"history", lines:[…]}` events, oldest first, at most 48 KiB of rows each, after the
+`scrollback` result and before the repaint they left. Limits: rows lost when herdr's history is cleared or rewrapped
+are sent again in full (a client may show some twice); more than 1000 rows between two reads (250 ms) lose the
+oldest; a run of 12 identical rows can hide new rows that repeat it.
+
+The stream ends with `{type:"end"}` when the pane is gone or the stream is unsubscribed. Dropping the
+connection stops its streams.
+
+Orca's flow control (Ack) is for its multiplexer, which the phone does not use. Input from the phone
+goes through `terminal.send`, not binary Input frames. The phone's viewport is not claimed: the pane keeps herdr's size, and the phone shows it at that size.
+
+### Why polling
+
+herdr's `pane.updated` does not fire when a pane's output changes (checked against herdr 0.9.1: output
+from `pane.send_keys` and `pane.send_text` produced no event). `pane.output_matched` fires only when a
+matching line appears, and an events connection fixes its pane set when it opens, so it cannot follow
+panes that come and go. The bridge therefore polls: a screen every 250 ms (sent only when it changed),
+the tab and status lists every second, and the conversation list from disk every 5 seconds. A pane listing reuses
+each pane's processes, the agents' reported sessions and the tab labels for up to 5 s while the pane's listed fields
+(id, tab, agent, foreground directory) are unchanged (`herdr::ProcessMemo`), so a tick costs about two herdr
+requests, not two plus one per pane.
+herdr's `pane.agent_status_changed` is not used for screens, but it is used for notifications (see Notifications), so no turn is missed between samples.
+
+## Prompt turns
+
+A `terminal.send` with text and `enter:true` is a prompt. Before the text is typed, the bridge claims the
+conversation in sesync-lock (`claim <conversation> phone <bridge pid> <pane>`), the way a harness turn
+does, so the TUI, the daemon and the other harnesses cannot write the same conversation at once.
+
+- A claim another harness holds refuses the prompt with `conversation_locked`, naming the holder
+  (`claude 4242`). Nothing is typed.
+- A second prompt while the bridge's own turn runs (its agent has been seen `working` or `blocked`) is refused
+  the same way. One whose agent has not started (a model `/switch`, a `/login`, a turn the provider refused at
+  once) is taken over by the new prompt under the same claim; the old turn's watcher stands down. Before this, a
+  `/switch` held the conversation for 15 s and the phone's next message came back "Message not sent".
+- A pane with a detected agent gets the prompt through herdr's `agent.prompt` (text, then Enter, as one
+  ordered submission). Any other pane gets the text, then `enter`.
+- The claim is released when the agent is seen `working` or `blocked` and then `idle` or `done`. A
+  prompt the agent never acts on releases after 15 s. Every turn releases by 30 min at the latest, so a
+  stuck pane cannot lock a conversation. The release is `release <conversation> phone <bridge pid>`.
+
+Other input (`text` without `enter`, `interrupt`, `clearBuffer`) is not a turn and is not claimed. `interrupt` sends
+`ctrl+c`; `terminal.clearBuffer` sends `ctrl+l`.
+
+Slash commands go through the same path: omp runs `/switch <model>` (fuzzy id or `provider/id`) and `/login
+<provider>` typed this way, as from its own keyboard (checked against the e2e sandbox's omp: `/switch fake/fake-32k`
+sent as the phone's chat does, `\x15` to clear the line and then the text with `enter`, changed the model).
+`/login` shows its authorization link and code prompt only on the terminal screen.
+
+Every refused request is logged as `bridge: <method> refused: <code>: <message>` (the bridge's own wording,
+never the prompt), so a "Message not sent" on the phone can be traced.
+
+## Framing: legacy for the phone, hybrid for sesync clients, and a correction
+
+The brief said v2 framing (`e2ee_hello` with `v:2`, transcript hash) is needed only for relay. That is
+not what the source shows. For direct connections, `rpc-client-socket-session.ts` dials **v2 first**
+and falls back to legacy only if the host closes with `4001` before `e2ee_ready`, and only for a host
+it has never seen speak v2 (`paired-e2ee-framing-policy.ts`).
+
+So this bridge implements legacy framing and answers any v2 hello with close `4001` before ready. The
+app then redials with the legacy hello. Cost: one refused dial on first pairing. Implementing v2 is
+deferred; the interop check below covers this path.
+
+**Hybrid (`v:3`, `hybrid.rs`), for sesync clients (`sesync machine`).** The hello carries a fresh X25519 key and a
+fresh ML-KEM-768 encapsulation key: `{"type":"e2ee_hello","v":3,"publicKeyB64":…,"mlkemEncapsulationKeyB64":…}`.
+The bridge encapsulates and answers `{"type":"e2ee_ready","v":3,"mlkemCiphertextB64":…}`, or `e2ee_error` and
+a close for a key that is not ML-KEM-768. Both sides run HKDF-SHA384 over the X25519 secret (the client's key with
+the bridge's pinned key, the one the offer carries) and the ML-KEM shared key, salted with the protocol's label and
+bound to a SHA-384 of the transcript (both X25519 keys, the encapsulation key, the ciphertext). That gives one
+AES-256-GCM key per direction. Every later frame is `base64(counter ‖ ciphertext ‖ tag)` (binary frames without
+base64): an 8-byte big-endian counter from 1, which is also the nonce, and a frame whose counter is not above the
+last one opened is dropped, so frames cannot be replayed or reordered. Auth and RPCs are then as for the phone.
+The client refuses an `e2ee_ready` without the ciphertext (a bridge that speaks only legacy): no fallback.
+
+## Security
+
+- **Crypto: hybrid for machines, classical for the phone.** A recorded `sesync machine` session needs both the
+  X25519 and the ML-KEM secret to read, and the ML-KEM one is fresh per connection. The bridge is still
+  authenticated only by its pinned X25519 key; resisting an attacker who breaks X25519 during a live connection
+  would need an ML-DSA signature. The phone's channel is Orca's legacy X25519 + XSalsa20-Poly1305, classical,
+  acceptable only because it runs inside WireGuard (also classical) until the app speaks the hybrid hello.
+- **Pairing is the trust decision.** Whoever can read the offer can pair. Show the QR only to the
+  phone being paired. Revoke with `sesync bridge revoke`.
+- **A paired phone can type into your agents.** `terminal.send` writes text and Enter into the herdr
+  panes that run your conversations, and `agent.prompt` submits prompts to their agents. Treat a paired
+  phone as a keyboard on this machine's agent sessions. The conversation claim stops a phone from writing
+  while the TUI or another harness is mid-turn, but it does not stop a phone from typing when they are idle.
+- **Tokens:** 256 random bits; stored as SHA-256; compared in constant time; checked on every
+  frame; a revoked device is refused on its next frame.
+- **Network:** a peer outside the allowlist is dropped at accept, before any protocol bytes. Only
+  IPv4 is bound. An IPv4-mapped IPv6 peer is checked against the same list.
+- **Limits:** 1 MiB messages; each frame before auth must arrive within 10 s of the one before. A
+  frame that does not decrypt is dropped without a reply. Terminal snapshots and frames are 48 KiB
+  pieces; a screen is at most the pane's visible rows.
+- **What a paired phone can read:** conversation titles, harness names, project directory paths, and
+  the visible screen and last 200 rows of each pane that runs a conversation. Read-only, it can also
+  read the files under each conversation's project directory and that repository's git status, diffs,
+  history and branch comparisons (see Files and source control), and any PNG, JPEG, GIF or WebP image on the
+  host by its absolute path (see Images). Nothing else from the session stores is
+  sent. Its only writes are `server.key`, `devices.json`, `pins.json`, `machines.json` (the grants, see Machines the phone grants),
+  the sesync-lock claims for prompt turns, and the upload staging.
+- **Notifications and push.** The ntfy publish token is read once at startup and held in memory; it is never logged or written. Publishing is best effort on a detached thread: a failure is logged without the token and never blocks a notification.
+- **Uploads.** Staged images live under `$SESYNC_CONFIG_DIR/bridge/uploads/<conversation>/` (directory `0700`, files `0600`), at most 20 MB decoded per image, and must start with a PNG, JPEG, GIF or WEBP signature. An upload that is refused or idle for 5 minutes is removed.
+- **File transfer.** A paired phone or machine can **read any file or folder on this host by its path** (`transfer.startDownload`) and **write any file into the inbox folder** (`transfer.startUpload`). That is the same reach as typing into a shell here, which the first bullet already grants, so it adds no new trust, but it is a file-sized way to use it. Uploads stay inside the inbox (the name is cut to its last component and nothing is overwritten); downloads are not confined, as with images. On Unix the inbox is `0700` and its partial files `0600`. Windows has no such permission bits here (`restrict` is a no-op), so the inbox and `transfer.json` keep the permissions the user profile gives them, and the inbox folder is as private as the folder you choose.
+- **Approval keys.** A paired phone can answer an approval by typing its key into the pane (`terminal.send` with `enter:false`): the same reach as typing into the pane.
+- **A paired phone decides which machines see each other.** `machines.grant`, `machines.accept`, `machines.forget` and `devices.revoke` link this machine to another machine's bridge, or take the link back. A granted link is a `machine` device on this bridge: the other machine reads and drives this bridge as the phone does (every method but the grant ones), and its token stops working on its next frame when the phone takes the link back. A machine device is refused the grant methods (`forbidden`), so a granted machine cannot give access to a third. Only a phone's `machines.accept` writes a machine's entry into `machines.json`.
+- **Not done yet:** per-device permissions beyond the device kind (a phone has every method above; a machine device has them all but the grant methods), rate limiting,
+  audit logging beyond connect/refuse lines, a revocation UI, key rotation for `server.key`, and a
+  read-only mode.
+
+## Files and source control (read-only)
+
+The file explorer, file previews, terminal file links, the `@` file search and the Changes and Commits tabs read the conversation's project directory, the `dir` the conversation records. Every path the phone names is checked twice: lexically (no absolute path, except an image's, see Images; no `..`, no NUL byte, no `.git` component), then again after symlinks are followed (a link that leaves the project, or points into `.git`, is `invalid_relative_path`). The check lives in `confine.rs`. `.git` is never listed or read, because its config can hold remote credentials.
+
+Caps: a text file is read up to 1 MiB and marked `truncated` when cut; an image preview is at most 2 MiB; a directory lists at most 5 000 entries (more is `directory_too_large`, never a silent cut); `files.searchPaths` walks at most 50 000 entries and returns `limit` rows.
+
+Git runs only through one runner (`git.rs`). Its allowlist is the verbs `status`, `diff`, `log`, `show`, `merge-base` and `rev-parse`, each with the read-only options the code lists: for example `--porcelain=v2 -z --branch` for status, `--no-ext-diff --no-textconv` for diff, and `--no-show-signature` for log and show, so a repository's own signature settings never run gpg. Any other verb, and any other option (`--output`, `--ext-diff`, `--textconv`, `-c`, `--git-dir`), is refused as `git_refused` before git starts. A revision from the phone is 1 to 255 characters from `[A-Za-z0-9._/@+-]` with no leading `-` and no `..`; a commit id is 40 or 64 hex digits; paths follow `--`. git runs with `-c core.fsmonitor= -c core.hooksPath=/dev/null` and `GIT_OPTIONAL_LOCKS=0`, with `GIT_DIR` and `GIT_WORK_TREE` removed from its environment, a 10 s limit and an 8 MiB output cap.
+
+Apart from pins and `terminal.clearBuffer` (Ctrl-L into the pane), none of these methods writes.
+
+## Chat view
+
+The chat screen for a terminal-backed agent reads the conversation's journal, not the pane. `nativeChat.readSession` and `nativeChat.subscribe` take the journal session id from the tab's `agentStatus.providerSession.id` (for omp and Pi, the session file path, which `omp --resume` takes). omp and Pi journals are read in process: the window starts at the last compaction's kept entry, and the compaction shows as a system line. Tool calls and their results are linked by call id, thinking is shown as text, and an image is a label (its bytes never go on the wire). Claude and OpenCode are converted first, by the converters the daemon uses: a Claude transcript by `sesync-conv from-claude`, an OpenCode session by `opencode export` run in the session's project directory and then `sesync-conv from-opencode`. The converted copy is kept under `<bridge state dir>/transcripts/` (owner-only), one per source state, named by the conversation and a digest of the source's stamp (a file's size and change time, or the store's own counts for the session). A read converts only when the stamp moved, and older copies are removed. A subscription rebuilds the copy once the stamp has held still for a poll (one second), or at most every five seconds while it keeps moving; conversions run one at a time. A harness whose source cannot be stamped answers `unavailable`. Paging uses a row cursor: `beforeOffset` is a record's position in the file. A subscription checks the file's length and modification time each second; a grown window is `appended`, a moved one is `replacement`.
+
+A reply that ended in a provider error (`stopReason:"error"`) shows why: `Model call failed (<provider>/<model>):
+<the provider's message> (HTTP <status>)`, as a system line when the reply has no content, or after its text. Before
+this, such replies were dropped, so a session whose login had expired showed nothing in the chat while every
+prompt failed (2026-10-31: `invalid_grant` on refresh, then "Your credit balance is too low" from the API-key
+fallback, three times, visible only in the terminal).
+
+Composer prompts are `terminal.send` (see Prompt turns). The app sends them with bracketed paste already applied.
+
+## Approvals
+
+When herdr reports a pane `blocked`, the bridge reads its last 60 screen lines and recognises the harness's prompt. omp and OpenCode approval and question screens are captured in `sesync/tests/fixtures/approvals/`. The tab row then carries `agentStatus.interactivePrompt` as a JSON string: `{"approval":{"tool","summary"}}` for an approval, or `{"questions":[…],"toolName"}` for a question. The keys are typed into the pane: approve is Enter (`\r`) and deny is Esc, both sent by the app through `terminal.send` with `enter:false`. Claude Code is not recognised: fake-model cannot speak the Anthropic API, so its prompt format is unverified here.
+
+## Images
+
+`clipboard.startImageUpload {expectedBase64Length}` returns `{uploadId}`. `appendImageUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` equals the bytes so far), at most 512 Ki base64 characters per chunk. The total is limited to 24 Mi base64 characters and 20 MB decoded. `commitImageUpload` returns the staged absolute path as a string, which the app inserts into the prompt as `@path`. omp expands that into an image input, so the model request carries an image part (fake-model counts these as `images`). `saveImageAsTempFile {contentBase64}` does the same in one call. The app's clipboard params carry no `worktree`, so uploads stage under `_unscoped`. The chat shows a staged image again in its history by reading that absolute path with `files.readPreview`.
+
+An agent shows a picture it made as markdown, `![alt](/abs/path.png)`, usually outside the project (`/tmp`, another repository). The chat reads such a path with `files.readPreview` too, so the image itself shows in the reply. This reaches images anywhere on the host on purpose: a paired phone already types into shells here (see Security), so an image adds no reach, while every file that is not an image by extension and signature stays refused.
+
+## File transfer
+
+Any file or folder moves in both directions over the same link, for a phone or a `sesync machine` client. Code: `bridge/transfer.rs` (the bridge) and `machines/send.rs` (the client).
+
+**The methods are `transfer.*`, not `files.*`, on purpose.** Orca's own runtime already has `files.commitUpload`, a worktree-scoped rename taking `{worktree, tempRelativePath, finalRelativePath}`. A phone talks to Orca hosts and to this bridge, so a bridge method of the same name with other params would answer an Orca-shaped call with a confusing validation error, or run the wrong thing. The bridge's pre-existing read-only `files.readDir`, `files.read`, `files.readPreview`, `files.resolveTerminalPath` and `files.searchPaths` keep Orca's names and shapes because they match them.
+
+- **Upload, client to this machine.** `transfer.startUpload {name, expectedBase64Length?}` returns `{uploadId}`. `transfer.appendUploadChunk {uploadId, offset, contentBase64}` must arrive in order (`offset` counts base64 characters), at most 512 Ki characters per chunk. `transfer.commitUpload {uploadId}` returns `{path, name, bytes}`. `transfer.abortUpload {uploadId}` drops it. The file lands in the **inbox folder** under its name cut to the last path component (no `..`, no separators, no leading dot, control characters and `:*?"<>|` replaced). A name already there is never overwritten: the new file is `name (1).ext`, `name (2).ext`, and so on. The partial file is `.<id>.part`, removed on any refusal and after 5 minutes idle. At most 8 uploads at once; at most 2 GiB per file.
+- **Download, this machine to the client.** `transfer.startDownload {path}` takes any file or folder path on this host (a leading `~/` is the home directory) and returns `{downloadId, name, bytes}`. A folder is zipped first, entries under `<folder>/`, deflate, **symlinks left out** so a link cannot pull in a file from elsewhere; the zip is staged in `bridge/transfer/` (`0600` on Unix) and removed when the download ends. `transfer.readDownloadChunk {downloadId, offset}` returns `{offset, contentBase64, done}`, 384 KiB per chunk. `transfer.endDownload {downloadId}` forgets it. A path that does not exist is `not_found`; a device or socket is `bad_request`; over 2 GiB is `file_too_large`.
+- **Inbox folder.** `transfer.inbox` returns `{path}`. It is `inbox` in `$SESYNC_CONFIG_DIR/transfer.json`, default `~/sesync-inbox` (on Windows `%USERPROFILE%\sesync-inbox`), created `0700` when missing on Unix. The bridge reads the file on every upload, so a change applies at once. Change it in the TUI's Settings tab (Tab to the last tab, Enter, type a folder, Enter): the folder must be absolute, creatable and writable, or it is refused and the old one stays.
+- **Client.** `sesync machine send <name> <file or folder>` uploads into that machine's inbox (a folder is zipped here first, symlinks left out, in an owner-only temp file removed afterwards) and prints where it landed. `sesync machine get <name> <path there> [<folder here>]` downloads into a folder here (default: the current directory) and never overwrites. The grant direction matters: `send` and `get` dial the **other** machine's bridge, so each works only toward a machine this one has a link to.
+
+## Dictation
+
+The mic in the native chat composer (Dictate, to the right of the attachment "+") records 16 kHz mono PCM and streams it as `speech.dictation.chunk` calls. `speech.dictation.finish` wraps the recording as a WAV and posts it to the whisper server that `~/.local/bin/dictate-toggle.sh` uses: llama-swap's OpenAI-compatible `/v1/audio/transcriptions`, with the multipart fields `file`, `temperature=0.0`, `model`, `language` and `response_format=json`. The transcript comes back as `[TRANSCRIBED] <text>`; the app inserts it into the composer and never sends it.
+
+Configuration, read from the environment of `sesync bridge serve`: `SESYNC_WHISPER_URL` (else `whisperUrl` in the settings file; with neither, dictation is off: `speech.models.list` answers `enabled: false` and a start is refused with `dictation_unavailable`), `SESYNC_WHISPER_MODEL` (default `whisper-gpu`) and `SESYNC_WHISPER_LANGUAGE` (default `auto`). A transcription may take 60 s, as the script's `curl -m 60` allows.
+
+Limits and lifetime: one dictation per phone connection; a second `start` on that connection is `dictation_already_active`, and a `start` from another connection replaces the one held. A chunk is at most 5 s, and a recording at most 5 minutes: the chunk that would pass 5 minutes is refused and the app cancels. Audio stays in memory only. `finish`, `cancel` and the connection's close drop it, and nothing is written to disk.
+
+Errors: `bad_request` for malformed chunks and `No audio captured` when finish holds no audio; `unavailable` with the reason when the speech server is unreachable, answers an HTTP error, times out, or replies without `text`; `dictation_stream_not_started` and `dictation_owner_mismatch` when a chunk or finish does not match the held dictation. An empty transcript is `text: ""`, which the app reports as "No speech detected."
+
+`speech.models.list` does not probe the speech server: an unreachable server surfaces at `finish`. `speech.dictation.setup`, `speech.models.download` and `speech.models.delete` stay unserved (`method_not_found`); the mic path never calls them. Client: `mobile/src/hooks/use-mobile-dictation.ts`.
+
+## New sessions
+
+`preflight.detectAgents` lists the agents on PATH from the table in `start.rs` (claude, omp, opencode, pi, and antigravity as `agy`). `session.tabs.createTerminal {worktree, agent}` has two cases, decided by the worktree id:
+
+- **A conversation's worktree** (a `worktree.ps` row, `<repo>::conv-…`) resumes the conversation the way "Open in herdr" does (`herdr_open::open_with_focus`, with focus left alone). A pane herdr already lists as running the conversation is reused. Otherwise a tab runs the harness's resume command (`omp --resume <session>`, `claude --resume <id>`, `pi --session <session>`), so the conversation's own journal grows. The reply is the pane herdr lists as running it, once herdr reports its agent up (not `unknown`), so a prompt sent after the reply is not lost in the agent's start-up screen. `agent` may be omitted or must equal the conversation's harness (`conversationAgent` on the row); any other agent fails with `bad_request` before anything opens. `cwd` is refused. A tab left with an idle shell (the agent quit) gets the resume command typed into that shell. With no workspace left in herdr, a workspace opens in the conversation's directory. A resume that never lists its pane within 10 s closes the tab it made and fails with `agent_not_started`. A conversation this host does not list (a copy on another host) fails with `worktree_not_found`, "not on this machine", and nothing opens.
+- **A project's worktree** (no conversation; the selector is a repo id) opens an unfocused herdr tab in the project's directory and starts the agent with `agent.start`, with no resume argument, or a plain shell when no agent is named. The pane is recorded against the project's id, which no conversation has, so no conversation lists it.
+
+Chat sends (`terminal.send` with `enter`) are refused with `not_running_agent` when the pane's tab carries a conversation's tag but no agent runs in it (the agent quit and the shell is left), and with `agent_waiting_on_prompt` when herdr reports the pane `blocked`. Nothing is typed in either case. A conversation's pane is listed only while its foreground argv carries the session's id (or its tab's tag names it), never by a record kept by the bridge, so a terminal id herdr reuses after a restart belongs to no conversation.
+
+## Notifications
+
+A watcher keeps one herdr events connection (`events.subscribe`) for pane-list events and for `pane.agent_status_changed` of the panes that can change status (an agent runs, or herdr reports a status), and observes every status change as it arrives, before any re-read of the pane list, so a turn is seen however short it is (a re-read can already show the turn over). It reads the pane list again on a pane-list event, on a status move, and every 30 s as a safety net; a title or agent change re-places the pane without a read. It re-reads the conversations every 5 s only while an agent pane runs. A pane whose argv changes with no pane or status event is placed at the next 30 s read. Per pane, `working` → `idle` or `done` is finished, and any change into `blocked` that was not already blocked is needs input. The first observation of a pane records it and raises nothing. Events carry a sequence number and the process's epoch. The in-app stream sends `{type:"notification", source:"agent", title, body, worktreeId, paneKey (the terminal id), notificationId "<epoch>:<seq>", notificationSeq, notificationEpoch, agentState ("done" or "blocked"), emittedAt}`; the body is the conversation's title. The last 200 events stay in memory for `getMissedSince`. With push enabled, each event is also published on a detached thread to `<ntfy url>/<topic>` with `Authorization: Bearer`, the headers `Title` ("Agent finished" or "Agent needs input"), `Priority` (3 or 4) and `Tags`. Dismissal is not implemented: `dismissedPushes` is always `[]`.
+
+`notifications.testPush` sends one synthetic frame, `{type:"notification", source:"test", title:"Test notification", notificationId:"test:<epoch>:<n>"}`, to every open `notifications.subscribe` stream. It is not kept in the history, takes no sequence number and never goes to ntfy. The reply is `{accepted:true}`, or `{accepted:false, reason:"unavailable"}` when no stream is open.
+
+## Plan usage
+
+`accounts.list` and `accounts.subscribe` answer the app's `AccountsSnapshot`: the `claude` and `codex` account lists and the `rateLimits.claude|codex.{session,weekly}` bars (`usedPercent`, `windowMinutes`, `resetsAt` in ms or null). The bridge maps `omp usage --json` to it: the 5-hour window is the session bar and the 7-day untiered window the weekly bar; Anthropic is `claude`, OpenAI Codex is `codex`. Every login is also an inactive row. omp does not say which login is the system default, so with exactly one login for a provider that login's usage also fills `rateLimits.claude` (or `codex`), the bars the app draws for the system default; with several logins those stay null and the app shows no default bars. Nothing else from the report is shown. A failed refresh keeps the last good snapshot, and a subscriber gets a frame only when the usage changes. The bridge never sends provider credentials to the phone. Verified live against the e2e fixture (one login: `rateLimits.claude.session.usedPercent` 25).
+
+## Session data
+
+`worktree.ps` and `repo.list` read the listing the TUI uses (`manage::list_groups`) on the saved
+`state.json`, read-only, through each harness's own cwd or store row, and resolve each conversation's
+herdr session identifiers through the harness's resume command. It does not run the daemon's save-time
+steps, so a session the TUI hides only in memory can show here until the daemon next saves. The catalog keeps what
+it read between builds and reads again only what moved: each journal's title by the file's size and mtime
+(`TitleCache`), each store's rows by its files' stamps (`Harness::rows_stamp`; OpenCode's database, `-wal` and
+`-journal`, so an idle bridge no longer opens the database and rewrites its `-shm`), and each project folder. A file
+replaced with the same size and mtime is seen at its next change. On Linux with glibc the bridge sets `mallopt`'s
+mmap threshold to 128 KiB, so the large title-read buffers go back to the system instead of staying in the heap
+(idle RSS about 10 MB).
+
+## Herdr access
+
+The bridge talks to herdr over its Unix socket: one JSON request per line, one reply line per request,
+each request on its own connection (herdr closes a request connection after its reply; only an events connection
+stays open), 5 s timeout. The socket is `$HERDR_SOCKET_PATH`, else
+`$HOME/.config/herdr/herdr.sock`; `--herdr-socket` overrides it. Methods used: `pane.list`, `pane.get`,
+`pane.process_info`, `pane.read`, `pane.send_text`, `pane.send_keys`, `agent.prompt`, `agent.list` (the session each agent reported, read only when an agent pane is listed), `tab.list` (tab labels, read only when an agent pane is listed, for the tag rule), and `pane.layout` (the pane's size, for `terminal.subscribe` and the size checks). The bridge never
+creates, closes, or resizes panes. Verified against herdr 0.9.1 (protocol 22):
+
+- `pane.read` with `format:"ansi"` returns CRLF line endings and the colour codes herdr keeps.
+- `pane.send_keys` takes names such as `enter`, `ctrl+c`, `esc`, `space`; `pane.send_text` types raw text.
+- `pane.process_info` reports each foreground process's `argv`; a pane started with `sh … --resume <id>`
+  reports that argv while the shell's loop runs.
+- Real agent detection (`agent`, `agent_status`) needs a recognised agent binary; the tests use a shell
+  stand-in, so `agent.prompt` and the status mapping for detected agents are covered by unit tests only.
+
+## Verification
+
+Run with a sandboxed HOME, as `AGENTS.md` requires.
+
+```sh
+cd sesync
+SB=$(mktemp -d)
+env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test --lib bridge
+env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test --test bridge
+env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" cargo test --test bridge_resources
+```
+
+The live tests in `tests/bridge.rs` (`a_prompt_typed…`, `an_approval_card…`, `an_uploaded_image…`, `a_new_agent_tab…`, `finished_and_needs_input…`) need herdr and omp on PATH and a fake-model build: `FAKE_MODEL_BIN`, or the static build in the sibling `sesync-wt-fake-model` worktree. Each skips with a note when they are missing.
+
+- `src/bridge/*`: unit tests for the herdr reply and pane parsing, the conversation id and worktree
+  mapping, the tab, terminal and status shapes, the binary frame codec and 48 KiB chunking, the
+  stream registry, the prompt claims (against a stand-in sesync-lock script, including a holder being
+  named and a timed release), the RPC dispatch against canned herdr answers, the pane fallback rules (the tag, the title and directory, ambiguity, and that an argv or owner match is never overridden), and the chat conversions (cached per source state, replaced when it moves, owner-only).
+- `src/bridge/pins.rs`: pins survive a reload, the file is owner-only, a damaged file fails the write and is left alone, `isPinned` must be a boolean, and no other field is accepted. `rpc.rs` tests: the pin shows on the worktree row, `terminal.clearBuffer` sends Ctrl-L and reports a missing pane, write verbs and unserved methods answer `method_not_found`, and every read method is routed. `notify.rs`: a test push reaches a live stream, is kept out of the history, and is refused with no stream.
+- `src/bridge/devices.rs`: a token's kind, a record without `kind` loads as a phone, an unknown kind denies every token, the machine-only revoke refuses a phone and an unknown id. `src/bridge/grants.rs`: grant, accept (saved even when the machine does not answer), forget (returns the grant id), list (no tokens), refusals of bad names, endpoints and keys. `rpc.rs`: a machine device is refused the five grant methods and a phone is not. `machines/store.rs`: the grant id round-trips and an older `machines.json` loads, and `sanitize_name` always passes the name rule. `tests/bridge.rs` `a_phone_grants_a_machine_a_link_and_taking_it_back_stops_that_link`: two in-process bridges, grant, accept, A's machine client reads B, a machine device is refused over the wire, forget and revoke, and the same client is refused.
+- `src/bridge/dictation.rs`: the WAV and multipart shapes, the owner and lifetime rules, every refusal (oversize chunk and recording included), and the whisper outcomes (success, HTTP error, no `text`, timeout, unreachable). `tests/bridge.rs`: a dictation round trip over the encrypted link, a 503 and an oversize chunk, and a timeout. One `#[ignore]`d test hits the live server with `SESYNC_LIVE_WAV`.
+- `src/bridge/confine.rs`, `files.rs`, `git.rs`: the path confinement (`..`, absolute paths, NUL, `.git`, a symlink that leaves the project or enters `.git`), the size caps, the `.gitignore`-honouring search, the git allowlist (every other verb and each unlisted option is refused before git starts, and a write verb leaves the repository unchanged), and reads of real files and a real `git init` repository in a sandbox. `rpc.rs` also runs a live repository through dispatch.
+- `src/bridge/e2ee.rs` pins the NaCl framing against a tweetnacl vector (both directions, and the
+  server public key derivation).
+- `tests/bridge.rs` drives a real loopback WebSocket server with a Rust client: hello, auth, status,
+  `method_not_found`, bad token, revocation, v2 fallback, allowlist, the real `StateCatalog` over an
+  omp fixture, and `worktree.ps` with and without herdr. Its last test starts a real `herdr server` in a
+  sandboxed HOME (skipped with a message when herdr is not on PATH), runs a shell stand-in agent whose
+  argv carries the session id, and then, over the encrypted link: lists the conversation, its tab and
+  terminal, reads the screen, subscribes with the binary stream (the snapshot must show `hello`), types
+  `ping` with Enter and reads the echo `got: ping` back as an Output frame, subscribes again with the
+  JSON events, unsubscribes, and reads the status stream.
+- `tests/bridge.rs` (Claude and OpenCode chats): a Claude transcript and an OpenCode store in a sandboxed HOME, with a fake `opencode` CLI that answers only from the session's directory and a fake herdr socket, are opened over the encrypted link. Tabs list, `nativeChat.readSession` reads both, a turn appended to the transcript and a row added to the store arrive on `nativeChat.subscribe`, and `terminal.send` reaches each pane as `agent.prompt`. `tests/opencode_export.rs` checks the export runs from the session's project directory.
+- `tests/bridge_resources.rs` starts the built `sesync bridge serve` with no phone connected and asserts
+  its resident memory is under 20 MB (measured 12–13 MB across runs).
+- Phase 2 (`tests/bridge.rs`, live): a prompt typed into a live omp pane reaches `nativeChat.readSession`; an approval card denies without writing and approves by running the tool; an uploaded image reaches the model request log as an image part; a created tab is listed; finished and needs-input notifications reach the in-app stream and a local ntfy stand-in. Unit tests cover the transcript window and paging, the approval recognisers against the captured screens, upload staging and limits, the notification transitions and the ntfy request, the usage mapping, and the new RPC shapes.
+- `fork/e2e/backend.sh up|down <stateDir>` (orca-phone) starts the same stack for the emulator suite and writes `<stateDir>/env`.
+
+Interop with Orca's own TypeScript (`tools/bridge-interop`): it copies the Orca files it needs
+(pairing codec and schema, compat gate, host status schema, method-unavailable rule, mock E2EE
+framing) and runs 13 checks against a live bridge. It predates the phase-1 methods and does not cover
+the terminal stream.
+
+```sh
+SB=$(mktemp -d)
+env HOME="$SB" ./target/debug/sesync bridge pair --endpoint ws://127.0.0.1:6768 --label interop | grep '^url:'
+env HOME="$SB" ./target/debug/sesync bridge serve --listen 127.0.0.1:6768 &   # stop it by PID afterwards
+cd tools/bridge-interop && npm install && ORCA_PHONE_DIR=~/projects/orca-phone npm run interop -- "agenthub://pair?code=…"
+```
+
+Not verified here: a real phone, the emulator run (orca-phone `fork/e2e`), a live `omp usage --json` run, Claude Code approvals, and real ntfy delivery.

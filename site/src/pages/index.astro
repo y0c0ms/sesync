@@ -1,0 +1,310 @@
+---
+import Layout from '../layouts/Layout.astro';
+const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const repo = 'https://github.com/y0c0ms/sesync';
+const docs = `${repo}/blob/main/docs`;
+---
+<Layout title="sesync: one conversation across coding agent harnesses" description="sesync keeps one AI coding conversation in step across omp, Pi, OpenCode, Claude Code and Antigravity CLI, with a lock, a TUI, a herdr popup, a phone bridge and machine-to-machine prompts.">
+
+  <section class="intro">
+    <h1>sesync</h1>
+    <p class="lead">One conversation, kept in step across several coding agent harnesses. Only one harness writes to a conversation at a time.</p>
+    <p>Start a conversation in omp, continue it in Pi, pick it up in OpenCode, resume it in Claude Code. sesync converts each copy, keeps the copies current, and locks the conversation while a turn is running.</p>
+    <p>Source: <a href={repo}>github.com/y0c0ms/sesync</a> · Docs: <a href={`${repo}#readme`}>README</a> · License: MIT</p>
+  </section>
+
+  <section id="what">
+    <h2>What it is</h2>
+    <p>A conversation has one <strong>source</strong>: the harness where it is live. Every other harness you chose gets a converted <strong>mirror</strong>. Answering inside a mirror moves the source there. The other mirrors then follow.</p>
+
+    <div class="flow" role="img" aria-label="The source conversation is converted into mirrors in each chosen harness">
+      <div class="node source"><strong>Source</strong><br />the live harness<br />(for example omp)</div>
+      <div class="arrow" aria-hidden="true">→</div>
+      <div class="mirrors">
+        <div class="node">Mirror: Pi</div>
+        <div class="node">Mirror: OpenCode</div>
+        <div class="node">Mirror: Claude Code</div>
+      </div>
+    </div>
+
+    <ul>
+      <li><strong>Turn-taking.</strong> A reply typed into a mirror makes that harness the source.</li>
+      <li><strong>The lock.</strong> A conversation is locked while a harness takes a turn. The lock is claimed at turn start and released at turn end. An idle conversation holds nothing. A refused claim blocks the prompt and names the holder.</li>
+      <li><strong>Mirrors are derived.</strong> A mirror is rebuilt from its source. The daemon skips any conversation that is locked.</li>
+      <li><strong>Archive before replace.</strong> Bytes that sesync did not write are archived before anything replaces them.</li>
+    </ul>
+
+    <p>The format converter is <code>sesync-conv</code>. The omp/Pi journal is the interchange format. Reasoning content is kept for omp, Pi, OpenCode and Antigravity, and dropped for Claude Code, which signs its own reasoning blocks.</p>
+  </section>
+
+  <section id="tui">
+    <h2>The TUI</h2>
+    <p>Run <code>sesync --tui</code>. The tabs are <strong>Sessions</strong>, <strong>Team</strong> and <strong>Machines</strong>. The command palette is <kbd>ctrl+p</kbd>. The divergence dialog opens when two copies of a conversation have moved on separately. <strong>Open in herdr</strong> (<kbd>o</kbd>) opens the selected session in herdr.</p>
+
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/tui-sessions.gif`} alt="Sessions tab" width="1260" height="700" loading="lazy" /></div>
+      <figcaption>Sessions: each conversation with its mirrors, sync age and team status. Pick one to see its copies.</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/tui-team.gif`} alt="Team tab" width="1260" height="700" loading="lazy" /></div>
+      <figcaption>Team: the conversations this machine shares or the team holds, with where each stands (in step, waiting to push, behind, or diverged).</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/tui-machines.gif`} alt="Machines tab" width="1260" height="700" loading="lazy" /></div>
+      <figcaption>Machines: paired machines, their address and status, and the conversations each one reports.</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/tui-palette.gif`} alt="Command palette" width="1260" height="700" loading="lazy" /></div>
+      <figcaption>Command palette (<kbd>ctrl+p</kbd>): lists every command for the current tab, such as joining or leaving a team.</figcaption>
+    </figure>
+
+    <h3>Divergence dialog</h3>
+    <p>When two copies of a conversation each have new turns after their common history, the dialog shows both sides. It offers five choices and "decide later". Every choice except "decide later" keeps both histories.</p>
+    <p>Full details: <a href={`${docs}/ARCHITECTURE.md`}>docs/ARCHITECTURE.md</a>.</p>
+  </section>
+
+  <section id="herdr">
+    <h2>The herdr popup</h2>
+    <p>herdr is a terminal multiplexer for coding agents. Add this to <code>~/.config/herdr/config.toml</code>, with <code>sesync</code> on herdr's PATH:</p>
+<pre><code>[[keys.command]]
+key = "ctrl+alt+s"
+type = "popup"
+command = "sesync --tui"
+description = "sesync: open a session"
+width = "90%"
+height = "85%"</code></pre>
+    <p>Press <kbd>ctrl+alt+s</kbd> in herdr to open the TUI as a popup. Pick a session and choose <strong>Open in herdr</strong>. If a herdr pane already runs that session, its tab is focused. Otherwise a new tab opens in the session's directory and types the harness's resume command.</p>
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/popup-herdr.gif`} alt="The sesync popup inside herdr" width="1260" height="700" loading="lazy" /></div>
+      <figcaption>The sesync TUI as a herdr popup.</figcaption>
+    </figure>
+  </section>
+
+  <section id="phone">
+    <h2>Phone app control</h2>
+    <p>The Agent Hub app for Android runs the bridge's protocol. It is built on Orca's mobile protocol. The bridge is <code>sesync bridge serve</code>. It listens on <code>0.0.0.0:6768</code> by default.</p>
+
+    <h3>Pairing</h3>
+    <pre><code>sesync bridge pair --endpoint ws://HOST:6768 --label phone</code></pre>
+    <p>This prints a pairing offer, an <code>agenthub://pair?code=</code> URL and a terminal QR code. The device token appears only in that output. <code>--endpoint</code> is the address the phone dials. If you omit it, the <code>endpoint</code> value from the settings file is used. If neither is set, pairing stops and asks for one. Nothing here opens a firewall port.</p>
+    <p>Show the QR code only to the phone being paired. Whoever can read the offer can pair. Remove a device with <code>sesync bridge revoke &lt;device-id&gt;</code>. Its token is refused on the next frame.</p>
+
+    <h3>What the phone can do</h3>
+    <ul>
+      <li>List conversations, with their project and herdr status.</li>
+      <li>Read each transcript, and open its herdr pane live.</li>
+      <li>Send prompts and answer approvals.</li>
+      <li>Send images, and send or receive files.</li>
+      <li>Dictate prompts (needs a Whisper-compatible server).</li>
+      <li>Start new sessions.</li>
+      <li>Receive push notifications through ntfy, when ntfy is configured.</li>
+      <li>Show plan usage, read from <code>omp usage --json</code>.</li>
+      <li>Set the <strong>"can see"</strong> switch. It links one paired machine to another, so each machine can reach the other.</li>
+    </ul>
+
+    <div class="phone-row">
+      <figure>
+        <img src={`${base}media/app-chat.png`} alt="Agent Hub chat view with a prompt and a reply" width="1080" height="2400" loading="lazy" />
+        <figcaption>Chat view: prompt, reply and an image.</figcaption>
+      </figure>
+      <figure>
+        <img src={`${base}media/app-approval.png`} alt="Agent Hub approval card" width="1080" height="2400" loading="lazy" />
+        <figcaption>Approval: a tool call waiting for a decision.</figcaption>
+      </figure>
+      <figure>
+        <img src={`${base}media/app-resume.png`} alt="Agent Hub conversation resumed on the phone" width="1080" height="2400" loading="lazy" />
+        <figcaption>Resume: the same conversation, continued from the phone.</figcaption>
+      </figure>
+    </div>
+
+    <h3>Encryption</h3>
+    <ul>
+      <li><strong>Machine links</strong> (<code>sesync machine</code>) use a hybrid handshake: X25519 + ML-KEM-768, with AES-256-GCM frames. A bridge that answers only with the legacy channel is refused.</li>
+      <li><strong>Phone link</strong> uses Orca's legacy channel: X25519 + XSalsa20-Poly1305. This is classical, not hybrid. The bridge's docs say it is acceptable only because it runs inside WireGuard, which is also classical, until the app speaks the hybrid hello.</li>
+      <li>The bridge is authenticated by its pinned X25519 key. Tokens are 256 random bits, and only their SHA-256 is stored.</li>
+    </ul>
+
+    <h3>Settings file</h3>
+    <p><code>~/.config/sesync/bridge/settings.json</code> holds this machine's values. All keys are optional. A flag wins over the file. An unknown field or invalid JSON stops the bridge and names the file.</p>
+<pre><code>&#123; "endpoint": "ws://HOST:6768",
+  "allow": "127.0.0.0/8,10.0.0.0/8",
+  "ntfyUrl": "https://NTFY_HOST", "ntfyTopic": "agents", "ntfyTokenCommand": "cat ~/.config/ntfy-token",
+  "whisperUrl": "http://WHISPER_HOST:8080/v1/audio/transcriptions",
+  "whisperModel": "MODEL", "whisperLanguage": "en" &#125;</code></pre>
+    <p>The default allowlist is loopback, the private ranges and the shared VPN range (<code>100.64.0.0/10</code>). Without ntfy settings, push is off.</p>
+    <p>Full details: <a href={`${docs}/BRIDGE.md`}>docs/BRIDGE.md</a>.</p>
+  </section>
+
+  <section id="machines">
+    <h2>Machines</h2>
+    <p>One sesync machine can drive another's conversations. Pair them with <code>sesync bridge pair --label &lt;this machine&gt;</code> on the other machine, then add it here.</p>
+<pre><code>sesync machine add &lt;name&gt; &lt;pairing link&gt;
+sesync machine list [&lt;name&gt;]
+sesync machine attach &lt;name&gt; &lt;conversation title or id&gt; [--open]
+sesync machine prompt &lt;name&gt; &lt;conversation&gt; &lt;text | -&gt; [--open] [--wait[=&lt;seconds&gt;]]
+sesync machine read &lt;name&gt; &lt;conversation&gt; [&lt;count&gt;]
+sesync machine send &lt;name&gt; &lt;file or folder&gt;
+sesync machine get &lt;name&gt; &lt;path on that machine&gt; [&lt;folder here&gt;]
+sesync machine endpoint &lt;name&gt; &lt;ws://address&gt; | --clear
+sesync machine remove &lt;name&gt;</code></pre>
+
+    <figure class="figure">
+      <div class="frame"><img src={`${base}media/machine-prompt.gif`} alt="Sending a prompt to a conversation on another machine" width="1260" height="620" loading="lazy" /></div>
+      <figcaption><code>sesync machine prompt</code>: a prompt sent to a conversation on another machine, with the answer read back.</figcaption>
+    </figure>
+
+    <h3>Agents prompting agents</h3>
+    <p>An agent can use the <code>prompt-agent-over-bridge</code> skill from <a href={`${repo}/tree/main/skills`}>skills/</a> to ask an agent on another machine. <code>prompt</code> claims the conversation's lock for the turn. It refuses a pane that is waiting on a question, and a closed conversation unless <code>--open</code> is given.</p>
+    <p>A paired phone can type into your agents. Treat each paired machine the same way.</p>
+  </section>
+
+  <section id="flags">
+    <h2>Flags and commands</h2>
+    <p>Taken from the usage strings in the source. <code>sesync</code> exits with code 2 on a usage error.</p>
+
+    <h3><code>sesync</code> (<code>sesync/src/bin/sesync.rs</code>)</h3>
+    <table>
+      <thead><tr><th>Form</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>sesync --once</code></td><td>Run one sync pass and exit. Prints <code>one pass done, N source(s) changed</code>.</td></tr>
+        <tr><td><code>sesync --watch</code></td><td>Run continuously. Poll interval from <code>SESYNC_POLL</code> (seconds, default 5). Only one daemon per state directory.</td></tr>
+        <tr><td><code>sesync --status</code></td><td>Print the mirror view.</td></tr>
+        <tr><td><code>sesync --tui</code></td><td>Open the manage TUI.</td></tr>
+        <tr><td><code>sesync mirrors [--apply]</code></td><td>List mirror copies that can be removed. A dry run by default. <code>--apply</code> removes them; stop the daemon first.</td></tr>
+        <tr><td><code>sesync team create &lt;name&gt; [--member &lt;m&gt;]...</code></td><td>Create a team (admin). Needs <code>SESYNC_TEAM_URL</code> and <code>SESYNC_ADMIN_TOKEN_FILE</code>.</td></tr>
+        <tr><td><code>sesync team invite &lt;name&gt; &lt;member&gt;</code></td><td>Invite a member.</td></tr>
+        <tr><td><code>sesync team roster &lt;name&gt;</code></td><td>Show the team's listed and pending machines.</td></tr>
+        <tr><td><code>sesync team approve &lt;name&gt; &lt;member&gt; &lt;machine&gt; [--fingerprint &lt;fp&gt;]</code></td><td>Approve a join request. Compare the fingerprint with the member first.</td></tr>
+        <tr><td><code>sesync team decline &lt;name&gt; &lt;member&gt; &lt;machine&gt;</code></td><td>Decline a join request.</td></tr>
+        <tr><td><code>sesync team revoke &lt;name&gt; &lt;member&gt; &lt;machine&gt;</code></td><td>Revoke a machine.</td></tr>
+        <tr><td><code>sesync team remove &lt;name&gt; &lt;member&gt;</code></td><td>Remove a member.</td></tr>
+        <tr><td><code>sesync team join &lt;name&gt; --member &lt;m&gt;</code></td><td>Join a team as this machine. Asks for the 6-digit code.</td></tr>
+        <tr><td><code>sesync team renew &lt;name&gt;</code></td><td>Renew this machine's team token.</td></tr>
+        <tr><td><code>sesync herdr check [--herdr &lt;exe&gt;]</code></td><td>Check what sesync needs from herdr, in a throwaway herdr session. <code>--herdr</code> defaults to <code>HERDR_BIN_PATH</code>, else <code>herdr</code>.</td></tr>
+        <tr><td><code>sesync herdr guard [--remove]</code></td><td>Write, or with <code>--remove</code> delete, herdr's <code>update-guard.toml</code>. herdr updates then warn and can run <code>sesync herdr check</code> first.</td></tr>
+        <tr><td><code>sesync machine ...</code></td><td>Machine pairing and prompts. See <a href="#machines">Machines</a>. Source: <code>sesync/src/machines/cli.rs</code>.</td></tr>
+        <tr><td><code>sesync bridge ...</code></td><td>Phone and machine bridge. See the table below. Source: <code>sesync/src/bridge/cli.rs</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h3><code>sesync machine</code> (<code>sesync/src/machines/cli.rs</code>)</h3>
+    <table>
+      <thead><tr><th>Form</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>add &lt;name&gt; &lt;pairing link&gt;</code></td><td>Add a machine from <code>sesync bridge pair --label</code> output on that machine.</td></tr>
+        <tr><td><code>list [&lt;name&gt;]</code></td><td>List machines, or one.</td></tr>
+        <tr><td><code>attach &lt;name&gt; &lt;conversation&gt; [--open]</code></td><td>Mirror the conversation's pane here and type into it. <kbd>Ctrl-]</kbd> detaches.</td></tr>
+        <tr><td><code>prompt &lt;name&gt; &lt;conversation&gt; &lt;text | -&gt; [--open] [--wait[=&lt;seconds&gt;]]</code></td><td>Send a prompt turn. <code>-</code> reads stdin. <code>--open</code> resumes a closed conversation. <code>--wait</code> prints the answer (default 600 s).</td></tr>
+        <tr><td><code>read &lt;name&gt; &lt;conversation&gt; [&lt;count&gt;]</code></td><td>Print the last messages (default 10).</td></tr>
+        <tr><td><code>send &lt;name&gt; &lt;file or folder&gt;</code></td><td>Upload into that machine's inbox. A folder is sent as a zip.</td></tr>
+        <tr><td><code>get &lt;name&gt; &lt;path&gt; [&lt;folder here&gt;]</code></td><td>Download a file, or a folder as a zip.</td></tr>
+        <tr><td><code>endpoint &lt;name&gt; &lt;ws://address&gt; | --clear</code></td><td>Dial that machine at this address instead of the paired one.</td></tr>
+        <tr><td><code>remove &lt;name&gt;</code></td><td>Forget the machine here.</td></tr>
+      </tbody>
+    </table>
+
+    <h3><code>sesync bridge</code> (<code>sesync/src/bridge/cli.rs</code>)</h3>
+    <table>
+      <thead><tr><th>Form</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>pair [--endpoint ws://HOST:PORT] [--label NAME]</code></td><td>Pair a new device. Prints the offer, the URL and a QR code.</td></tr>
+        <tr><td><code>devices</code></td><td>List paired devices. Never prints tokens.</td></tr>
+        <tr><td><code>revoke &lt;device-id&gt;</code></td><td>Remove a device.</td></tr>
+        <tr><td><code>serve [--listen ADDR:PORT] [--allow CIDR,...] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]</code></td><td>Serve in the foreground until Ctrl-C. Defaults: <code>0.0.0.0:6768</code>, plan usage every 600 s.</td></tr>
+      </tbody>
+    </table>
+
+    <h3><code>sesync-lock</code> (<code>sesync-lock/src/main.rs</code>)</h3>
+    <table>
+      <thead><tr><th>Form</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>claim &lt;id&gt; &lt;harness&gt; &lt;pid&gt; [target] [--force]</code></td><td>Claim a conversation's lock.</td></tr>
+        <tr><td><code>release &lt;id&gt; &lt;harness&gt; &lt;pid&gt;</code></td><td>Release it.</td></tr>
+        <tr><td><code>check &lt;id&gt;</code></td><td>Check the lock. Exit 2 means locked; it prints <code>harness pid</code>.</td></tr>
+        <tr><td><code>resolve &lt;id&gt;</code></td><td>Map a mirror id to its source id.</td></tr>
+        <tr><td><code>sweep | list</code></td><td>Clear stale locks, or list them.</td></tr>
+        <tr><td><code>hook &lt;event&gt; &lt;harness&gt; --pid &lt;pid&gt; [--session &lt;id&gt;]</code></td><td>Harness hook. Reads a JSON payload on stdin. Events: <code>agent_end</code>, <code>message_end</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>Exit codes: 0 ok or free, 2 locked, 1 error.</p>
+
+    <h3><code>sesync-conv</code> (<code>sesync-conv/src/main.rs</code>)</h3>
+    <table>
+      <thead><tr><th>Form</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>inspect &lt;journal&gt;</code></td><td>Summarise a journal: roles and block types.</td></tr>
+        <tr><td><code>to-pi &lt;journal&gt; --out-dir &lt;dir&gt; [--id UUID] [--title T]</code></td><td>Write a Pi session.</td></tr>
+        <tr><td><code>to-omp &lt;journal&gt; --out-dir &lt;dir&gt; --home &lt;HOME&gt; [--id UUID] [--title T]</code></td><td>Write an omp session.</td></tr>
+        <tr><td><code>to-opencode &lt;journal&gt; [--out bundle.json] --id SES_ID --title T [--cli-version V] [--no-thinking] [--context-window N] [--context-share F] [--context-overhead N]</code></td><td>Write an OpenCode bundle.</td></tr>
+        <tr><td><code>to-claude &lt;journal&gt; --out-dir &lt;~/.claude/projects&gt; [--id UUID] [--title T] [--cli-version V] [--context-window N] [--context-share F] [--context-overhead N]</code></td><td>Write a Claude Code session.</td></tr>
+        <tr><td><code>to-antigravity &lt;journal&gt; --store &lt;dir&gt; --id &lt;id&gt; [--title T]</code></td><td>Write an Antigravity conversation.</td></tr>
+        <tr><td><code>from-claude &lt;transcript.jsonl&gt; --out &lt;journal.jsonl&gt;</code></td><td>Convert a Claude Code transcript to a journal.</td></tr>
+        <tr><td><code>from-opencode &lt;export.json&gt; --out &lt;journal.jsonl&gt;</code></td><td>Convert an OpenCode export to a journal.</td></tr>
+        <tr><td><code>from-antigravity ...</code></td><td>Convert an Antigravity conversation to a journal.</td></tr>
+        <tr><td><code>antigravity-retitle --store &lt;dir&gt; --id &lt;id&gt; --title T</code></td><td>Change an Antigravity conversation's title.</td></tr>
+        <tr><td><code>ids &lt;seed&gt;</code></td><td>Print the deterministic OpenCode and Claude ids.</td></tr>
+      </tbody>
+    </table>
+    <p>The <code>--context-*</code> flags fit the copy to the target's context window. See <a href={`${docs}/ARCHITECTURE.md`}>docs/ARCHITECTURE.md</a>, "Context fit".</p>
+
+    <h3><code>sesync bridge</code> and <code>sesync team</code> settings</h3>
+    <p>Environment: <code>SESYNC_DIR</code> (state, default <code>~/.local/share/sesync</code>), <code>SESYNC_CONFIG_DIR</code>, <code>SESYNC_POLL</code>, <code>SESYNC_TEAM_URL</code>, <code>SESYNC_ADMIN_TOKEN_FILE</code>, <code>HERDR_BIN_PATH</code>. Full list: the Configuration table in the <a href={`${repo}#configuration`}>README</a>.</p>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <h3>From a release</h3>
+    <p>Download an archive from <a href={`${repo}/releases`}>GitHub Releases</a>. Each release ships three binaries (<code>sesync-lock</code>, <code>sesync-conv</code>, <code>sesync</code>), the hook files and a <code>SHA256SUMS</code> file. The archives are tar.gz for Linux and macOS and zip for Windows. The binaries are not signed.</p>
+
+    <h3>From source</h3>
+    <p>You need Rust (stable). Build the three binaries, then copy them onto your <code>PATH</code>:</p>
+<pre><code>cargo build --release --manifest-path sesync-lock/Cargo.toml
+cargo build --release --manifest-path sesync-conv/Cargo.toml
+cargo build --release --manifest-path sesync/Cargo.toml</code></pre>
+
+    <h3><code>install.sh</code> (Linux and macOS)</h3>
+    <p>Run <code>sh install.sh</code>. It builds the three binaries with <code>cargo build --release</code>, then installs them into <code>~/.local/bin</code>. The hook files go into <code>~/.local/share/sesync/hooks</code>. A <code>MANIFEST</code> lists every file it wrote. On Linux with systemd it writes <code>~/.config/systemd/user/sesync.service</code> and enables it, so the daemon starts at login. The other options:</p>
+    <ul>
+      <li><code>--prefix DIR</code>: install under <code>DIR</code>.</li>
+      <li><code>--no-service</code>: do not register the login service.</li>
+      <li><code>--no-build</code>: use already-built release binaries.</li>
+      <li><code>--uninstall</code>: stop the service and remove exactly the files in the manifest.</li>
+    </ul>
+
+    <h3><code>install.ps1</code> (Windows)</h3>
+    <p>Run <code>powershell -ExecutionPolicy Bypass -File install.ps1</code>. It needs no administrator rights. It writes only under <code>%LOCALAPPDATA%\Programs\sesync</code>, plus two per-user settings. It adds the <code>bin</code> folder to the user <code>PATH</code> (in <code>HKCU\Environment</code>), and adds a login start entry under <code>HKCU\...\Run</code>. The options are <code>-NoService</code> (skip the login entry) and <code>-Uninstall</code>.</p>
+
+    <h3>Hooks per harness</h3>
+    <table>
+      <thead><tr><th>Harness</th><th>Hook</th></tr></thead>
+      <tbody>
+        <tr><td>omp and Pi</td><td><code>hooks/omp-lock-shim.ts</code>, an omp extension. Claims on <code>turn_start</code>, releases on <code>turn_end</code> and session lifecycle events.</td></tr>
+        <tr><td>Claude Code</td><td><code>hooks/claude-hook.sh</code>, wired to <code>UserPromptSubmit</code> (claim, block on refusal) and <code>Stop</code> / <code>SessionEnd</code> (release).</td></tr>
+        <tr><td>OpenCode</td><td>A plugin that claims on <code>chat.message</code> and releases on <code>session.idle</code> and <code>session.deleted</code>.</td></tr>
+        <tr><td>Antigravity CLI (<code>agy</code>)</td><td>No hook yet. The daemon still claims the lock for every write, refuses to refresh a copy that agy holds open, and archives any agy turn it would replace.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>herdr popup</h3>
+    <p>See <a href="#herdr">The herdr popup</a>. <code>sesync herdr check</code> runs a throwaway herdr session to verify the setup.</p>
+  </section>
+
+  <section id="links">
+    <h2>Links</h2>
+    <ul>
+      <li>Repository: <a href={repo}>github.com/y0c0ms/sesync</a></li>
+      <li>Releases: <a href={`${repo}/releases`}>github.com/y0c0ms/sesync/releases</a></li>
+      <li>README: <a href={`${repo}/blob/main/README.md`}>README.md</a></li>
+      <li>Docs:
+        <a href={`${docs}/ARCHITECTURE.md`}>ARCHITECTURE.md</a>,
+        <a href={`${docs}/BRIDGE.md`}>BRIDGE.md</a>,
+        <a href={`${docs}/PROCESSES.md`}>PROCESSES.md</a>,
+        <a href={`${docs}/STATUS.md`}>STATUS.md</a>
+      </li>
+      <li>License: <a href={`${repo}/blob/main/LICENSE`}>MIT License</a></li>
+    </ul>
+  </section>
+</Layout>

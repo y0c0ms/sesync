@@ -21,12 +21,17 @@
 //!
 //! Thinking IS carried as `reasoning` parts: OpenCode stores them natively.
 
-use crate::journal::{Journal, Msg};
+use crate::attach::{self, Verdict};
+use crate::fit::Window;
+use crate::journal::Msg;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const B62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Why a note stands in for a tool-result image this copy does not carry.
+const TOOL_IMAGE_WHY: &str = "an image in a tool result, which OpenCode's tool output does not carry; kept in the source session";
 
 /// OpenCode ids: prefix + 12 hex chars (ms time) + 14 base62 chars.
 /// Deterministic from (seed, counter) so a re-run yields identical ids and
@@ -52,8 +57,8 @@ pub struct Options<'a> {
     pub include_thinking: bool,
 }
 
-pub fn to_bundle(j: &Journal, o: &Options) -> Value {
-    let msgs = j.messages();
+pub fn to_bundle(win: &Window, o: &Options) -> Value {
+    let msgs = &win.msgs;
     let seed = o.session_id;
     let mut n: u64 = 0;
     let mut next = |prefix: &str, t: i64| {
@@ -63,7 +68,7 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
 
     // tool results by call id, so the assistant's tool part can be completed
     let mut results: HashMap<&str, &Msg> = HashMap::new();
-    for m in &msgs {
+    for m in msgs {
         if m.role == "toolResult" {
             if let Some(cid) = m.message.get("toolCallId").and_then(Value::as_str) {
                 results.insert(cid, m);
@@ -86,11 +91,11 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
     // and that `opencode import` accepts: an assistant record here needs a `parentID`, and a
     // parentless one makes the whole import fail with "Missing key at [parentID]" - which creates
     // the session row and then leaves it empty, the exact symptom seen on a real mirror.
-    if let (Some(note), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
+    if let Some((note, ts)) = win.note() {
         // OpenCode orders a session by its time-derived message ids, and a compaction is usually
         // recorded after the turns it keeps: stamped with its own time, the summary of what came
         // before showed up as the LAST message. It belongs first, just before the oldest kept one.
-        let compacted = crate::journal::parse_iso_ms(ts).unwrap_or(0);
+        let compacted = crate::journal::parse_iso_ms(&ts).unwrap_or(0);
         let t = match msgs.iter().map(|m| m.timestamp_ms).min() {
             Some(first_kept) => compacted.min(first_kept - 1),
             None => compacted,
@@ -115,7 +120,7 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
         last_id = Some(mid);
     }
 
-    for m in &msgs {
+    for m in msgs {
         match m.role {
             "user" | "assistant" => {}
             _ => continue, // toolResult folded; system/developer/bashExecution skipped
@@ -162,13 +167,14 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
                         }
                     }
                     Some("thinking") => {}
-                    Some("image") => {
-                        let mime = ob.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
-                        let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
-                        if !data.is_empty() && !data.starts_with("blob:") {
+                    Some("image") => match attach::judge(&attach::OPENCODE, b, false) {
+                        Verdict::Carry => {
+                            let mime = ob.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
+                            let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
                             parts.push(part("file", map(json!({"mime": mime, "url": format!("data:{mime};base64,{data}")})), next("prt", t)));
                         }
-                    }
+                        Verdict::Withhold(note) => parts.push(part("text", map(json!({"text": note})), next("prt", t))),
+                    },
                     Some("toolCall") => {
                         tool_calls += 1;
                         let cid = ob.get("id").and_then(Value::as_str).unwrap_or("");
@@ -177,8 +183,9 @@ pub fn to_bundle(j: &Journal, o: &Options) -> Value {
                         let (status, output, is_err, end) = match results.get(cid) {
                             Some(r) => {
                                 let txt = r.content.iter().filter_map(|c| match c {
-                                    Value::String(s) => Some(s.as_str()),
-                                    Value::Object(x) => x.get("text").and_then(Value::as_str),
+                                    Value::String(s) => Some(s.clone()),
+                                    Value::Object(x) if x.get("type").and_then(Value::as_str) == Some("image") => Some(attach::image_note(c, TOOL_IMAGE_WHY)),
+                                    Value::Object(x) => x.get("text").and_then(Value::as_str).map(str::to_string),
                                     _ => None,
                                 }).collect::<Vec<_>>().join("\n");
                                 let is_err = r.message.get("isError").and_then(Value::as_bool).unwrap_or(false);
@@ -274,6 +281,10 @@ mod untimed_tests {
     use super::*;
     use crate::journal::Journal;
 
+    fn to_bundle(j: &Journal, o: &Options) -> Value {
+        super::to_bundle(&j.window(), o)
+    }
+
     #[test]
     fn untimed_journal_never_produces_the_epoch() {
         let path = std::env::temp_dir().join(format!("hs-untimed-{}.jsonl", std::process::id()));
@@ -293,6 +304,12 @@ mod untimed_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Journal;
+
+    /// The writer on a journal's whole live window, nothing fitted.
+    fn to_bundle(j: &Journal, o: &Options) -> Value {
+        super::to_bundle(&j.window(), o)
+    }
     use crate::journal::fixture::*;
 
     /// Same compacted journal as every other target's test: the live window is exported and the

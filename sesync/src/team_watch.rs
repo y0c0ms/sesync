@@ -37,6 +37,10 @@ pub struct TeamCopy {
     /// The record sequence the pull accepted for it.
     pub seq: u64,
     pub text: Vec<u8>,
+    /// Written by this device (see `team_pull_verified::PulledRecord::mine`).
+    pub mine: bool,
+    /// The device that wrote it, as the verified list's fingerprint (`PulledRecord::by`); empty when unnamed.
+    pub by: String,
 }
 
 /// One entry per conversation from verified copies: the highest sequence wins, so the newest copy
@@ -108,6 +112,8 @@ impl TeamWatch {
             conversation: r.conversation.clone(),
             seq: p.out.accepted.get(&r.conversation).copied().unwrap_or(0),
             text: r.text.clone(),
+            mine: r.mine,
+            by: r.by.clone(),
         })).collect()
     }
 
@@ -233,6 +239,7 @@ impl HttpRecords {
     /// The current signed list as the server holds it: the raw signed-list bytes, nothing parsed.
     /// Verification happens where the pinned admin key lives, never here.
     fn fetch_list(&self) -> Option<(Vec<u8>, u64)> {
+        crate::team_url::check_scheme(&self.base).ok()?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
         let url = format!("{}/list", self.base.trim_end_matches('/'));
         let body = serde_json::json!({"space": self.space, "machine": self.machine});
@@ -260,6 +267,7 @@ impl RecordSource for HttpRecords {
     /// The listing: every conversation id, and the sequence its stored record advertises when the
     /// server gives one. An older server sends no "sequences", so every id comes back unadvertised.
     fn list_advertised(&self) -> Result<Vec<(String, Option<u64>)>, String> {
+        crate::team_url::check_scheme(&self.base)?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
         let url = format!("{}/sessions", self.base.trim_end_matches('/'));
         let body = serde_json::json!({"space": self.space, "machine": self.machine});
@@ -284,6 +292,7 @@ impl RecordSource for HttpRecords {
     }
 
     fn fetch(&self, conversation: &str) -> Result<Vec<u8>, String> {
+        crate::team_url::check_scheme(&self.base)?;
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30)).build();
         let url = format!("{}/record/sealed/read", self.base.trim_end_matches('/'));
         let body = serde_json::json!({"space": self.space, "conversation": conversation, "machine": self.machine});
@@ -292,5 +301,21 @@ impl RecordSource for HttpRecords {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|_| "cannot read a team record".to_string())?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pull side sends the member token too, so plain http outside loopback is refused before
+    /// any request, as on the push side. 198.51.100.7 is a non-routable test address.
+    #[test]
+    fn the_pull_side_refuses_plain_http_outside_loopback_before_the_token_is_sent() {
+        let src = HttpRecords { base: "http://198.51.100.7:30500".into(), token: "tok".into(),
+            machine: "m".into(), space: "personal".into() };
+        assert!(src.fetch_list().is_none());
+        assert!(matches!(src.list_advertised(), Err(e) if e.contains("refusing")));
+        assert!(matches!(src.fetch("ses_1"), Err(e) if e.contains("refusing")));
     }
 }

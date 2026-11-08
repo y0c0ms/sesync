@@ -5,6 +5,7 @@
 use crate::lock::ClaimOutcome;
 use crate::manage::{self, Group, Roots};
 use crate::palette::{self};
+use crate::herdr_open;
 use crate::state::State;
 use crate::tui::{Key, Model};
 use std::path::PathBuf;
@@ -12,6 +13,13 @@ use std::time::Instant;
 use crate::members::{Act, Members, Step};
 use crate::team_actions::{AdminDone, AdminJob, SetupDone};
 use crate::team_cli::Command;
+use crate::team_compare::Compared;
+use crate::team_watch::TeamCopy;
+
+mod team_tab;
+mod machines_tab;
+mod settings_tab;
+pub use team_tab::{Choice, PendingReplace, Resolve, RowState, Side, TeamRow};
 
 /// How long an informational status message stays before the view fades it. Failures stay.
 pub const STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(25);
@@ -40,6 +48,7 @@ pub mod prefs {
             view: match v.get("view").and_then(|t| t.as_str()) {
                 Some("team") => Some(View::Team),
                 Some("sessions") => Some(View::Sessions),
+                Some("machines") => Some(View::Machines),
                 _ => None,
             },
         }
@@ -52,7 +61,7 @@ pub mod prefs {
         }
         let v = json!({
             "theme": theme_name,
-            "view": match view { View::Sessions => "sessions", View::Team => "team" },
+            "view": match view { View::Sessions => "sessions", View::Team => "team", View::Machines => "machines" },
         });
         std::fs::write(&file, serde_json::to_vec_pretty(&v)?)?;
         Ok(())
@@ -63,6 +72,8 @@ pub mod prefs {
 pub enum Mode {
     Browse,
     Rename,
+    /// Typing the folder files arrive in, on the Settings tab. Enter saves it, Esc cancels.
+    Settings,
     /// Waiting for y/n before importing the selected team session.
     Confirm,
     /// Typing into the command list. Enter runs the highlighted command.
@@ -92,6 +103,8 @@ pub enum Mode {
     LeavePick,
     /// The team members dialog: the roster and the approve, refuse, revoke and remove keys.
     Members,
+    /// The divergence dialog: both copies' new turns after their common history, and the five choices.
+    Resolve,
 }
 
 /// Which dialog the form serves: joining a team or starting one (admin side).
@@ -143,11 +156,12 @@ impl FormView {
     }
 }
 
-/// Which list the main pane shows. The two tabs have separate cursors.
+/// Which list the main pane shows. Each tab keeps its own cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Sessions,
     Team,
+    Machines,
 }
 
 /// The `f` cycle on the Sessions tab: which subset of sessions is listed.
@@ -198,6 +212,8 @@ pub enum Ev {
     Theme,
     /// Open the join-a-team dialog (from the command list).
     OpenEnroll,
+    /// The files folder, from the command palette: the same edit the settings tab used to host.
+    OpenFolder,
     /// Open the start-a-team dialog (from the command list).
     OpenRegister,
     /// Open the invite dialog (from the command list, admin only).
@@ -217,6 +233,8 @@ pub enum Ev {
     PreviewDown,
     /// Open the leave-a-team picker (from the command list).
     OpenLeave,
+    /// Open the divergence dialog for the selected Team row (from the command list).
+    OpenResolve,
 }
 
 /// One row of the command list as the view draws it.
@@ -245,17 +263,28 @@ pub struct App {
     title_wanted: Vec<(String, String)>,
     /// Asked for and not answered yet, so a re-list does not ask twice.
     title_asked: std::collections::HashSet<String>,
+    /// An "Open in herdr" asked for and not run yet (see [`App::run_pending_open`]).
+    pending_open: Option<herdr_open::Plan>,
     /// Set when a key changed a field the app owns (a mark or a mirror choice); the
     /// caller saves state only then, not on every keypress.
     user_dirty: bool,
-    /// Team sessions from the last pull, as (id, bytes). Shown for display; written only when
-    /// the user confirms an import.
-    team: Vec<(String, Vec<u8>)>,
-    /// Every verified copy the last pull returned, by team. `team` is built from these (the
-    /// newest copy of each conversation), and leaving a team removes only that team's copies.
+    /// Every verified copy the last pull returned, by team. The Team list is built from these: one
+    /// row per conversation, from the newest copy of each. Leaving a team removes only its copies.
     team_copies: Vec<crate::team_watch::TeamCopy>,
-    /// Cursor into `team`, kept separate from the session cursor.
+    /// Cursor into the Team list (`team_rows`), kept separate from the session cursor.
     team_index: usize,
+    /// The newest comparison of each conversation's local and team copies (`team_compare`).
+    compared: std::collections::BTreeMap<String, Compared>,
+    /// What each conversation's comparison was last asked for: a new listing or team sequence asks again.
+    compare_asked: std::collections::BTreeMap<String, team_tab::Asked>,
+    /// Device fingerprint to member@machine, from the last roster the admin read (LATEST BY).
+    roster_names: std::collections::BTreeMap<String, String>,
+    /// The open divergence dialog, if any.
+    resolve: Option<Resolve>,
+    /// A confirmed "take theirs" waiting for the bin to save the state and replace the local copy.
+    pending_replace: Option<PendingReplace>,
+    /// Where replaced copies are archived (the daemon's `archive`), set by the caller.
+    archive_dir: Option<PathBuf>,
     /// Ids imported in this run, in order. Recorded so the result can be shown.
     imported: Vec<String>,
     /// The space currently shown, if any, and the sessions last fetched for it.
@@ -297,6 +326,8 @@ pub struct App {
     last_pull: Option<(Instant, usize, usize)>,
     /// Cursor and picks for the per-session menu and the mirror-target picker.
     menu_cursor: usize,
+    /// The herdr client "Open in herdr" talks through. Read from the environment at start-up.
+    herdr: herdr_open::Herdr,
     installed_targets: Vec<String>,
     /// When the state file was last read from disk, in seconds since the epoch. Drawn in the tab bar.
     state_written: Option<f64>,
@@ -354,6 +385,10 @@ pub struct App {
     leave_cursor: usize,
     leave_armed: Option<usize>,
     leave_request: Option<LeaveRequest>,
+    /// The Machines tab: the saved machines, their last answers, the cursor and an attach waiting to run.
+    machines_tab: machines_tab::MachinesTab,
+    /// The Settings tab: where files other machines and the phone send arrive.
+    settings_tab: settings_tab::SettingsTab,
 }
 
 /// What the transcript view holds: the file it came from, its lines and the scroll.
@@ -366,6 +401,9 @@ pub struct TranscriptView {
 
 /// How many lines a transcript shows before the head is cut.
 pub const TRANSCRIPT_MAX_LINES: usize = 4000;
+
+/// How long a team pull stays current for the Team tab: opening the tab after that pulls again.
+pub const TEAM_LIST_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl App {
     /// Lists the sessions and reads every title before it returns. The CLI and tests use this;
@@ -396,10 +434,15 @@ impl App {
         App {
             model,
             roots, state, lock_dir, sesync_lock, groups, titles, user_dirty: false,
-            defer_titles, title_wanted, title_asked: Default::default(),
-            team: Vec::new(),
+            defer_titles, title_wanted, title_asked: Default::default(), pending_open: None,
             team_copies: Vec::new(),
             team_index: 0,
+            compared: Default::default(),
+            compare_asked: Default::default(),
+            roster_names: Default::default(),
+            resolve: None,
+            pending_replace: None,
+            archive_dir: None,
             imported: Vec::new(),
             space: None,
             remote: Vec::new(),
@@ -422,6 +465,7 @@ impl App {
             palette_query: String::new(),
             palette_cursor: 0,
             menu_cursor: 0,
+            herdr: herdr_open::Herdr::from_env(Box::new(herdr_open::Process)),
             installed_targets: Vec::new(),
             state_written: None,
             pick_cursor: 0,
@@ -453,6 +497,8 @@ impl App {
             leave_cursor: 0,
             leave_armed: None,
             leave_request: None,
+            machines_tab: Default::default(),
+            settings_tab: Default::default(),
         }
     }
 
@@ -570,12 +616,9 @@ impl App {
     /// Show these team sessions, with no team behind them (a caller that has rows only). Display
     /// only; nothing is written by this, and leaving a team does not remove these rows.
     pub fn set_team_sessions(&mut self, sessions: Vec<(String, Vec<u8>)>) {
-        self.team_copies.clear();
-        self.show_team_rows(sessions);
-    }
-
-    fn show_team_rows(&mut self, rows: Vec<(String, Vec<u8>)>) {
-        self.team = rows;
+        self.team_copies = sessions.into_iter().map(|(conversation, text)| TeamCopy {
+            space: String::new(), conversation, seq: 1, text, mine: false, by: String::new(),
+        }).collect();
         self.clamp_team_index();
     }
 
@@ -617,11 +660,10 @@ impl App {
     /// Record what a team pull returned: every verified copy, by team (the list shows the newest
     /// copy of each conversation), and how many records the app refused.
     pub fn set_pull_result(&mut self, copies: Vec<crate::team_watch::TeamCopy>, refused: usize) {
-        let rows = crate::team_watch::newest_of(&copies);
         self.team_copies = copies;
-        self.show_team_rows(rows);
-        let shown = self.team.len();
+        self.clamp_team_index();
         self.pulling = false;
+        let shown = self.team_rows().len();
         self.last_pull = Some((Instant::now(), shown, refused));
         self.say(if refused == 0 {
             format!("team pull: {shown} verified")
@@ -633,7 +675,7 @@ impl App {
     /// One dim line above the team list: how many rows it shows, when this run last pulled, and
     /// how many records the pull refused. So an empty list is never mistaken for an empty team.
     pub fn team_header(&self, now: Instant) -> String {
-        let mut s = format!("{} session(s)", self.team.len());
+        let mut s = format!("{} session(s)", self.team_rows().len());
         match self.last_pull {
             Some((at, _, refused)) => {
                 s.push_str(&format!(" · pulled {}s ago", now.saturating_duration_since(at).as_secs()));
@@ -706,6 +748,7 @@ impl App {
     pub fn footer(&self) -> String {
         match self.mode {
             Mode::Rename => "enter save · esc cancel".to_string(),
+            Mode::Settings => "enter save · esc cancel".to_string(),
             Mode::Confirm => "y import · any other key cancels".to_string(),
             Mode::Palette => "type to filter · up/down move · enter run · ctrl+p/esc close".to_string(),
             Mode::SessionMenu => "enter run · esc close".to_string(),
@@ -720,6 +763,7 @@ impl App {
             Mode::DeleteConfirm => "ctrl+d delete · any other key cancels".to_string(),
             Mode::SharePick => "space tick · a all · n none · enter keep · esc cancel".to_string(),
             Mode::LeavePick => "up/down move · enter twice leaves · esc cancel".to_string(),
+            Mode::Resolve => "up/down scroll · tab switch side · 1-5 choose · y confirm · esc decide later".to_string(),
             Mode::Browse => match self.view {
                 View::Sessions => {
                     let view_key = match self.filter_scope {
@@ -732,7 +776,8 @@ impl App {
                     }
                     f
                 }
-                View::Team => "enter import · ctrl+r pull · ? help · ctrl+p cmds · tab sessions · q quit".to_string(),
+                View::Team => "i import · enter resolve · ctrl+r pull · ? help · ctrl+p cmds · tab machines · q quit".to_string(),
+                View::Machines => "enter attach · o attach, opening a closed one · ctrl+r refresh · ? help · ctrl+p cmds · tab settings · q quit".to_string(),
             },
         }
     }
@@ -1164,11 +1209,9 @@ impl App {
                     // Only rows this team's pulls brought over leave the list; a conversation
                     // another team holds too stays, as that team's copy.
                     if self.team_copies.iter().any(|c| c.space == req.team) {
-                        let before = self.team.len();
+                        let before = self.team_rows().len();
                         self.team_copies.retain(|c| c.space != req.team);
-                        let rows = crate::team_watch::newest_of(&self.team_copies);
-                        self.show_team_rows(rows);
-                        let gone = before - self.team.len();
+                        let gone = before.saturating_sub(self.team_rows().len());
                         if gone > 0 {
                             msg.push_str(&format!("; {gone} of its session(s) left the Team list"));
                         }
@@ -1210,26 +1253,14 @@ impl App {
         self.team_configured = yes;
     }
 
-    /// The team list as the view shows it: one label per pulled session, titled and with a short
-    /// conversation id. The full id is still what actions use; the row only has to be recognizable.
-    pub fn team_rows(&self) -> Vec<String> {
-        self.team.iter().map(|(id, bytes)| {
-            let text = String::from_utf8_lossy(bytes);
-            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            let (title, found) = crate::harness::journal::omp_title_from_lines(&lines);
-            let title = if found && !title.trim().is_empty() { title } else { "untitled".to_string() };
-            let short: String = id.chars().take(8).collect();
-            format!("{title} · {short}…")
-        }).collect()
-    }
-
     /// What the command list needs to know about the current state.
     fn palette_ctx(&self) -> palette::Ctx {
         palette::Ctx {
             view: self.view,
             session_selected: self.selected().is_some(),
             session_shared: self.is_selected_marked(),
-            team_selected: self.team.get(self.team_index).is_some(),
+            team_selected: self.team_selected().is_some(),
+            resolve: self.resolve_ready(),
             team_configured: self.team_configured,
             team_to_manage: !self.manageable_teams().is_empty(),
             teams_here: !self.team_cards.is_empty() || !self.admin_teams.is_empty(),
@@ -1266,7 +1297,7 @@ impl App {
     }
 
     fn clamp_team_index(&mut self) {
-        self.team_index = self.team_index.min(self.team.len().saturating_sub(1));
+        self.team_index = self.team_index.min(self.team_rows().len().saturating_sub(1));
     }
 
     /// Move the cursor by `delta` rows, clamped to the list. The caller has already cancelled any
@@ -1279,7 +1310,7 @@ impl App {
 
     /// Move the team cursor by `delta`, clamped to the team list.
     fn move_team(&mut self, delta: isize) {
-        let last = self.team.len().saturating_sub(1) as isize;
+        let last = self.team_rows().len().saturating_sub(1) as isize;
         let next = (self.team_index as isize).saturating_add(delta).clamp(0, last);
         self.team_index = next as usize;
     }
@@ -1299,13 +1330,17 @@ impl App {
     pub fn absorb_daemon_state(&mut self, disk: &State) {
         self.state.mirror_keys = disk.mirror_keys.clone();
         self.state.subagents = disk.subagents.clone();
+        // A push the daemon just made shows on the Team tab without a ctrl+r.
+        let pushed = |s: &State| s.team.values().map(|t| t.pushed_at).fold(0.0, f64::max);
+        if pushed(disk) > pushed(&self.state) {
+            self.request_team_refresh();
+        }
         self.state.team = disk.team.clone();
         self.state.team_seen = disk.team_seen.clone();
         for (key, dsrc) in &disk.sources {
             if let Some(s) = self.state.sources.get_mut(key) {
                 s.last_seen_change = dsrc.last_seen_change;
                 s.last_hash = dsrc.last_hash.clone();
-                s.last_stamp = dsrc.last_stamp.clone();
                 s.failures = dsrc.failures;
                 s.sync = dsrc.sync.clone();
                 s.mirrors = dsrc.mirrors.clone();
@@ -1396,7 +1431,7 @@ impl App {
         }
         // ctrl+t opens the colour scheme picker from anywhere except the questions and dialogs
         // that own the screen; inside them it stays out of the way.
-        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members) {
+        if ev == Ev::Theme && !matches!(self.mode, Mode::Confirm | Mode::Form | Mode::Qr | Mode::Members | Mode::Resolve) {
             self.disarm(now);
             self.open_theme();
             return;
@@ -1414,6 +1449,7 @@ impl App {
         match self.mode {
             Mode::Confirm => self.handle_confirm(ev),
             Mode::Rename => self.handle_rename(ev),
+            Mode::Settings => self.handle_settings(ev),
             Mode::Palette => self.handle_palette(ev, now),
             Mode::SessionMenu => self.handle_session_menu(ev, now),
             Mode::MirrorPick => self.handle_mirror_pick(ev),
@@ -1427,6 +1463,7 @@ impl App {
             Mode::DeleteConfirm => self.handle_delete_confirm(ev),
             Mode::SharePick => self.handle_share_pick(ev),
             Mode::LeavePick => self.handle_leave_pick(ev),
+            Mode::Resolve => self.handle_resolve(ev),
             Mode::Browse => self.handle_browse(ev, now),
         }
     }
@@ -1449,18 +1486,18 @@ impl App {
         match ev {
             // Local refresh needs no network: re-list the files so a rename made in the harness
             // itself appears. The team refresh needs the server client, which the caller supplies.
-            Ev::CtrlR => {
-                if self.view == View::Sessions {
-                    self.refresh_local();
-                } else {
-                    self.refresh_requested = true;
-                }
-            }
+            Ev::CtrlR => match self.view {
+                View::Sessions => self.refresh_local(),
+                View::Team => self.refresh_requested = true,
+                View::Machines => self.refresh_machines_now(),
+            },
             Ev::OpenEnroll => self.open_form(Kind::Enroll, &[]),
+            Ev::OpenFolder => self.begin_inbox_edit(),
             Ev::OpenRegister => self.open_form(Kind::Register, &[]),
             Ev::OpenInvite => self.open_invite(),
             Ev::OpenMembers => self.open_members(),
             Ev::OpenLeave => self.open_leave(),
+            Ev::OpenResolve => self.open_resolve(),
             Ev::CtrlD => {
                 if self.view != View::Sessions {
                     self.say("delete works on local sessions only; press tab");
@@ -1492,10 +1529,12 @@ impl App {
             // Enter on a local session opens its options; ctrl+p always opens the command list.
             // Tab switches the pane.
             Ev::Enter if self.view == View::Sessions && self.selected().is_some() => self.open_session_menu(),
+            Ev::Enter if self.view == View::Team => self.enter_team(),
+            Ev::Enter if self.view == View::Machines => self.enter_machine(false),
             Ev::Enter | Ev::CtrlP => self.open_palette(),
             Ev::Tab => self.switch_view(),
             Ev::Char('i') => match self.view {
-                View::Sessions => self.say("team sessions are on the Team tab; press tab"),
+                View::Sessions | View::Machines => self.say("team sessions are on the Team tab; press tab"),
                 View::Team => self.ask_import(),
             },
             Ev::Char('m') => {
@@ -1505,6 +1544,9 @@ impl App {
                 }
                 self.toggle_mark();
             }
+            Ev::Char('o') if self.view == View::Machines => self.enter_machine(true),
+            // o opens the selected session in herdr: its tab if one runs it, else a new tab that resumes it.
+            Ev::Char('o') => self.open_in_herdr(),
             // s opens the share picker (explicit team choice); u stops sharing everywhere.
             Ev::Char('s') => {
                 if self.view != View::Sessions {
@@ -1593,6 +1635,7 @@ impl App {
         match self.view {
             View::Sessions => self.move_selection(delta),
             View::Team => self.move_team(delta),
+            View::Machines => self.move_machines(delta),
         }
     }
 
@@ -1719,6 +1762,7 @@ impl App {
         match self.view {
             View::Sessions => vec![
                 ("enter", "open the selected session's menu (rename, mark, mirror, delete)"),
+                ("o", "open the session in herdr: focus its tab, or resume it in a new one"),
                 ("m", "mark / unmark the session for the team push"),
                 ("/", "filter the list by title; enter keeps it, esc clears it"),
                 ("f", "cycle what is listed: all, marked, mirrored, failing"),
@@ -1732,9 +1776,18 @@ impl App {
                 ("q / esc", "quit (esc clears a kept filter first)"),
             ],
             View::Team => vec![
-                ("i", "import the selected team session into this harness"),
+                ("enter", "resolve the selected behind or diverged conversation: keep mine, take theirs, or fork"),
+                ("i", "import the team copy of a conversation this machine does not hold"),
                 ("ctrl+r", "pull the team's verified sessions from the server"),
-                ("tab", "back to the local sessions"),
+                ("tab", "switch to the machines list"),
+                ("ctrl+p", "open the command list"),
+                ("q / esc", "quit"),
+            ],
+            View::Machines => vec![
+                ("enter", "attach to the selected conversation in a new herdr tab (a closed one stays closed)"),
+                ("o", "attach to it, and open a closed conversation there"),
+                ("ctrl+r", "refresh every machine's conversation list now"),
+                ("tab", "switch to the sessions list"),
                 ("ctrl+p", "open the command list"),
                 ("q / esc", "quit"),
             ],
@@ -1743,11 +1796,32 @@ impl App {
 
     /// Switch between the local list and the team list. Each keeps its own cursor.
     fn switch_view(&mut self) {
+        // Tab only moves between the views: Sessions, Team, Machines, and back. Opening a bridge session from
+        // Machines ends the popup on its own (see `run_pending_attach`).
         self.view = match self.view {
             View::Sessions => View::Team,
-            View::Team => View::Sessions,
+            View::Team => View::Machines,
+            View::Machines => View::Sessions,
         };
         self.prefs_dirty = true;
+        // Opening the Team tab shows what the team holds now, not what this run saw a while ago.
+        if self.view == View::Team && self.team_configured && self.team_pull_is_stale(Instant::now()) {
+            self.refresh_requested = true;
+        }
+    }
+
+    /// Whether the Team list should be pulled again before it is looked at: never pulled this run,
+    /// or pulled more than [`TEAM_LIST_FRESH`] ago.
+    fn team_pull_is_stale(&self, now: Instant) -> bool {
+        self.last_pull.map_or(true, |(at, _, _)| now.saturating_duration_since(at) > TEAM_LIST_FRESH)
+    }
+
+    /// Ask for a team pull at the next frame (the TUI does it at start, so the Team tab is never
+    /// empty only because nothing was pulled yet). Only with a team configured.
+    pub fn request_team_refresh(&mut self) {
+        if self.team_configured {
+            self.refresh_requested = true;
+        }
     }
 
     /// Restore last-run taste before the first draw. An unknown theme name falls back to
@@ -1768,18 +1842,6 @@ impl App {
         std::mem::replace(&mut self.prefs_dirty, false)
     }
 
-    /// Ask before writing a team session into the harness. The question is about the row on
-    /// screen right now; only that exact one survives a later refresh.
-    fn ask_import(&mut self) {
-        let Some(sel) = self.team.get(self.team_index).cloned() else {
-            self.say("no team session selected");
-            return;
-        };
-        self.say(format!("import team session {} into your harness? y/n", sel.0));
-        self.pending_import = Some(sel);
-        self.mode = Mode::Confirm;
-    }
-
     // ----- the command list ---------------------------------------------------------------
 
     /// Open the command list over the current view.
@@ -1797,6 +1859,7 @@ impl App {
     /// The session menu options, in display order. Each runs the same event its normal key sends.
     pub fn session_menu_rows(&self) -> Vec<(&'static str, &'static str)> {
         vec![
+            ("Open in herdr", "o"),
             ("Rename", "r"),
             ("Mark / unmark for team", "m"),
             ("Mirror to harness", ""),
@@ -1827,16 +1890,74 @@ impl App {
                 let choice = self.menu_cursor;
                 self.close_session_menu();
                 match choice {
-                    0 => self.handle(Ev::Char('r'), now),
-                    1 => self.handle(Ev::Char('m'), now),
-                    2 => self.open_mirror_pick(),
-                    3 => self.open_transcript(),
-                    4 => self.copy_selected_path(),
-                    5 => self.handle(Ev::CtrlD, now),
+                    0 => self.handle(Ev::Char('o'), now),
+                    1 => self.handle(Ev::Char('r'), now),
+                    2 => self.handle(Ev::Char('m'), now),
+                    3 => self.open_mirror_pick(),
+                    4 => self.open_transcript(),
+                    5 => self.copy_selected_path(),
+                    6 => self.handle(Ev::CtrlD, now),
                     _ => {}
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Open the selected session in herdr (see `herdr_open`): focus the tab that already runs it,
+    /// or open a tab that resumes it. Success leaves the TUI, so the popup closes onto that tab.
+    /// The herdr calls take a moment (each is a process), so this only says what is about to
+    /// happen; the caller draws that, then calls [`App::run_pending_open`].
+    fn open_in_herdr(&mut self) {
+        if self.view != View::Sessions {
+            self.say("herdr opens local sessions; press tab");
+            return;
+        }
+        let Some(g) = self.selected() else {
+            self.say("nothing selected");
+            return;
+        };
+        if g.orphan {
+            self.fail(format!("'{}' is no longer on disk, so there is nothing to open", g.title));
+            return;
+        }
+        // A copy the team has gone past (it went on and was closed on another machine) would resume without the
+        // newer turns, and the next turn here would diverge: it is caught up first, which makes no fork.
+        let conversation = crate::harness::get(&g.fmt).and_then(|h| h.id_in(&g.key));
+        let behind = conversation.is_some_and(|c| {
+            self.team_rows().iter().any(|r| r.conversation == c && r.here && r.state == team_tab::RowState::Behind)
+        });
+        if behind {
+            self.fail(format!(
+                "'{}' is behind the team copy: another machine went on with it. Catch it up first (Team tab, Enter, 1: no fork is made), then open it",
+                g.title
+            ));
+            return;
+        }
+        match herdr_open::plan(&self.roots.locations, &self.roots.home, &g.fmt, &g.key, &g.title) {
+            Ok(plan) => {
+                self.say(format!("opening '{}' in herdr…", plan.label));
+                self.pending_open = Some(plan);
+            }
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Whether an "Open in herdr" waits for [`App::run_pending_open`].
+    pub fn has_pending_open(&self) -> bool {
+        self.pending_open.is_some()
+    }
+
+    /// Run the "Open in herdr" the last key asked for.
+    pub fn run_pending_open(&mut self) {
+        let Some(plan) = self.pending_open.take() else { return };
+        let shell = herdr_open::PaneShell::current(&self.roots.home);
+        match herdr_open::open(&self.herdr, &plan, shell, herdr_open::Detect::platform()) {
+            Ok(opened) => {
+                self.say(opened.message(&plan));
+                self.quit = true;
+            }
+            Err(e) => self.fail(e),
         }
     }
 
@@ -1909,6 +2030,11 @@ impl App {
     /// The harnesses installed on this machine, as format names. Set by the caller at start-up.
     pub fn set_installed_targets(&mut self, targets: Vec<String>) {
         self.installed_targets = targets;
+    }
+
+    /// Replace the herdr client "Open in herdr" uses. Tests drive a fake herdr through this.
+    pub fn set_herdr(&mut self, herdr: herdr_open::Herdr) {
+        self.herdr = herdr;
     }
 
     pub fn menu_cursor(&self) -> usize { self.menu_cursor }
@@ -2325,6 +2451,7 @@ impl App {
         self.admin_busy = false;
         match result {
             Ok(AdminDone::Roster(view)) => {
+                self.remember_roster(&view);
                 if let Some(m) = self.members.as_mut() {
                     m.set_roster(&view);
                 }
@@ -2446,50 +2573,6 @@ impl App {
                 self.mode = Mode::Browse;
                 self.say("import cancelled");
             }
-        }
-    }
-
-    /// Write a confirmed team session, as it is (a canonical journal), into the first harness
-    /// whose own files are journals, filed the way that harness files its own: in the folder it
-    /// lists for the project directory the session's header records (the home when there is
-    /// none), under the start-time name its listing reads. A session that harness already holds
-    /// is left alone.
-    fn import_team_session(&mut self, id: &str, bytes: &[u8]) {
-        use crate::harness::journal;
-        let Some(h) = crate::harness::ALL.iter().find(|h| h.native_journal()) else {
-            self.fail("not imported: no harness keeps canonical journals");
-            return;
-        };
-        let loc = self.roots.locations.of(h.id());
-        let head = journal::session_head(bytes);
-        let home = self.roots.home.display().to_string();
-        let cwd = head.cwd.clone().unwrap_or_else(|| home.clone());
-        let Some(folder) = h.folder_for_cwd(loc, &home, &cwd) else {
-            self.fail(format!("not imported: {} has no project folder to file it in", h.id()));
-            return;
-        };
-        // The harness lists only `<timestamp>_<uuid>.jsonl`. A header without a usable start time
-        // takes the import's; an id that cannot be written in that form is refused, so no file
-        // is written that nothing shows.
-        let mut name = journal::journal_filename(head.timestamp.as_deref().unwrap_or_default(), id);
-        if !journal::is_listed_session_name(&name) {
-            name = journal::journal_filename(&journal::now_iso_ms(), id);
-        }
-        if !journal::is_listed_session_name(&name) {
-            self.say(format!("not imported: team session id {id} is not a harness session id"));
-            return;
-        }
-        if h.sessions(loc).iter().any(|p| h.id_in(&p.display().to_string()).as_deref() == Some(id)) {
-            self.fail(format!("not imported: {} already holds session {id}", h.id()));
-            return;
-        }
-        match crate::team_import::import_confirmed(&folder.join(name), bytes, true) {
-            Ok(_) => {
-                self.imported.push(id.to_string());
-                self.say(format!("imported team session {id} into {}", h.id()));
-                self.refresh_rows();
-            }
-            Err(e) => self.fail(format!("not imported: {e:?}")),
         }
     }
 

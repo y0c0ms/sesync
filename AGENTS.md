@@ -32,8 +32,7 @@ One harness writes a conversation at a time, enforced by a lock.
 4. **Kill processes by PID only.** Never `pkill -f sesync`, `pkill cargo`, or similar.
 5. **Never commit, amend, push, or open a PR unless the operator explicitly asks.** Work is
    delivered as a green working tree plus a report.
-6. **Never edit `~/hlgit` (homelab GitOps), Kubernetes, or the team server deployment**
-   without loading the `homelab-context` and `deploy-to-homelab` skills first.
+6. **Never touch a deployed team server or its database** from a development session.
 7. **Never log or commit secrets**: tokens, device keys, admin keys, credentials, master
    keys. Session content is as sensitive as the token: never paste it into a log or report.
 8. **Never weaken or delete an assertion to get a green suite.** Fix the code, or report the
@@ -67,7 +66,7 @@ cd sesync-team
 env HOME=/tmp CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
     CARGO_TARGET_DIR=/tmp/opencode/target-e2e cargo build --bin team-server
 
-# 2. Postgres for the tests (throwaway container, not the homelab database).
+# 2. Postgres for the tests (throwaway container, never a deployed database).
 podman start tsv-ses-pg   # 127.0.0.1:55437, user postgres, password test
 
 # 3. Run the acceptance suite.
@@ -80,7 +79,7 @@ env HOME="$SB" CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
 ```
 
 `TEAM_REQUIRE_PG=1` makes a skipped database test a failure. Each test creates its own
-schema and drops it; nothing touches the homelab `team` database.
+schema and drops it; nothing touches a deployed `team` database.
 
 Real-CLI tests (omp, OpenCode, Claude Code) never run by default. Only in an isolated
 machine or container, with no access to real session stores or credentials:
@@ -105,17 +104,30 @@ HS_E2E=1 sh build-test.sh
 - **Harnesses**: `harness` holds the `Harness` trait and its registry (`ALL`, `get`), one module
   per harness (`omp`, `pi`, `claude` with `compaction`, `opencode` with `store` and `rename`,
   `antigravity` with `store`), the JSONL helpers they share (`journal`) and the retired ones
-  (`retired`). Nothing outside `harness` names a harness.
-- **Local pipeline**: `scan`, `pass`, `mirror`, `mirror_write`, `mirror_cleanup`, `turn`,
-  `prompts`, `lock`, `archive`, `archive_store`.
+  (`retired`). Nothing outside `harness` names a harness. A store harness implements `rows_stamp` (the stamps of its
+  store's files) so a reader can keep its rows until they move (`manage::StoreRows`); OpenCode does, the others return None.
+- **Local pipeline**: `scan`, `pass`, `mirror` (with `CopyHashes`, the run's content hashes by file identity),
+  `mirror_write`, `mirror_cleanup`, `turn`, `prompts`, `lock`, `archive`, `archive_store`.
 - **TUI**: `tui`, `app`, `ui`, `keys`, `palette`, `form`, `theme`, `session_cols` (columns,
   `display_safe`), `manage`, `members` (members dialog state), `team_actions` (the network work
   behind the team dialogs, run on worker threads), `preview` (the highlighted session's last
   turns, read on a worker thread), `title_worker` (the list's titles, read on a worker thread;
-  the cache is `manage::TitleCache`), `qr`, `clipboard`, `remote`, `remote_http`.
+  the cache is `manage::TitleCache`), `qr`, `clipboard`, `remote`, `remote_http`, `herdr_open` (the
+  herdr CLI behind "Open in herdr").
 - **Team client**: `team_cli` (admin commands), `team_join`, `device_keys`, `sealed`,
   `team_pull_verified` (the live pull), `team_watch`, `team_push`, `team_sync` (trigger),
-  `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`.
+  `team_pass` (daemon pass), `team_backoff`, `team_import`, `state`, `turns` (completed turns and the comparison).
+- **Phone bridge** (`bridge/`, only `sesync bridge …` runs it; protocol, pairing and security in
+  `docs/BRIDGE.md`, flows in `docs/PROCESSES.md`): `server` (WebSocket, allowlist, E2EE handshake),
+  `e2ee` (the channel: Orca's NaCl framing, or AES-256-GCM after the hybrid handshake), `hybrid` (X25519 +
+  ML-KEM-768 handshake for sesync clients), `net` (allowlist), `rpc` (the served methods), `catalog` (conversations
+  by project directory, read-only), `devices` (hashed device tokens, each a `phone` or a `machine`), `grants` (the `machines.*` RPCs and `devices.revoke`: the phone decides which machines see each other), `offer` (pairing offer v2), `keys`,
+  `herdr` (socket client; `ProcessMemo` keeps a listing's process reads while the panes are unchanged), `terminals`, `stream` (live terminal screens and the pane history behind them), `transcript` (chat view),
+  `turns` (prompt claims), `start` (new sessions), `approvals`, `notify`, `ntfy`, `usage`, `files`, `git`,
+  `pins`, `confine`, `uploads`, `testkit`, `cli`.
+- **Machines** (`machines/`, only `sesync machine …` runs it; commands in `docs/BRIDGE.md`): this machine as a
+  client of other machines' bridges, speaking the phone's protocol. `store` (`machines.json`, owner-only; each entry's grant device id and local endpoint override, which a grant replacing the entry keeps; the name rule and `sanitize_name`),
+  `client` (hello, auth, sealed RPCs), `attach` (a remote pane mirrored in this terminal), `tab` (the TUI's Machines tab: rows and the refresh worker; its state is `app/machines_tab.rs`), `cli`.
 - **Test-only today** (do not wire new features to these without a decision): `team_pull`
   (superseded by `team_pull_verified`), `team_conflict`, `divergence`,
   `harness::claude::compaction`.
@@ -160,6 +172,9 @@ Each one has a test; if you change the area, keep the test and add one for the n
 | 24 | A team this machine can no longer use is never a dead end: a pull the server refuses says so (the team's card, the status line, the daemon log), never reads as an empty team, and "Leave a team" removes a revoked, removed or declined membership with its shares, or a team managed here. | `PullOutcome::error`, `team_actions::leave`, `App::left_team` |
 | 25 | Two TUIs never overwrite each other's choices: a save writes only the shares and chosen targets changed in that process since it last read or wrote the file, a re-read takes every other choice from the file, and deletes are only ever added. | `State::user_base`, `State::save_user`, `State::absorb_user_choices`, `App::save_user`, `App::absorb_daemon_state` |
 | 26 | A member-list change never hides a shared conversation for good: each machine re-seals, under the current list, every unchanged shared conversation whose stored record its own signature proves it wrote, once per list change; it never re-seals a record someone else wrote last, and never on the word of an unverified header. | `team_sync::needs_reseal`, `signed_records::authorship`, `State::team_list` |
+| 27 | A team copy is never overwritten by a machine that lacks its completed turns: the push reads the stored copy under the lease, and writes only when this machine is the same or ahead of it (or the user chose "keep mine" for the exact copy they reviewed). Behind, diverged and unverifiable copies are held, and the hold is recorded. Change is judged on completed turns, never bytes or file times. | `team_sync::push_due`, `team_sync::check_stored`, `turns::compare`, `State::team_conflict`, `State::team_force`, `tests/team_sync.rs` (`a_behind_machine_never_replaces_newer_turns`, `a_diverged_copy_is_never_written_over`), `tests/turns.rs` |
+| 28 | A copy written to a message-based harness (Claude Code, OpenCode, Antigravity) fits that harness's window: the compaction note and the newest whole turns, cut at a user turn so no tool call is split from its result, or the write is refused and the existing copy stays. The fit applies to the live window only; omp and Pi copies are whole files and are not fitted. | `Journal::fit`, `cut_points` (`sesync-conv/src/fit.rs`), `window::flags` (`sesync/src/harness/window.rs`), `sesync/tests/context_fit.rs` |
+| 29 | A divergence choice never loses a copy: every choice except "decide later" keeps both turn histories reachable. Take theirs archives and reads back the replaced bytes before the file changes, keeps this machine's version as a fork, and records the replacement (`State::superseded`) before the change, so a turn-taking mirror answered at or before it is dropped, never promoted over the team copy. Keep mine pushes only the exact turns and team record reviewed. Forks install into omp. | `App::confirm_resolve`, `App::write_fork`, `App::run_pending_replace`, `team_import::replace_confirmed`, `State::supersede`, `turn::promote_changed`, `tests/team_divergence.rs` (`take_theirs_keep_mine_here_...`, `a_claude_mirror_answered_before_take_theirs_is_not_promoted_back_over_the_team_copy`) |
 
 ## Change recipes
 
@@ -204,7 +219,9 @@ module and nothing else:
    (a large transcript, a database). `harness/journal.rs` has the JSONL helpers.
 2. Declare it in `harness/mod.rs` and list it in `ALL` (the picker's order).
 3. Test its own reads and writes under `sesync/tests/` with a fake CLI and the real converter;
-   never the real CLI.
+   never the real CLI. Stage the fake with `fake_cli::stage` (`sesync/tests/support/fake_cli.rs`), never by
+   writing a script and `chmod`-ing it: a test that execs a file it just wrote races every forking test
+   thread into ETXTBSY ("Text file busy").
 
 The scan, turn-taking, mirror writes and cleanup, the team push, and the TUI's list, picker,
 titles, renames, icons and preview all come from the registry.

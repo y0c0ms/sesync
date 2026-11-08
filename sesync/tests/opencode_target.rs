@@ -10,6 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+#[path = "support/fake_cli.rs"]
+mod fake_cli;
+
 const BIN: &str = env!("CARGO_BIN_EXE_sesync");
 
 fn sesync_conv() -> PathBuf {
@@ -68,9 +72,9 @@ fn fake_opencode(sb: &Path, deletes: bool) -> PathBuf {
     } else {
         "echo 'Session not found' >&2; exit 1".to_string()
     };
-    fs::write(
+    fake_cli::stage(
         &cmd,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\n\
              case \"$1\" in\n\
              session) {delete};;\n\
@@ -79,10 +83,7 @@ fn fake_opencode(sb: &Path, deletes: bool) -> PathBuf {
             log = sb.join("oc.log").display(),
             bundle = sb.join("imported.json").display(),
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&cmd, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     cmd
 }
 

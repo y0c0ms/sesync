@@ -34,12 +34,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.view() {
         View::Sessions => draw_sessions(f, app, th, chunks[1]),
         View::Team => draw_team(f, app, th, chunks[1]),
+        View::Machines => draw_machines(f, app, th, chunks[1]),
     }
 
     let status_line = match app.mode() {
         // The status goes beside the input, so a refused rename is visible while the user edits.
         // A rename refusal is an error and does not fade, so the raw status is honest here too.
         Mode::Rename => Some((format!("Rename: {}_  {}", app.input(), app.status()), app.status_is_error())),
+        Mode::Settings => Some((format!("Folder: {}_  {}", app.input(), app.status()), app.status_is_error())),
         _ => app.status_line(Instant::now()).map(|(t, e)| (t.to_string(), e)),
     };
     // Both bottom rows sit on the theme's bar colour, like a statusline, so typed input and
@@ -72,6 +74,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::SharePick => draw_share_pick(f, app, th, area),
         Mode::LeavePick => draw_leave_pick(f, app, th, area),
         Mode::Members => draw_members(f, app, th, area),
+        Mode::Resolve => draw_resolve(f, app, th, area),
         _ => {}
     }
     // Session text reaches every view (titles, transcripts, team rows, messages). A glyph whose
@@ -101,10 +104,7 @@ fn scrub_unsafe_glyphs(buf: &mut ratatui::buffer::Buffer) {
 fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let selected = Style::default().fg(th.text).bg(th.accent);
     let unselected = Style::default().fg(th.dim);
-    let (s_style, t_style) = match app.view() {
-        View::Sessions => (selected, unselected),
-        View::Team => (unselected, selected),
-    };
+    let style = |tab: View| if app.view() == tab { selected } else { unselected };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
     // The daemon saves the state file at the end of every pass (every SESYNC_POLL, 5 s by
@@ -116,9 +116,12 @@ fn draw_tab_bar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     };
     let (ok, failing) = app.sync_counts();
     let bar = Line::from(vec![
-        Span::styled(" Sessions ", s_style),
+        Span::styled(" Local ", style(View::Sessions)),
         Span::styled("│", Style::default().fg(th.dim)),
-        Span::styled(format!(" Team ({}) ", app.team_rows().len()), t_style),
+        Span::styled(format!(" Team ({}) ", app.team_rows().len()), style(View::Team)),
+        Span::styled("│", Style::default().fg(th.dim)),
+        Span::styled(format!(" Machines ({}) ", app.machine_count()), style(View::Machines)),
+        Span::styled("│", Style::default().fg(th.dim)),
         Span::styled(format!("   {daemon}"), Style::default().fg(daemon_color)),
         Span::styled(format!(" · {ok} copies in place, {failing} failing"),
             Style::default().fg(if failing > 0 { th.error } else { th.dim })),
@@ -465,8 +468,9 @@ fn mirror_spans(parts: &[(String, crate::session_cols::MirrorState)], width: usi
     spans
 }
 
-/// The Team pane: one line per joined team saying where this machine stands (with a dim line
-/// under it when the user has something to do), then what a verified pull actually brought over.
+/// The Team pane: where this machine stands in each joined team (a dim line under it when the user has
+/// something to do), then the Team list: one row per conversation this machine shares or the team holds,
+/// with its state marker, what the state says, LATEST BY, and when its newest completed turn happened.
 fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     use crate::team_join::Standing;
     const LEAVE: &str = "ctrl+p, Leave a team";
@@ -510,14 +514,31 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             Span::styled("managed here; join it to sync this machine", Style::default().fg(th.dim)),
         ]));
     }
-    head.push(Line::from(Span::styled(app.team_header(std::time::Instant::now()), Style::default().fg(th.dim))));
+    let rows = app.team_rows();
+    head.push(Line::from(vec![
+        Span::styled("Team list  ", Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+        Span::styled(app.team_header(std::time::Instant::now()), Style::default().fg(th.dim)),
+    ]));
+    head.push(Line::from(Span::styled(
+        "= in step   ↑ waiting to push   ↓ behind or not here   ≠ diverged   • shared by this machine   (enter resolves ≠ and ↓)",
+        Style::default().fg(th.dim),
+    )));
+    let title_w = (area.width as usize).saturating_sub(TEAM_FIXED_W).max(12);
+    if !rows.is_empty() {
+        head.push(Line::from(Span::styled(
+            format!("  {:<tw$}  {:<sw$}  {:<hw$}  {:<pw$}  {:<bw$}  UPDATED", "TITLE", "STATE", "HARNESS", "PROJECT", "LATEST BY",
+                tw = title_w, sw = TEAM_STATE_W, hw = TEAM_HARNESS_W, pw = TEAM_PROJECT_W, bw = TEAM_BY_W),
+            Style::default().fg(th.dim),
+        )));
+    }
     let parts = Layout::vertical([Constraint::Length(head.len() as u16), Constraint::Min(1)]).split(area);
     f.render_widget(Paragraph::new(head), parts[0]);
     let area = parts[1];
-    let rows = app.team_rows();
     if rows.is_empty() {
-        let msg = if !cards.is_empty() || app.team_configured() {
-            "No verified team sessions yet. Press ctrl+r to pull."
+        let msg = if app.pulling() {
+            "Pulling the team…"
+        } else if !cards.is_empty() || app.team_configured() {
+            "Nothing shared or on the team yet. Press ctrl+r to pull, or share a session from the Sessions tab."
         } else {
             "Not in a team yet. Press ctrl+p and pick \"Join a team\", or \"Start a team\" on the admin machine."
         };
@@ -528,11 +549,218 @@ fn draw_team(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let selected = Some(app.team_index());
     let offset = selected.unwrap_or(0).saturating_sub(height.saturating_sub(1));
     let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
-    let items: Vec<ListItem> = rows.iter().map(|r| ListItem::new(r.clone())).collect();
+    let items: Vec<ListItem> = rows.iter().map(|r| {
+        let color = match r.state {
+            crate::app::RowState::InStep => th.text,
+            crate::app::RowState::Waiting | crate::app::RowState::Behind => th.warn,
+            crate::app::RowState::Diverged => th.error,
+            crate::app::RowState::Shared => th.dim,
+        };
+        // The short id is shown only when two rows have the same title.
+        let same = rows.iter().filter(|o| o.title == r.title).count() > 1;
+        let title = if same {
+            format!("{} · {}", crate::session_cols::display_safe(&r.title), r.short_id)
+        } else {
+            crate::session_cols::display_safe(&r.title)
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{}  ", crate::session_cols::fit(&title, title_w)), Style::default().fg(th.text)),
+            Span::styled(format!("{}  ", crate::session_cols::fit(&r.state_text(), TEAM_STATE_W)), Style::default().fg(color)),
+            Span::styled(format!("{}  ", crate::session_cols::fit(&r.harness, TEAM_HARNESS_W)), Style::default().fg(th.dim)),
+            Span::styled(format!("{}  ", crate::session_cols::fit(&r.project, TEAM_PROJECT_W)), Style::default().fg(th.dim)),
+            Span::styled(format!("{}  ", crate::session_cols::fit(&r.from, TEAM_BY_W)), Style::default().fg(th.dim)),
+            // Never truncated: the time is short, and a cut time reads as a wrong one.
+            Span::styled(format!("{:<9}", r.updated), Style::default().fg(th.dim)),
+        ]))
+    }).collect();
     let list = List::new(items)
         .highlight_style(Style::default().bg(th.accent))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// The Machines tab's fixed columns: the state, harness and project widths, the gaps after the first three, and the
+/// highlight symbol. The title takes what the row has left.
+const MACHINE_STATE_W: usize = 9;
+const MACHINE_HARNESS_W: usize = 11;
+const MACHINE_PROJECT_W: usize = 40;
+const MACHINE_FIXED_W: usize = MACHINE_STATE_W + MACHINE_HARNESS_W + MACHINE_PROJECT_W + 6 + 2;
+
+/// The Settings tab: the folder files other machines and the phone send arrive in, and how to change it.
+fn draw_settings(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::session_cols::display_safe;
+    let folder = app.inbox_folder();
+    let origin = if app.inbox_is_default() { "default" } else { "chosen" };
+    let lines = vec![
+        Line::from(Span::styled("Files received over the bridge", Style::default().fg(th.text).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Folder  ", Style::default().fg(th.dim)),
+            Span::styled(display_safe(&folder), Style::default().fg(th.text)),
+            Span::styled(format!("  ({origin})"), Style::default().fg(th.dim)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Files and folders sent with `sesync machine send` or from the phone land here. A name that is taken gets a number; nothing is overwritten.",
+            Style::default().fg(th.dim),
+        )),
+        Line::from(Span::styled("The bridge reads this on every upload, so a change applies at once.", Style::default().fg(th.dim))),
+        Line::from(""),
+        Line::from(Span::styled("Enter changes the folder.", Style::default().fg(th.dim))),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+/// The Machines tab: each saved machine with its address and status, then the conversations its last refresh listed,
+/// with their state, title, harness and project. Enter attaches the conversation under the cursor.
+fn draw_machines(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::machines::tab::{Row, Status};
+    use crate::session_cols::{display_safe, fit};
+    let rows = app.machine_rows();
+    if rows.is_empty() {
+        let (msg, color) = match app.machines_error() {
+            Some(why) => (display_safe(why), th.error),
+            None => ("No machines saved; add one with `sesync machine add <name> <pairing link>`.".to_string(), th.dim),
+        };
+        f.render_widget(Paragraph::new(msg).style(Style::default().fg(color)).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let title_w = (area.width as usize).saturating_sub(MACHINE_FIXED_W).max(12);
+    let head = format!("  {}  {}  {}  PROJECT", fit("STATE", MACHINE_STATE_W), fit("TITLE", title_w), fit("HARNESS", MACHINE_HARNESS_W));
+    f.render_widget(Paragraph::new(head).style(Style::default().fg(th.dim)), parts[0]);
+    let selected = rows.iter().enumerate()
+        .filter(|(_, r)| matches!(r, Row::Conversation(_)))
+        .nth(app.machine_index())
+        .map(|(i, _)| i);
+    let height = parts[1].height as usize;
+    let offset = selected.unwrap_or(0).saturating_sub(height.saturating_sub(1));
+    let mut list_state = ListState::default().with_offset(offset).with_selected(selected);
+    let items: Vec<ListItem> = rows.iter().map(|row| match row {
+        Row::Machine { name, endpoint, status } => {
+            let (text, color) = match status {
+                Status::Loading => ("loading…".to_string(), th.dim),
+                Status::Unreachable(why) => (format!("unreachable: {}", display_safe(why)), th.error),
+                Status::Listed => (String::new(), th.dim),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}  ", display_safe(name)), Style::default().fg(th.text).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}  ", display_safe(endpoint)), Style::default().fg(th.dim)),
+                Span::styled(text, Style::default().fg(color)),
+            ]))
+        }
+        Row::Conversation(c) => {
+            let state_color = match c.state.as_str() {
+                "blocked" | "waiting" => th.warn,
+                "working" => th.text,
+                _ => th.dim,
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}  ", fit(&c.state, MACHINE_STATE_W)), Style::default().fg(state_color)),
+                Span::styled(format!("{}  ", fit(&display_safe(&c.title), title_w)), Style::default().fg(th.text)),
+                Span::styled(format!("{}  ", fit(&c.harness, MACHINE_HARNESS_W)), Style::default().fg(th.dim)),
+                Span::styled(fit(&display_safe(&c.path), MACHINE_PROJECT_W), Style::default().fg(th.dim)),
+            ]))
+        }
+    }).collect();
+    let list = List::new(items).highlight_style(Style::default().bg(th.accent)).highlight_symbol("> ");
+    f.render_stateful_widget(list, parts[1], &mut list_state);
+}
+
+/// The Team list's fixed columns. The title takes what the row has left (see `TEAM_FIXED_W`).
+const TEAM_STATE_W: usize = 18;
+const TEAM_HARNESS_W: usize = 8;
+const TEAM_PROJECT_W: usize = 14;
+const TEAM_BY_W: usize = 16;
+/// The columns other than the title, their gaps, and the highlight symbol.
+const TEAM_FIXED_W: usize = TEAM_STATE_W + TEAM_HARNESS_W + TEAM_PROJECT_W + TEAM_BY_W + 9 + 10 + 2;
+
+/// The divergence dialog: what the two copies share, then each side's new turns (side by side when the
+/// dialog is wide, stacked when it is narrow), and the five choices with the highlighted one.
+fn draw_resolve(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    use crate::app::Choice;
+    let Some(r) = app.resolve() else { return };
+    let outer = centered(area.width.min(120), area.height.min(36), area);
+    let title = format!("{}: {}", if r.behind { "Behind" } else { "Diverged" }, crate::session_cols::display_safe(&r.title));
+    let inner = dialog(f, &title, th, outer);
+    // Each choice is a label line and its description, which wraps: three rows wide, four stacked.
+    let wide = inner.width >= 96;
+    let option_rows = if wide { 3 } else { 4 } * Choice::ALL.len() as u16;
+    let parts = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(option_rows),
+    ]).split(inner);
+    let common = if r.common == 0 {
+        "No completed turns in common: the two copies start differently.".to_string()
+    } else {
+        format!("Same history up to turn {}.", r.common)
+    };
+    let counts = format!("New turns: this machine {}, team {} · team record {}",
+        r.local_new.len(), r.team_new.len(), r.team_seq);
+    f.render_widget(Paragraph::new(vec![
+        Line::from(Span::styled(common, Style::default().fg(th.text).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(counts, Style::default().fg(th.dim))),
+    ]), parts[0]);
+    let panes = if wide {
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(parts[1])
+    } else {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(parts[1])
+    };
+    draw_side(f, r, crate::app::Side::Local, th, panes[0]);
+    draw_side(f, r, crate::app::Side::Team, th, panes[1]);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, c) in Choice::ALL.iter().enumerate() {
+        let chosen = r.choice == Some(*c);
+        let (label_style, text_style) = if chosen {
+            (Style::default().fg(th.text).bg(th.accent).add_modifier(Modifier::BOLD), Style::default().fg(th.text).bg(th.accent))
+        } else {
+            (Style::default().fg(th.text).add_modifier(Modifier::BOLD), Style::default().fg(th.dim))
+        };
+        lines.push(Line::from(Span::styled(format!("{} {}", i + 1, c.label()), label_style)));
+        lines.push(Line::from(Span::styled(format!("   {}", c.describe_for(r.behind)), text_style)));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), parts[2]);
+}
+
+/// One side of the divergence dialog: its new turns from the scroll, the focused side marked.
+fn draw_side(f: &mut Frame, r: &crate::app::Resolve, side: crate::app::Side, th: &Theme, area: Rect) {
+    use crate::app::Side;
+    let focused = r.focus == side;
+    let (name, index) = match side {
+        Side::Local => ("This machine", 0),
+        Side::Team => ("Team copy", 1),
+    };
+    let turns = r.side_turns(side);
+    let title = format!("{} {}: {} new turn(s)", if focused { ">" } else { " " }, name, turns.len());
+    let block = Block::default().borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { th.accent } else { th.dim }))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if turns.is_empty() {
+        let text = match side {
+            Side::Local => "no completed turn on this machine past the common history",
+            Side::Team => "no completed turn on the team copy past the common history",
+        };
+        f.render_widget(Paragraph::new(text).style(Style::default().fg(th.dim)).wrap(Wrap { trim: true }), inner);
+        return;
+    }
+    let width = inner.width as usize;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let mut lines: Vec<Line> = Vec::new();
+    for (n, t) in turns.iter().enumerate().skip(r.scroll[index]) {
+        let when = if t.at_ms > 0 { crate::session_cols::relative(now, t.at_ms as f64 / 1000.0) } else { "-".to_string() };
+        lines.push(Line::from(Span::styled(
+            crate::session_cols::fit(&format!("{:>3}  {:<9} {}", r.common + n + 1, when, crate::session_cols::display_safe(&t.user)), width),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            crate::session_cols::fit(&format!("       {}", crate::session_cols::display_safe(&t.reply)), width),
+            Style::default().fg(th.dim),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ----- floating dialogs -------------------------------------------------------------------
@@ -595,6 +823,8 @@ fn draw_palette(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         parts[0],
     );
     let cursor = rows.iter().position(|r| r.highlighted).unwrap_or(0);
+    // The title column fits the longest title, so a long one never runs into its key.
+    let title_w = rows.iter().map(|r| r.title.chars().count()).max().unwrap_or(0).max(22);
     let list_rows: Vec<Line<'static>> = rows.iter()
         .map(|r| {
             let state = if r.why.is_empty() { "enabled".to_string() } else { format!("off: {}", r.why) };
@@ -608,7 +838,7 @@ fn draw_palette(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
             let key_style = if r.highlighted { on_accent(th, false) } else { Style::default().fg(th.dim) };
             let title_style = if r.highlighted { on_accent(th, true) } else { Style::default().fg(th.text) };
             Line::from(vec![
-                Span::styled(format!(" {:<22}", r.title), title_style),
+                Span::styled(format!(" {:<title_w$} ", r.title), title_style),
                 Span::styled(format!("{:<8}", r.key), key_style),
                 Span::styled(state, state_style),
             ])
@@ -773,7 +1003,12 @@ fn tail_fit(text: &str, width: usize) -> String {
 fn draw_help(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let lines = app.help_lines();
     let height = lines.len() as u16 + 4;
-    let inner = dialog(f, if app.view() == View::Team { "Keys: team" } else { "Keys: sessions" }, th,
+    let title = match app.view() {
+        View::Sessions => "Keys: sessions",
+        View::Team => "Keys: team",
+        View::Machines => "Keys: machines",
+    };
+    let inner = dialog(f, title, th,
         centered(74, height, area));
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let items: Vec<ListItem> = lines.iter().map(|(keys, what)| {

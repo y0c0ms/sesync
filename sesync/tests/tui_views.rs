@@ -1,6 +1,6 @@
 //! The command palette, the Team view, and the screen that shows them. Enter and Ctrl+P open the
 //! palette, which lists every action with the key that runs it and whether it can run here. Tab
-//! switches between the local Sessions and the verified Team sessions.
+//! cycles through the local Sessions, the verified Team sessions and the Machines.
 
 use ratatui::{backend::TestBackend, Terminal};
 use sesync::app::{App, Ev, Mode, View};
@@ -150,12 +150,14 @@ fn esc_closes_the_palette() {
 }
 
 #[test]
-fn tab_switches_between_sessions_and_team() {
+fn tab_cycles_sessions_team_and_machines() {
     let sb = sandbox("tab");
     let mut a = app(&sb);
     assert_eq!(a.view(), View::Sessions);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Team);
+    a.handle(Ev::Tab, Instant::now());
+    assert_eq!(a.view(), View::Machines);
     a.handle(Ev::Tab, Instant::now());
     assert_eq!(a.view(), View::Sessions);
     let _ = fs::remove_dir_all(&sb);
@@ -223,8 +225,8 @@ fn the_screen_shows_both_tabs_and_points_at_the_palette() {
     write_session(&sb, SID_A, "one");
     let a = app(&sb);
     let text = screen(&a, 100, 10);
-    let tabs = line_with(&text, "Sessions");
-    assert!(tabs.contains("Team"), "the tab bar shows Team:\n{text}");
+    let tabs = line_with(&text, "Local");
+    assert!(tabs.contains("Team"), "the tab bar shows Local and Team:\n{text}");
     assert!(text.contains("ctrl+p"), "the footer points at the palette:\n{text}");
     let _ = fs::remove_dir_all(&sb);
 }
@@ -297,17 +299,6 @@ fn the_team_header_says_when_nothing_was_pulled_yet() {
     let sb = sandbox("never-pulled");
     let a = app(&sb);
     assert!(a.team_header(Instant::now()).contains("not pulled yet"), "an untouched list says so");
-    let _ = fs::remove_dir_all(&sb);
-}
-
-#[test]
-fn team_rows_show_a_short_id_next_to_the_title() {
-    let sb = sandbox("short-id");
-    let mut a = app(&sb);
-    a.set_team_sessions(vec![team_session(TEAM_ID, "Deploy runbook")]);
-    let rows = a.team_rows();
-    assert_eq!(rows, vec!["Deploy runbook · 11111111…".to_string()],
-        "the row carries the full title and just enough id to tell sessions apart");
     let _ = fs::remove_dir_all(&sb);
 }
 

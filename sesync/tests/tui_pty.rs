@@ -252,7 +252,7 @@ fn tui_session_menu_opens_the_mirror_picker_and_confirms() {
     let text = wait_for("up/down move", master, seen);
     assert!(text.contains("Mark / unmark for team"), "the session menu must be drawn:\n{text}");
 
-    m.write_all(b"jj\r").unwrap(); // down two rows to Mirror to harness, then run it
+    m.write_all(b"jjj\r").unwrap(); // down three rows, past Open in herdr, Rename and Mark, to Mirror to harness, then run it
     let text = wait_for("space tick", master, seen);
     assert!(text.contains("[ ] π pi") && text.contains("[ ] ⋆ claude"),
         "a fresh picker starts with nothing ticked, each harness behind its icon:\n{text}");

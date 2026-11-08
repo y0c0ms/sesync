@@ -78,12 +78,12 @@ fn the_join_dialog_has_the_join_fields() {
 #[test]
 fn typing_edits_the_highlighted_field_and_tab_moves_it() {
     let mut a = open_join();
-    type_text(&mut a, "http://10.10.20.6:30500");
+    type_text(&mut a, "http://10.0.0.6:30500");
     a.handle(Ev::Tab, Instant::now()); // -> team
     type_text(&mut a, "main");
     a.handle(Ev::Tab, Instant::now()); // -> member
     a.handle(Ev::Backspace, Instant::now()); // no-op on empty, harmless
-    assert_eq!(a.form_value("server url"), "http://10.10.20.6:30500");
+    assert_eq!(a.form_value("server url"), "http://10.0.0.6:30500");
     assert_eq!(a.form_value("team"), "main");
     assert_eq!(a.form_value("member"), "");
 }
@@ -176,8 +176,8 @@ fn an_untouched_start_a_team_dialog_shows_examples_and_refuses_enter() {
 #[test]
 fn the_dialog_can_be_prefilled_by_the_caller() {
     let mut a = app();
-    a.open_form(Kind::Register, &[("admin token file", "/home/yocoms/.sesync/admin-token")]);
-    assert_eq!(a.form_value("admin token file"), "/home/yocoms/.sesync/admin-token");
+    a.open_form(Kind::Register, &[("admin token file", "/home/jordan/.sesync/admin-token")]);
+    assert_eq!(a.form_value("admin token file"), "/home/jordan/.sesync/admin-token");
     assert_eq!(a.form_value("team"), "");
 }
 

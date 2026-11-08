@@ -18,7 +18,9 @@
 //! Ids are uuid5 of (session seed, record id) so a re-run rewrites the same
 //! uuids and the daemon's replace-in-place keeps working.
 
-use crate::journal::{iso_from_ms, Journal};
+use crate::attach::{self, Verdict};
+use crate::fit::Window;
+use crate::journal::iso_from_ms;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -41,8 +43,11 @@ fn tool_id(raw: &str) -> String {
     format!("toolu_{}", &Uuid::new_v5(&NS, format!("{raw}|tool").as_bytes()).simple().to_string()[..24])
 }
 
-pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
-    let msgs = j.messages();
+/// Why a note stands in for an image the Claude copy does not carry.
+const REPLY_IMAGE_WHY: &str = "an image in a reply, which Claude does not take; kept in the source session";
+const TOOL_IMAGE_WHY: &str = "an image in a tool result, which this copy does not carry; kept in the source session";
+
+pub fn to_lines(win: &Window, o: &Options) -> Vec<String> {
     let mut out = Vec::new();
     // The session starts with a custom-title, as /rename and `-n` write. Claude
     // prefers it over ai-title; without one it labels the session by its first
@@ -58,10 +63,10 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
         Uuid::new_v5(&NS, format!("{}|{}|{}", o.session_id, rid, n).as_bytes()).to_string()
     };
 
-    // The turns a compaction archived are not in `msgs` any more: its summary is the only record
-    // of them, so it is carried as the first message. Without this a compacted journal exports a
-    // conversation that simply starts mid-thread.
-    if let (Some(text), Some((_, ts))) = (j.compaction_note(), j.live_compaction()) {
+    // The note stands in for what is not carried: the turns a compaction archived (its summary is
+    // the only record of them) and the turns a fit left out. It goes first, so the conversation
+    // never starts mid-thread without a word.
+    if let Some((text, ts)) = win.note() {
         let uuid = uid("compaction-summary");
         let rec = json!({
             "parentUuid": parent, "isSidechain": false, "userType": "external",
@@ -73,7 +78,10 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
         parent = Some(uuid);
     }
 
-    for m in &msgs {
+    // Claude rejects a request with more than 20 images when one has a side over 2000 px. The copy
+    // is one request, so the rule is decided over the whole window.
+    let many = attach::carried_count(&attach::CLAUDE, &win.msgs) > attach::CLAUDE.many_images.map_or(usize::MAX, |(n, _)| n);
+    for m in &win.msgs {
         let ts = iso_from_ms(m.timestamp_ms);
         let (typ, message): (&str, Value) = match m.role {
             "user" => {
@@ -84,12 +92,13 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
                         Value::String(s) => only_text = Some(s.clone()),
                         Value::Object(ob) => match ob.get("type").and_then(Value::as_str) {
                             Some("text") => blocks.push(json!({"type": "text", "text": ob.get("text").cloned().unwrap_or(Value::String(String::new()))})),
-                            Some("image") => {
-                                let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
-                                if !data.starts_with("blob:") && !data.is_empty() {
+                            Some("image") => match attach::judge(&attach::CLAUDE, b, many) {
+                                Verdict::Carry => {
+                                    let data = ob.get("data").and_then(Value::as_str).unwrap_or("");
                                     blocks.push(json!({"type": "image", "source": {"type": "base64", "media_type": ob.get("mimeType").cloned().unwrap_or("image/png".into()), "data": data}}));
                                 }
-                            }
+                                Verdict::Withhold(note) => blocks.push(json!({"type": "text", "text": note})),
+                            },
                             _ => {}
                         },
                         _ => {}
@@ -134,6 +143,7 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
                             "name": ob.get("name").cloned().unwrap_or(Value::String("tool".into())),
                             "input": ob.get("arguments").cloned().unwrap_or(Value::Object(Map::new()))
                         })),
+                        Some("image") => blocks.push(json!({"type": "text", "text": attach::image_note(b, REPLY_IMAGE_WHY)})),
                         _ => {}
                     }
                 }
@@ -153,8 +163,9 @@ pub fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
                 let cid = m.message.get("toolCallId").and_then(Value::as_str).unwrap_or("");
                 let is_err = m.message.get("isError").and_then(Value::as_bool).unwrap_or(false);
                 let text = m.content.iter().filter_map(|c| match c {
-                    Value::String(s) => Some(s.as_str()),
-                    Value::Object(x) => x.get("text").and_then(Value::as_str),
+                    Value::String(s) => Some(s.clone()),
+                    Value::Object(x) if x.get("type").and_then(Value::as_str) == Some("image") => Some(attach::image_note(c, TOOL_IMAGE_WHY)),
+                    Value::Object(x) => x.get("text").and_then(Value::as_str).map(str::to_string),
                     _ => None,
                 }).collect::<Vec<_>>().join("\n");
                 ("user", json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id(cid), "content": text, "is_error": is_err}]}))
@@ -182,6 +193,13 @@ pub fn bucket(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::journal::Journal;
+
+    /// The writer on a journal's whole live window, nothing fitted.
+    fn to_lines(j: &Journal, o: &Options) -> Vec<String> {
+        super::to_lines(&j.window(), o)
+    }
 
     fn journal_of(lines: &[String]) -> Journal {
         // Unique per call: tests run in parallel, and a shared name let one test read

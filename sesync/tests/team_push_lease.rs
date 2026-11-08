@@ -2,7 +2,7 @@
 //! the write happens under the granted lease; the lease is always given back, even when the
 //! write fails; and a held conversation is refused without writing.
 use sesync::state::State;
-use sesync::team_push::{push_marked, push_marked_sealed, PushError, TeamRemote};
+use sesync::team_push::{push_marked, push_marked_sealed, HttpTeam, PushError, TeamRemote};
 use std::cell::RefCell;
 
 #[derive(Default)]
@@ -85,4 +85,13 @@ fn the_lease_is_released_even_when_the_write_fails() {
     let r = push_marked(&marked("ses_1"), &f, "personal", "ses_1", b"x");
     assert_eq!(r, Err(PushError::Unreachable));
     assert_eq!(f.log.borrow().last().unwrap(), "release ses_1", "a failed write still gives the lease back");
+}
+
+#[test]
+fn a_team_over_plain_http_outside_loopback_is_refused_before_the_token_is_sent() {
+    // 198.51.100.7 (TEST-NET-2) is not loopback: the bearer token must not leave in clear text, so the
+    // stored-record read refuses before it sends anything. Without the scheme check this would be a network error.
+    let team = HttpTeam { base: "http://198.51.100.7:30500".into(), token: "tok".into(), machine: "m".into() };
+    let r = team.stored("personal", "ses_1");
+    assert!(matches!(&r, Err(PushError::Refused(m)) if m.contains("refusing")), "{r:?}");
 }

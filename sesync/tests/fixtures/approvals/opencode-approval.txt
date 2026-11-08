@@ -1,0 +1,39 @@
+
+  ┃
+  ┃  run ls
+  ┃
+
+     $ ls -la
+
+     ▣  Build · fake-32k
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┃
+  ┃  △ Permission required
+  ┃    # Shell command
+  ┃
+  ┃  $ ls -la
+  ┃
+  ┃
+  ┃   Allow once   Allow always   Reject                                 ctrl+f fullscreen  ⇆ select  enter confirm
+  ┃

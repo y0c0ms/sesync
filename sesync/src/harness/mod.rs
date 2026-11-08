@@ -26,6 +26,7 @@ pub mod omp;
 pub mod opencode;
 pub mod pi;
 mod retired;
+pub mod window;
 
 pub use retired::{Retired, RETIRED};
 
@@ -246,11 +247,27 @@ pub trait Harness: Send + Sync {
         messages
     }
 
+    /// The command that resumes this conversation in its own harness: the program first, the
+    /// conversation's identifier last. Err says why sesync cannot offer one.
+    fn resume_argv(&self, _loc: &Location, _key: &str) -> Result<Vec<String>, String> {
+        Err(format!("{} cannot resume a session from sesync: not supported", self.label()))
+    }
+    /// The project directory the conversation was run in, where its resume starts. None when the
+    /// harness does not record one.
+    fn project_dir(&self, _loc: &Location, key: &str) -> Option<String> {
+        self.cwd(Path::new(key))
+    }
+
     // ----- a store harness's conversations -----------------------------------------------------
 
     /// The conversations in the database, newest updates included.
     fn rows(&self, _loc: &Location) -> Vec<Row> {
         Vec::new()
+    }
+    /// A stamp that changes whenever `rows` would answer differently: the store's files, by size and change time.
+    /// None when the store cannot say, and its rows are read each time.
+    fn rows_stamp(&self, _loc: &Location) -> Option<String> {
+        None
     }
     /// The name to show for a row: its own title, or what the harness falls back to.
     fn row_title(&self, _loc: &Location, row: &Row) -> String {

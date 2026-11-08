@@ -33,6 +33,10 @@ impl Harness for Omp {
     fn cwd(&self, path: &Path) -> Option<String> {
         journal::cwd_from_head(path)
     }
+    /// `omp --resume` takes the session file's path.
+    fn resume_argv(&self, _loc: &Location, key: &str) -> Result<Vec<String>, String> {
+        Ok(vec!["omp".into(), "--resume".into(), key.into()])
+    }
     fn placed_by_cwd(&self) -> bool {
         true
     }

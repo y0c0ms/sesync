@@ -74,6 +74,7 @@ pub fn install_antigravity(
 ) -> Result<PathBuf, String> {
     let mut cmd = Command::new(sesync_conv);
     cmd.arg("to-antigravity").arg(src).arg("--store").arg(store).args(["--id", mirror_id]);
+    cmd.args(crate::harness::window::flags("antigravity", src));
     // "untitled" is the scan's placeholder, not a name: without --title the converter takes the
     // journal's own title, and agy names an untitled conversation by its first prompt.
     let title = title.trim();

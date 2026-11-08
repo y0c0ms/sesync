@@ -65,7 +65,7 @@ fn the_command_list_is_a_centered_dialog_over_the_list() {
     let s = screen(&a, 100, 24);
     // The lists the dialog floats over are still there.
     assert!(s.contains("one"), "the session list stays visible:\n{s}");
-    assert!(s.contains("Sessions"), "the tab bar stays visible:\n{s}");
+    assert!(s.contains("Local"), "the tab bar stays visible:\n{s}");
     assert!(s.contains("ctrl+p"), "the footer stays visible:\n{s}");
     // The dialog itself, centered: its title appears with a border around content.
     assert!(s.contains("Command palette"), "dialog title:\n{s}");

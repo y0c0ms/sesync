@@ -3,11 +3,11 @@
 //! Continuous polling is the same pass repeated on an interval (not yet wired).
 
 use sesync::harness::{self, Harness, Kind, Locations, Row, Tools};
-use sesync::mirror::{copy_hash, copy_mtime, copy_stamp};
+use sesync::mirror::{copy_mtime, copy_stat, file_identity, CopyHashes};
 use sesync::pass::{format_status, PassSource};
 use sesync::scan::{should_sync, ScanInput, MIN_BYTES};
 use sesync::state::{Mirror, Source, State};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ struct Env {
 
 impl Env {
     fn from_env() -> Env {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         let get = |k: &str, d: PathBuf| std::env::var_os(k).map(PathBuf::from).unwrap_or(d);
         let num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         // install.sh puts sesync-conv and sesync-lock next to this binary (~/.local/bin by default).
@@ -54,7 +54,7 @@ impl Env {
         Tools { home: &self.home, sesync_conv: &self.sesync_conv }
     }
     fn lock_dir(&self) -> PathBuf {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         sesync::lock::lock_dir_for(&home, std::env::var_os("SESYNC_LOCK_DIR").map(PathBuf::from))
     }
 }
@@ -68,7 +68,7 @@ fn now_secs() -> f64 {
 /// `team join` is visible to all of them.
 fn team_config_dir() -> PathBuf {
     std::env::var_os("SESYNC_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = sesync::home::home_dir();
         home.join(".config").join("sesync")
     })
 }
@@ -110,8 +110,17 @@ fn release_records_logged(locations: &Locations, state: &mut State) {
     }
 }
 
+/// What the daemon keeps from one pass to the next, so an unchanged file is not read again: the
+/// content hashes of the session copies, and the identity of each subagent transcript archived.
+/// A run starts with both empty.
+#[derive(Default)]
+struct PassMemo {
+    hashes: CopyHashes,
+    archived: HashMap<PathBuf, String>,
+}
+
 /// Find sources that need a sync, and the title to give their mirror.
-fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
+fn scan(env: &Env, state: &mut State, memo: &mut PassMemo) -> Vec<PassSource> {
     let now = now_secs();
     let mut out = Vec::new();
     // One database read per store harness per pass: the rows are scan_store's input, and the ids
@@ -151,10 +160,11 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             if is_mirror(state, &key) || recorded.contains(&key) {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
             // A conversation of several files (a database and its WAL) changes in any of them:
-            // its time, stamp and hash cover them together.
-            let mtime = copy_mtime(fmt, &path);
+            // its time and hash cover them together. One stat per file gives all of it.
+            let stat = copy_stat(fmt, &path);
+            let Some(size) = stat.size else { continue };
+            let mtime = stat.mtime;
             let src = state.sources.entry(key.clone()).or_insert_with(|| Source::new(fmt, &key));
             if src.conv.is_empty() {
                 src.conv = sesync::manage::conversation_id(&key);
@@ -162,14 +172,7 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
             if mtime > src.last_seen_change {
                 src.last_seen_change = mtime;
             }
-            let stamp = copy_stamp(fmt, &path);
-            let hash = if stamp == src.last_stamp && !src.last_hash.is_empty() {
-                src.last_hash.clone()
-            } else {
-                let h = copy_hash(fmt, &path).unwrap_or_default();
-                src.last_stamp = stamp;
-                h
-            };
+            let hash = memo.hashes.hash(fmt, &path, &stat.identity).unwrap_or_default();
             let hash_changed = hash != src.last_hash;
             let live: Vec<&Mirror> = src.mirrors.values().filter(|m| !m.diverged).collect();
             let live_current = live.iter().all(|m| m.source_hash == hash);
@@ -190,7 +193,7 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
                 missing, src.chosen_targets.len(), src.mirrors.len(),
                 src.failures, src.last_failure, now, env.quiet_secs);
             let input = ScanInput {
-                size: meta.len(),
+                size,
                 mtime,
                 now,
                 is_mirror: false,
@@ -202,7 +205,7 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
                 wanted_mirrors: wanted,
                 needs_mirror,
             };
-            if !should_sync(&input) || meta.len() < MIN_BYTES {
+            if !should_sync(&input) || size < MIN_BYTES {
                 continue;
             }
             let title = h.title(&path);
@@ -213,13 +216,16 @@ fn scan(env: &Env, state: &mut State) -> Vec<PassSource> {
     for (h, rows) in &stores {
         out.extend(scan_store(env, state, now, *h, rows, &store_ids));
     }
-    record_subagents(env, state);
+    record_subagents(env, state, &mut memo.archived);
+    memo.hashes.end_pass();
     out
 }
 
 /// Record every subagent transcript under its parent session, so the TUI can show it there.
 /// Harnesses that keep subagent files beside their parent list them (`Harness::subagents`).
-fn record_subagents(env: &Env, state: &mut State) {
+/// Each one is kept as a verified, compressed copy under its parent. A transcript whose identity
+/// (size, modification time, inode) equals the one archived earlier in this run is not read again.
+fn record_subagents(env: &Env, state: &mut State, archived: &mut HashMap<PathBuf, String>) {
     let mut found: BTreeMap<String, Vec<String>> = Default::default();
     for h in harness::ALL {
         for (parent, path) in h.subagents(env.locations.of(h.id())) {
@@ -227,16 +233,36 @@ fn record_subagents(env: &Env, state: &mut State) {
         }
     }
     let store = env.state_dir.join("archive");
+    let mut listed: HashSet<PathBuf> = HashSet::new();
     for (parent, files) in found.iter_mut() {
         files.sort();
-        // Keep a verified, compressed copy of each subagent transcript under its parent.
         // A copy that fails to write is logged; it never blocks the pass.
         for f in files.iter() {
-            if let Err(e) = sesync::archive_store::store_session(&store, parent, Path::new(f)) {
-                eprintln!("archive {f}: {e}");
+            let path = PathBuf::from(f);
+            listed.insert(path.clone());
+            // The identity is read before the copy, so a transcript that changes while it is archived
+            // has a new identity, and is archived again, on the next pass.
+            let before = file_identity(&path);
+            if before.is_some() && archived.get(&path) == before.as_ref() {
+                continue;
+            }
+            match sesync::archive_store::store_session(&store, parent, &path) {
+                Ok(_) => match before {
+                    Some(id) => {
+                        archived.insert(path, id);
+                    }
+                    None => {
+                        archived.remove(&path);
+                    }
+                },
+                Err(e) => {
+                    archived.remove(&path);
+                    eprintln!("archive {f}: {e}");
+                }
             }
         }
     }
+    archived.retain(|p, _| listed.contains(p));
     state.subagents = found;
 }
 
@@ -296,7 +322,7 @@ fn scan_store(env: &Env, state: &mut State, now: f64, h: &dyn Harness, rows: &[R
 
 /// One pass: scan the stores and record what changed in sesync's own state. Nothing is written
 /// into any harness store, so a session stays exactly where its harness keeps it.
-fn one_pass(env: &Env, state: &mut State) -> usize {
+fn one_pass(env: &Env, state: &mut State, memo: &mut PassMemo) -> usize {
     // The TUI writes the same file while this loop runs. Adopt its choices before the scan
     // and once more before the save, so a keystroke is never rolled back by this pass.
     if let Err(e) = state.absorb_user_edits(&env.state_file()) {
@@ -305,7 +331,7 @@ fn one_pass(env: &Env, state: &mut State) -> usize {
     // A choice saved by an older TUI can still name a retired harness, and the TUI may have
     // deleted a session since the last pass.
     release_records_logged(&env.locations, state);
-    let changed = scan(env, state);
+    let changed = scan(env, state, memo);
     let attempted = changed.len();
     // Un-choosing a target has to drop the copy, and that is not a content change, so it runs on
     // every pass rather than inside the `changed` loop.
@@ -578,11 +604,98 @@ fn run_mirrors(env: &Env, state: &mut State, apply: bool) -> i32 {
     0
 }
 
+/// `sesync herdr check [--herdr <exe>]`: does that herdr still do what sesync needs (see
+/// `herdr_check`). `sesync herdr guard [--remove]`: make `herdr update` offer that check first.
+/// `sesync herdr probe --file <f>`: the stand-in session the check runs in a pane.
+fn run_herdr(args: &[String]) -> i32 {
+    use sesync::herdr_check;
+    let usage = "usage: sesync herdr check [--herdr <exe>] | sesync herdr guard [--remove]";
+    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    let home = sesync::home::home_dir();
+    match args.first().map(String::as_str) {
+        Some("probe") => match value("--file") {
+            Some(file) => herdr_check::probe(Path::new(&file)),
+            None => 2,
+        },
+        Some("check") => {
+            let bin = value("--herdr")
+                .or_else(|| std::env::var("HERDR_BIN_PATH").ok().filter(|b| !b.is_empty()))
+                .unwrap_or_else(|| "herdr".to_string());
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => { eprintln!("sesync: cannot find its own program: {e}"); return 1; }
+            };
+            println!("Checking what sesync needs from {bin}, in a throwaway herdr session:");
+            let ok = herdr_check::check(Path::new(&bin), &exe, &home, &mut |step| {
+                let mark = if step.ok { "  ok  " } else { "  FAIL" };
+                if step.detail.is_empty() {
+                    println!("{mark} {}", step.what);
+                } else {
+                    println!("{mark} {}: {}", step.what, step.detail);
+                }
+            });
+            if ok {
+                println!("Every check passed: sesync's popup and \"Open in herdr\" work with this herdr.");
+                0
+            } else {
+                println!("A check failed: with this herdr, sesync's \"Open in herdr\" would not work as it does now.");
+                1
+            }
+        }
+        Some("guard") => {
+            let Some(dir) = sesync::herdr_open::herdr_config_dir(&home) else {
+                eprintln!("sesync: herdr's configuration directory is unknown (APPDATA is not set)");
+                return 1;
+            };
+            if args.iter().any(|a| a == "--remove") {
+                return match herdr_check::remove_guard(&dir) {
+                    Ok(true) => { println!("removed {}", dir.join(herdr_check::GUARD_FILE).display()); 0 }
+                    Ok(false) => { println!("no guard in {}", dir.display()); 0 }
+                    Err(e) => { eprintln!("sesync: {e}"); 1 }
+                };
+            }
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => { eprintln!("sesync: cannot find its own program: {e}"); return 1; }
+            };
+            match herdr_check::install_guard(&dir, &exe) {
+                Ok(path) => { println!("wrote {}: herdr update now warns and can run `sesync herdr check` first", path.display()); 0 }
+                Err(e) => { eprintln!("sesync: {e}"); 1 }
+            }
+        }
+        _ => { eprintln!("{usage}"); 2 }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Team admin commands do not touch the session state, so they run before it is loaded.
     if args.first().map(String::as_str) == Some("team") {
         std::process::exit(run_team(&args[1..]));
+    }
+    if args.first().map(String::as_str) == Some("herdr") {
+        std::process::exit(run_herdr(&args[1..]));
+    }
+    // Pairings with other machines' bridges; no session state is read.
+    if args.first().map(String::as_str) == Some("machine") {
+        std::process::exit(sesync::machines::cli::run(&args[1..], &team_config_dir().join("machines.json")));
+    }
+    // The phone bridge reads sessions but never saves state, so it too runs before the state is loaded.
+    if args.first().map(String::as_str) == Some("bridge") {
+        let env = Env::from_env();
+        let state_file = env.state_file();
+        let roots = sesync::manage::Roots {
+            locations: env.locations.clone(),
+            home: env.home.clone(),
+            sesync_conv: env.sesync_conv.clone(),
+        };
+        let locks = sesync::bridge::turns::LockTools { sesync_lock: env.sesync_lock.clone(), lock_dir: env.lock_dir() };
+        let code = sesync::bridge::cli::run(&args[1..], &team_config_dir().join("bridge"), &team_config_dir().join("machines.json"), locks, move || {
+            let (locations, home) = (roots.locations.clone(), roots.home.clone());
+            let catalog = std::sync::Arc::new(sesync::bridge::catalog::StateCatalog::new(roots, state_file));
+            sesync::bridge::cli::Sessions { catalog, locations, home }
+        });
+        std::process::exit(code);
     }
     let env = Env::from_env();
     let _ = std::fs::create_dir_all(&env.state_dir);
@@ -617,7 +730,7 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--once") {
-        let attempted = one_pass(&env, &mut state);
+        let attempted = one_pass(&env, &mut state, &mut PassMemo::default());
         println!("one pass done, {attempted} source(s) changed");
         return;
     }
@@ -642,7 +755,15 @@ fn main() {
         // pushed. The teams are read again at every team step, after renewing any token about to
         // run out, so a renewal, a new join or a `sesync team renew` is used without a restart.
         let mut teams = sesync::team_watch::teams_from_env(&team_config_dir());
+        // A legacy `marked` list folds into shares here. Save it at once: the first pass re-reads
+        // shares from disk, and an unsaved fold would be discarded there.
+        let had_legacy = !state.legacy_marked.is_empty();
         state.migrate_legacy_team_state(&teams.iter().map(|t| t.space.clone()).collect::<Vec<_>>());
+        if had_legacy && state.legacy_marked.is_empty() {
+            if let Err(e) = state.save(&env.state_file()) {
+                eprintln!("sesync: cannot save migrated team shares: {e}");
+            }
+        }
         // The team pull and push run on their own interval: SESYNC_POLL at first, doubling while the
         // team has nothing new, capped at SESYNC_TEAM_POLL_MAX (team_backoff). The local pass is not
         // affected and still runs on every SESYNC_POLL tick.
@@ -657,8 +778,17 @@ fn main() {
         // The last line reported per waiting join, so "waiting for the admin" is logged once per
         // team per run, not on every team step.
         let mut join_notes: std::collections::BTreeMap<String, String> = Default::default();
+        // The shares as the team step last saw them: a session the user just shared or unshared
+        // is pushed on the next tick, not after the backed-off interval.
+        let mut shares_seen = state.shares.clone();
+        let mut memo = PassMemo::default();
         loop {
-            one_pass(&env, &mut state);
+            one_pass(&env, &mut state, &mut memo);
+            if state.shares != shares_seen {
+                shares_seen = state.shares.clone();
+                next_team_at = None;
+                team_backoff = team_backoff.next(true);
+            }
             let team_due = next_team_at.map_or(true, |t| std::time::Instant::now() >= t);
             if team_due {
                 // Set when a pull accepts a new record, a push succeeds or the admin approves a
@@ -1096,6 +1226,10 @@ fn run_tui(
     // list never waits on a large transcript or a conversion.
     let preview = sesync::preview::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
     tr("preview worker started", &mut trace);
+    // The Team list compares this machine's copy with the team's on a worker: a Claude transcript is
+    // converted to be read, and the list never waits on that (invariant 22).
+    let compare = sesync::team_compare::Worker::start(roots.locations.clone(), roots.home.clone(), roots.sesync_conv.clone());
+    tr("compare worker started", &mut trace);
     // The Team tab and "Refresh team" exist before the first pull; without configuration they
     // say what is missing instead of failing silently. A machine can belong to several teams.
     let teams: Vec<String> = sesync::team_watch::teams_from_env(&config_dir).iter()
@@ -1104,10 +1238,16 @@ fn run_tui(
     // worker reads the rest, rows on screen first. Opening never waits on every session file.
     let titles_file = state_file.with_file_name("titles.json");
     let title_worker = sesync::title_worker::Worker::start();
+    // The Machines tab lists each saved machine's conversations on a worker: the TUI never waits on a machine.
+    let machines_worker = sesync::machines::tab::Worker::start(config_dir.join("machines.json"));
     let mut app = App::new_deferred(roots, state, lock_dir, sesync_lock,
         sesync::manage::TitleCache::load(&titles_file));
     tr("app built", &mut trace);
     app.migrate_legacy_team_state(&teams);
+    // "Take theirs" keeps the replaced copy in the daemon's archive, the same folder.
+    app.set_archive_dir(state_file.with_file_name("archive"));
+    // The Machines tab's attach tabs read this run's configuration, so they are given its directory.
+    app.set_config_dir(config_dir.clone());
     app.set_installed_targets(installed);
     // A join still waiting for the admin is configured too: ctrl+r asks whether it was approved.
     app.set_team_configured(!teams.is_empty() || !sesync::team_join::waiting_teams(&config_dir).is_empty());
@@ -1124,6 +1264,8 @@ fn run_tui(
     // Restore last-run taste (theme, tab) from this user's configuration directory.
     let prefs = sesync::app::prefs::load(&config_dir);
     app.restore_prefs(prefs.theme, prefs.view);
+    // The Team tab starts from a fresh pull (in the background), not from "not pulled yet".
+    app.request_team_refresh();
     tr("team and prefs loaded", &mut trace);
 
     // The state file is read back only when it changed since the last look: the daemon
@@ -1137,8 +1279,20 @@ fn run_tui(
     let mut jobs = TeamJobs::default();
     loop {
         jobs.tick(&mut app, &config_dir);
+        // The Team list's comparisons go to their worker; its answers are applied between frames.
+        for job in app.take_compare_jobs() {
+            compare.request(job);
+        }
+        app.apply_compared(compare.take());
         // A pull that finished while the terminal sat idle is applied now, not at the next key.
         collect_pull(&mut app, &mut pending_pull, &config_dir);
+        // A pull asked for without a key (start, opening the Team tab, a push the daemon just made)
+        // starts here; one asked for while another runs waits for it.
+        if !app.pulling() && app.take_refresh_request() {
+            if let started @ TeamPull::Running(_) = request_team_pull(&mut app, &config_dir) {
+                pending_pull = started;
+            }
+        }
         // Titles still to read go to their worker; the ones it read since are shown, and saved
         // once it has nothing left to read.
         title_worker.request(app.take_title_requests());
@@ -1158,6 +1312,13 @@ fn run_tui(
         if let Some(loaded) = preview.take() {
             app.apply_preview(loaded);
         }
+        // The Machines tab asks each machine for its conversations while the tab is shown: at most every few seconds,
+        // and at once for ctrl+r. The worker answers on its own thread; the answers are applied here, between frames.
+        if app.machines_due(Instant::now()) {
+            machines_worker.request();
+            app.machines_asked(Instant::now());
+        }
+        app.apply_machine_updates(machines_worker.take());
         term.draw(|f| sesync::ui::draw(f, &app))?;
         tr("drawn", &mut trace);
         if !event::poll(Duration::from_millis(200))? {
@@ -1207,6 +1368,12 @@ fn run_tui(
         // Every key goes through the app, so every key cancels a pending delete the same way.
         // Ctrl+R on the Team tab asks for a network refresh; the local list refreshes in the app.
         app.handle(ev, Instant::now());
+        // Opening a herdr tab takes a few herdr calls: show that it started before making them.
+        if app.has_pending_open() || app.has_pending_attach() {
+            term.draw(|f| sesync::ui::draw(f, &app))?;
+            app.run_pending_open();
+            app.run_pending_attach();
+        }
         // A team the user chose to leave goes now (a few local files), and the team records are
         // read again, so neither the share picker nor the Team tab offers it any more.
         if let Some(req) = app.take_leave_request() {
@@ -1236,6 +1403,8 @@ fn run_tui(
             }
             seen_state = stamp;
         }
+        // A confirmed "take theirs" saves its replacement mark first, then replaces the local copy.
+        app.run_pending_replace(&state_file);
         if app.take_user_dirty() {
             if let Err(e) = app.save_user(&state_file) {
                 eprintln!("sesync: cannot save state: {e}");

@@ -6,7 +6,7 @@
 pub mod rename;
 pub mod store;
 
-use super::{Harness, Kind, Location, Message, Row, Tools};
+use super::{stat, Harness, Kind, Location, Message, Row, Tools};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -41,9 +41,10 @@ impl Harness for OpenCode {
     fn newest_prompt(&self, loc: &Location, key: &str) -> Option<f64> {
         store::newest_prompt(&loc.root, key)
     }
-    /// Exported with its CLI and converted; the export is removed once converted.
+    /// Exported with its CLI from the session's project directory, and converted; the export is removed once converted.
     fn to_journal(&self, loc: &Location, tools: &Tools, key: &str, scratch: &Path) -> Result<Option<PathBuf>, String> {
-        store::export_and_convert(&Self::cli(loc), tools.sesync_conv, key, scratch).map(Some)
+        let dir = store::session_directory(&loc.root, key);
+        store::export_and_convert(&Self::cli(loc), tools.sesync_conv, key, dir.as_deref(), scratch).map(Some)
     }
     /// A session id in the shape OpenCode mints.
     fn mirror_id(&self, stable: &str) -> String {
@@ -51,6 +52,14 @@ impl Harness for OpenCode {
     }
     fn id_in(&self, key: &str) -> Option<String> {
         Some(key.to_string()).filter(|k| !k.is_empty())
+    }
+    /// `opencode --session` takes the session id. Never `--fork`, which would start a copy.
+    fn resume_argv(&self, loc: &Location, key: &str) -> Result<Vec<String>, String> {
+        Ok(vec![Self::cli(loc).display().to_string(), "--session".into(), key.into()])
+    }
+    /// OpenCode keeps the directory a session ran in in its database.
+    fn project_dir(&self, loc: &Location, key: &str) -> Option<String> {
+        store::session_directory(&loc.root, key)
     }
     /// The import goes by the bundle's directory, the conversation's own workspace. The
     /// delete-first runs where the store keeps the copy now, the only place the CLI finds it (a
@@ -65,6 +74,12 @@ impl Harness for OpenCode {
     }
     fn copy_exists(&self, loc: &Location, key: &str) -> bool {
         self.fingerprint(loc, key).is_some()
+    }
+    fn rows_stamp(&self, loc: &Location) -> Option<String> {
+        // The rows are the database's, plus the write-ahead log beside it, and a rollback journal while one exists.
+        let beside = |suffix: &str| PathBuf::from(format!("{}{suffix}", loc.root.display()));
+        let files = [loc.root.clone(), beside("-wal"), beside("-journal")];
+        Some(files.iter().map(|f| format!("{:?}", stat(f))).collect::<Vec<_>>().join("|"))
     }
     fn rows(&self, loc: &Location) -> Vec<Row> {
         if !loc.root.exists() {

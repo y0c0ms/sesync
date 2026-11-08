@@ -382,8 +382,8 @@ mod tests {
     #[test]
     fn workspace_uri_matches_what_agy_writes() {
         assert_eq!(
-            path_to_file_uri(r"C:\Users\manuesantos\Downloads\agy-research\sb\proj one"),
-            "file:///C:/Users/manuesantos/Downloads/agy-research/sb/proj%20one",
+            path_to_file_uri(r"C:\Users\exampleuser\Downloads\agy-research\sb\proj one"),
+            "file:///C:/Users/exampleuser/Downloads/agy-research/sb/proj%20one",
             "the exact TM field 7 of a native 1.4.4 conversation"
         );
         assert_eq!(path_to_file_uri(r"c:\Proj\ação #1\"), "file:///C:/Proj/a%C3%A7%C3%A3o%20%231");

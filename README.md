@@ -2,6 +2,8 @@
 
 Keep several AI coding harnesses working on the same conversation.
 
+Project page, with recordings of the TUI, the herdr popup and machine prompts: <https://y0c0ms.github.io/sesync/>.
+
 You can start a conversation in oh-my-pi (omp), continue it in Pi, pick it up in OpenCode, and then resume it in Claude Code. DoppelClanker keeps each harness's copy of the conversation in step with the others, and makes sure only one harness writes to a conversation at a time.
 
 ## How it works
@@ -32,6 +34,7 @@ sesync-conv/   sesync-conv: inspect / ids / to-pi / to-omp / to-opencode / to-cl
 sesync/        the sync daemon and manage TUI
 sesync-team/   team sync core (sealed records, leases, member list) and team-server
 hooks/         per-harness lock hooks (omp+Pi extension, Claude Code shell hook)
+skills/        agent skills (SKILL.md) for models that work through the bridge; copy one into your agent's skills directory
 docs/          architecture, status, research notes
 ```
 
@@ -41,6 +44,7 @@ docs/          architecture, status, research notes
   module map, invariants.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — design, trust model, wire formats, routes,
   persistence.
+- [docs/BRIDGE.md](docs/BRIDGE.md) — the phone and machine bridge: commands, settings, protocol, security.
 - [docs/STATUS.md](docs/STATUS.md) — last known state, deployment, open decisions.
 
 ## Requirements
@@ -108,6 +112,24 @@ details pane), and a double-click works like Enter. Two TUIs can be open at once
 each saves only the choices made in it (shares, mirror targets, deletes), so neither overwrites
 the other, and each shows the other's choices as soon as the state file changes.
 
+Open in herdr. The session menu's first row, or `o` in the list, opens the selected session in
+herdr (a terminal multiplexer for coding agents). If a herdr pane already runs the session, its tab
+is focused. Otherwise a new tab opens in the session's own directory and types the harness's resume
+command into it: `omp --resume`, `claude --resume <id>`, `opencode --session <id>`. Pi's
+`pi --session` is unverified, and Antigravity has no resume command here. Outside herdr the TUI says
+so and stays open. To open the TUI as a popup from herdr, with `sesync` on herdr's PATH, add this to
+`~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "ctrl+alt+s"
+type = "popup"
+command = "sesync --tui"
+description = "sesync: open a session"
+width = "90%"
+height = "85%"
+```
+
 Team commands. `join` and `renew` run on a member's machine; every other command runs on the
 admin's machine (the one that created the team, which holds the admin key) and also needs
 `SESYNC_ADMIN_TOKEN_FILE`:
@@ -159,6 +181,29 @@ listed device and `m` removes a member. Every change takes two presses on the sa
 cursor or pressing another key cancels it. Approval sends the fingerprint the member read, so the
 server refuses a request that changed. The admin's own key cannot be revoked or removed from the
 dialog. `t` switches between teams when more than one is configured.
+
+### Phone and other machines (the bridge)
+
+`sesync bridge serve` lets a phone app (Agent Hub, built on Orca's mobile protocol) and your other machines reach
+this machine's conversations: list them, read each transcript, watch and type into its herdr pane, answer
+approvals, send files, and start or resume sessions. Pair a device with `sesync bridge pair --endpoint
+ws://THIS-MACHINE:6768 --label phone`; the bridge only accepts paired devices from loopback and private networks by
+default, over an end-to-end encrypted channel (hybrid X25519 + ML-KEM-768 for machines). Defaults and per-machine
+values (endpoint, allowlist, push notifications, dictation) live in `~/.config/sesync/bridge/settings.json`.
+
+From a machine that another has granted (the phone's "can see" switch, or a pairing made by hand), `sesync machine`
+works with that machine's conversations:
+
+```sh
+sesync machine list [<machine>]                         # its conversations and their state
+sesync machine attach <machine> <conversation> [--open] # its pane, live in this terminal
+sesync machine prompt <machine> <conversation> "<text>" [--open] [--wait]   # a prompt turn; --wait prints the answer
+sesync machine read <machine> <conversation> [<count>]  # its last messages
+sesync machine send <machine> <file>  /  get <machine> <path>               # files, folders as zip
+```
+
+`prompt` is how an agent on one machine hands work to an agent on another; `skills/prompt-agent-over-bridge` tells
+an agent how to use it. Details: [docs/BRIDGE.md](docs/BRIDGE.md).
 
 Inspect the lock and converter directly:
 

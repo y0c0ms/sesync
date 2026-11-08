@@ -92,6 +92,7 @@ pub fn apply(state: &mut State, planned: &[Planned], lock_dir: &Path, sesync_loc
                 });
                 match outcome {
                     ClaimOutcome::Skipped(holder) => log.push(format!("kept    {} {}: held by {holder}", p.target, p.path)),
+                    ClaimOutcome::Failed(e) => log.push(format!("kept    {} {}: lock tool failed: {e}", p.target, p.path)),
                     ClaimOutcome::Ran(Ok(())) => {
                         forget(state, p);
                         log.push(format!("removed {} {}", p.target, p.path));

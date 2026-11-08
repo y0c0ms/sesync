@@ -1,0 +1,43 @@
+---
+import '../styles/site.css';
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const repo = 'https://github.com/y0c0ms/sesync';
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <title>{title}</title>
+    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="top">
+      <a class="brand" href={base}>sesync</a>
+      <nav aria-label="Page sections">
+        <a href="#what">What it is</a>
+        <a href="#tui">TUI</a>
+        <a href="#herdr">herdr</a>
+        <a href="#phone">Phone</a>
+        <a href="#machines">Machines</a>
+        <a href="#flags">Commands</a>
+        <a href="#install">Install</a>
+        <a href={repo}>GitHub</a>
+      </nav>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer class="foot">
+      <p>sesync is MIT licensed. <a href={`${repo}/blob/main/LICENSE`}>LICENSE</a> · <a href={repo}>Source</a> · <a href={`${repo}/blob/main/README.md`}>README</a></p>
+    </footer>
+  </body>
+</html>

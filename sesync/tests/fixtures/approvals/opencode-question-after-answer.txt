@@ -1,0 +1,39 @@
+  ┃
+  ┃  $ ls -la
+  ┃
+  ┃  total 0
+  ┃  drwxr-xr-x.  2 jordan jordan  40 Oct 26 22:29 .
+  ┃  drwx------. 10 jordan jordan 860 Oct 26 22:35 ..
+  ┃
+
+     listing done
+
+     ▣  Build · fake-32k · 7.6s
+
+  ┃
+  ┃  run ls
+  ┃
+
+     $ ls -la
+
+  ┃
+  ┃  ask oc
+  ┃
+
+  ┃
+  ┃  # Questions
+  ┃
+  ┃  Which colour?
+  ┃  Blue
+  ┃
+
+     question done
+
+     ▣  Build · fake-32k · 7.3s
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · fake-32k Fake
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   <SANDBOX>/work                                                             8.2K (25%)  ctrl+p commands

@@ -6,6 +6,9 @@
 // Shared persistent state (local sources and team floors/push records).
 pub mod state;
 
+// The user's home directory, the root of every default path.
+pub mod home;
+
 // The harnesses, one module each behind one interface; everything else asks the registry.
 pub mod harness;
 
@@ -26,10 +29,13 @@ pub mod turn;
 pub mod app;
 pub mod clipboard;
 pub mod form;
+pub mod herdr_check;
+pub mod herdr_open;
 pub mod keys;
 pub mod manage;
 pub mod palette;
 pub mod preview;
+pub mod proc_tree;
 pub mod qr;
 pub mod remote;
 pub mod remote_http;
@@ -47,12 +53,25 @@ pub mod sealed;
 pub mod team_actions;
 pub mod team_backoff;
 pub mod team_cli;
+pub mod team_compare;
 pub mod team_conflict;
 pub mod team_import;
 pub mod team_join;
+pub mod team_url;
 pub mod team_pass;
 pub mod team_pull;
 pub mod team_pull_verified;
 pub mod team_push;
 pub mod team_sync;
 pub mod team_watch;
+pub mod turns;
+
+// Phone bridge: `sesync bridge`, the WebSocket server the Orca app pairs with. Only that subcommand runs it.
+pub mod bridge;
+// Other machines' bridges, as their client: `sesync machine`. Only that subcommand runs it.
+pub mod machines;
+
+// Test-only: the shared staging helper for fake CLIs (the same file the integration tests include).
+#[cfg(all(test, unix))]
+#[path = "../tests/support/fake_cli.rs"]
+pub(crate) mod fake_cli;

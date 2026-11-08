@@ -22,11 +22,33 @@ sha2 = "0.10"
 zstd = "0.14"
 ureq = { version = "2", features = ["json"] }
 qrcodegen = "1"
+# The phone bridge (`sesync bridge`): a WebSocket server on tokio. Only the bridge subcommand runs it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+base64 = "0.22"
+# The gitignore-aware walk behind the phone's file search (files.rs). Only that module uses it.
+ignore = "0.4"
+# Mutexes the bridge holds for one short section each; parking_lot's guards need no poison handling.
+parking_lot = "0.12"
+# The bridge's hybrid handshake for sesync clients (`bridge::hybrid`): ML-KEM-768 (FIPS 203, pure Rust) beside
+# X25519. curve25519-dalek gives the raw X25519 secret the HKDF needs; it is in the lock file through crypto_box.
+ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
+curve25519-dalek = "4"
+# File transfer over the bridge (`bridge::transfer`): a directory is sent as a zip. Deflate only, no encryption,
+# bzip2 or lzma, so the crate pulls in as little as it can.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+[target.'cfg(windows)'.dependencies]
+# The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's
+# shell. Already in the lock file through other crates.
+# The phone bridge talks to herdr over its named pipe (`bridge::herdr`, `PeekNamedPipe`).
+# `sesync machine attach` turns on virtual-terminal input so keys arrive as escape sequences (Console).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes", "Win32_System_Console"] }
 
 [dev-dependencies]
 proptest = "1"
 postgres = "0.19"
 # The client end-to-end tests run the real team-server router in-process over a TCP socket.
-# Both are already in the lock file through sesync-team.
-tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# axum is already in the lock file through sesync-team.
 axum = "0.7"
