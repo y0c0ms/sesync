@@ -1,4 +1,4 @@
-Output "/var/tmp/sesync-demo/out/tui-palette.gif"
+Output "/var/tmp/sesync-demo/out/tui-palette.mp4"
 Source common.tape
 Hide
 Type ". /var/tmp/sesync-demo/env.sh; rm -f ~/.config/sesync/tui.json; cd ~; clear" Enter

@@ -1,4 +1,4 @@
-Output "/var/tmp/sesync-demo/out/machine-prompt.gif"
+Output "/var/tmp/sesync-demo/out/machine-prompt.mp4"
 Source common.tape
 Set Height 620
 Hide

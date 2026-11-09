@@ -1,16 +1,28 @@
 ---
 import Layout from '../layouts/Layout.astro';
+import Recording from '../components/Recording.astro';
 const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
 const repo = 'https://github.com/y0c0ms/sesync';
 const docs = `${repo}/blob/main/docs`;
 ---
 <Layout title="sesync: one conversation across coding agent harnesses" description="sesync keeps one AI coding conversation in step across omp, Pi, OpenCode, Claude Code and Antigravity CLI, with a lock, a TUI, a herdr popup, a phone bridge and machine-to-machine prompts.">
 
-  <section class="intro">
-    <h1>sesync</h1>
-    <p class="lead">One conversation, kept in step across several coding agent harnesses. Only one harness writes to a conversation at a time.</p>
-    <p>Start a conversation in omp, continue it in Pi, pick it up in OpenCode, resume it in Claude Code. sesync converts each copy, keeps the copies current, and locks the conversation while a turn is running.</p>
-    <p>Source: <a href={repo}>github.com/y0c0ms/sesync</a> · Docs: <a href={`${repo}#readme`}>README</a> · License: MIT</p>
+  <section class="hero">
+    <div class="hero-copy">
+      <span class="kicker"><b>sesync</b> v0.1.0 · MIT · Linux and Windows builds</span>
+      <h1>One conversation, every harness.</h1>
+      <p class="lead">Start a conversation in omp, continue it in Pi, pick it up in OpenCode, resume it in Claude Code or Antigravity. sesync converts each copy, keeps them in step, and locks the conversation while a turn is running.</p>
+      <p>A TUI on the machine, a popup inside herdr, a bridge for the phone, and prompts that travel from one machine to another.</p>
+      <div class="actions">
+        <a class="button primary" href={`${repo}/releases`}>Download v0.1.0</a>
+        <a class="button" href={repo}>Source on GitHub</a>
+        <a class="button" href="#herdr">See the herdr popup</a>
+      </div>
+    </div>
+    <div class="hero-media">
+      <Recording name="popup-herdr" alt="The sesync TUI opening as a herdr popup" width={1260} height={700}
+        caption="The TUI as a herdr popup: <kbd>ctrl+alt+s</kbd>, pick a session, <kbd>o</kbd> opens it in a tab." />
+    </div>
   </section>
 
   <section id="what">
@@ -41,25 +53,13 @@ const docs = `${repo}/blob/main/docs`;
     <h2>The TUI</h2>
     <p>Run <code>sesync --tui</code>. The tabs are <strong>Sessions</strong>, <strong>Team</strong> and <strong>Machines</strong>. The command palette is <kbd>ctrl+p</kbd>. The divergence dialog opens when two copies of a conversation have moved on separately. <strong>Open in herdr</strong> (<kbd>o</kbd>) opens the selected session in herdr.</p>
 
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/tui-sessions.gif`} alt="Sessions tab" width="1260" height="700" loading="lazy" /></div>
-      <figcaption>Sessions: each conversation with its mirrors, sync age and team status. Pick one to see its copies.</figcaption>
-    </figure>
+    <Recording name="tui-sessions" alt="Sessions tab" width={1260} height={700} caption="Each conversation with its mirrors, the age of the last good sync, and its team state. The details pane lists each copy and the last messages." steps={[`The list, then the details pane on a wide terminal`, `Share a session: the picker, then <code>a</code> for every harness`, `The filter cycles: all, marked, mirrored, failing`]} />
 
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/tui-team.gif`} alt="Team tab" width="1260" height="700" loading="lazy" /></div>
-      <figcaption>Team: the conversations this machine shares or the team holds, with where each stands (in step, waiting to push, behind, or diverged).</figcaption>
-    </figure>
+    <Recording name="tui-team" alt="Team tab" width={1260} height={700} caption="The sessions this machine shares and the ones the team holds, with where each stands. <kbd>i</kbd> imports a session the team has into a local harness." steps={[`Each row: in step, waiting to push, behind, or diverged`, `Import the copy another machine shared`]} />
 
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/tui-machines.gif`} alt="Machines tab" width="1260" height="700" loading="lazy" /></div>
-      <figcaption>Machines: paired machines, their address and status, and the conversations each one reports.</figcaption>
-    </figure>
+    <Recording name="tui-machines" alt="Machines tab" width={1260} height={700} caption="Paired machines, their address and status, and the conversations each reports. <kbd>enter</kbd> attaches to the selected conversation in a herdr tab." steps={[`Tab to Machines, pick a conversation on the other machine`, `<kbd>enter</kbd>: its pane opens live in herdr`, `Type into that agent from here`]} />
 
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/tui-palette.gif`} alt="Command palette" width="1260" height="700" loading="lazy" /></div>
-      <figcaption>Command palette (<kbd>ctrl+p</kbd>): lists every command for the current tab, such as joining or leaving a team.</figcaption>
-    </figure>
+    <Recording name="tui-palette" alt="Command palette" width={1260} height={700} caption="Every command for the current tab, searchable, including team and colour-scheme commands." steps={[`<kbd>ctrl+p</kbd>, then a few letters`, `Run the command with <kbd>enter</kbd>`]} />
 
     <h3>Divergence dialog</h3>
     <p>When two copies of a conversation each have new turns after their common history, the dialog shows both sides. It offers five choices and "decide later". Every choice except "decide later" keeps both histories.</p>
@@ -77,10 +77,7 @@ description = "sesync: open a session"
 width = "90%"
 height = "85%"</code></pre>
     <p>Press <kbd>ctrl+alt+s</kbd> in herdr to open the TUI as a popup. Pick a session and choose <strong>Open in herdr</strong>. If a herdr pane already runs that session, its tab is focused. Otherwise a new tab opens in the session's directory and types the harness's resume command.</p>
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/popup-herdr.gif`} alt="The sesync popup inside herdr" width="1260" height="700" loading="lazy" /></div>
-      <figcaption>The sesync TUI as a herdr popup.</figcaption>
-    </figure>
+    <Recording name="popup-herdr" alt="The sesync popup inside herdr" width={1260} height={700} caption="herdr, then the TUI as a popup on <kbd>ctrl+alt+s</kbd>, then <kbd>o</kbd>: the session opens in a new herdr tab and the popup closes." steps={[`<kbd>ctrl+alt+s</kbd> over any pane: the TUI appears in a popup`, `Pick a session; <kbd>o</kbd> opens it in herdr`, `Press it again from another workspace`]} />
   </section>
 
   <section id="phone">
@@ -151,10 +148,7 @@ sesync machine get &lt;name&gt; &lt;path on that machine&gt; [&lt;folder here&gt
 sesync machine endpoint &lt;name&gt; &lt;ws://address&gt; | --clear
 sesync machine remove &lt;name&gt;</code></pre>
 
-    <figure class="figure">
-      <div class="frame"><img src={`${base}media/machine-prompt.gif`} alt="Sending a prompt to a conversation on another machine" width="1260" height="620" loading="lazy" /></div>
-      <figcaption><code>sesync machine prompt</code>: a prompt sent to a conversation on another machine, with the answer read back.</figcaption>
-    </figure>
+    <Recording name="machine-prompt" alt="A prompt sent to a conversation on another machine" width={1260} height={620} caption="<code>sesync machine prompt --open --wait</code>: a closed conversation on the other machine is resumed, the prompt is sent as a turn, and its answer comes back." steps={[`<code>sesync machine list laptop</code>: what runs there`, `<code>prompt</code> with <code>--open --wait</code>`, `<code>read</code>: the last messages`]} />
 
     <h3>Agents prompting agents</h3>
     <p>An agent can use the <code>prompt-agent-over-bridge</code> skill from <a href={`${repo}/tree/main/skills`}>skills/</a> to ask an agent on another machine. <code>prompt</code> claims the conversation's lock for the turn. It refuses a pane that is waiting on a question, and a closed conversation unless <code>--open</code> is given.</p>
@@ -166,7 +160,7 @@ sesync machine remove &lt;name&gt;</code></pre>
     <p>Taken from the usage strings in the source. <code>sesync</code> exits with code 2 on a usage error.</p>
 
     <h3><code>sesync</code> (<code>sesync/src/bin/sesync.rs</code>)</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Form</th><th>What it does</th></tr></thead>
       <tbody>
         <tr><td><code>sesync --once</code></td><td>Run one sync pass and exit. Prints <code>one pass done, N source(s) changed</code>.</td></tr>
@@ -188,10 +182,10 @@ sesync machine remove &lt;name&gt;</code></pre>
         <tr><td><code>sesync machine ...</code></td><td>Machine pairing and prompts. See <a href="#machines">Machines</a>. Source: <code>sesync/src/machines/cli.rs</code>.</td></tr>
         <tr><td><code>sesync bridge ...</code></td><td>Phone and machine bridge. See the table below. Source: <code>sesync/src/bridge/cli.rs</code>.</td></tr>
       </tbody>
-    </table>
+    </table></div>
 
     <h3><code>sesync machine</code> (<code>sesync/src/machines/cli.rs</code>)</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Form</th><th>What it does</th></tr></thead>
       <tbody>
         <tr><td><code>add &lt;name&gt; &lt;pairing link&gt;</code></td><td>Add a machine from <code>sesync bridge pair --label</code> output on that machine.</td></tr>
@@ -204,10 +198,10 @@ sesync machine remove &lt;name&gt;</code></pre>
         <tr><td><code>endpoint &lt;name&gt; &lt;ws://address&gt; | --clear</code></td><td>Dial that machine at this address instead of the paired one.</td></tr>
         <tr><td><code>remove &lt;name&gt;</code></td><td>Forget the machine here.</td></tr>
       </tbody>
-    </table>
+    </table></div>
 
     <h3><code>sesync bridge</code> (<code>sesync/src/bridge/cli.rs</code>)</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Form</th><th>What it does</th></tr></thead>
       <tbody>
         <tr><td><code>pair [--endpoint ws://HOST:PORT] [--label NAME]</code></td><td>Pair a new device. Prints the offer, the URL and a QR code.</td></tr>
@@ -215,10 +209,10 @@ sesync machine remove &lt;name&gt;</code></pre>
         <tr><td><code>revoke &lt;device-id&gt;</code></td><td>Remove a device.</td></tr>
         <tr><td><code>serve [--listen ADDR:PORT] [--allow CIDR,...] [--herdr-socket PATH] [--ntfy-url URL] [--ntfy-topic NAME] [--ntfy-token-command CMD] [--no-ntfy] [--usage-every SECONDS] [--omp PATH] [--no-usage]</code></td><td>Serve in the foreground until Ctrl-C. Defaults: <code>0.0.0.0:6768</code>, plan usage every 600 s.</td></tr>
       </tbody>
-    </table>
+    </table></div>
 
     <h3><code>sesync-lock</code> (<code>sesync-lock/src/main.rs</code>)</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Form</th><th>What it does</th></tr></thead>
       <tbody>
         <tr><td><code>claim &lt;id&gt; &lt;harness&gt; &lt;pid&gt; [target] [--force]</code></td><td>Claim a conversation's lock.</td></tr>
@@ -228,11 +222,11 @@ sesync machine remove &lt;name&gt;</code></pre>
         <tr><td><code>sweep | list</code></td><td>Clear stale locks, or list them.</td></tr>
         <tr><td><code>hook &lt;event&gt; &lt;harness&gt; --pid &lt;pid&gt; [--session &lt;id&gt;]</code></td><td>Harness hook. Reads a JSON payload on stdin. Events: <code>agent_end</code>, <code>message_end</code>.</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p>Exit codes: 0 ok or free, 2 locked, 1 error.</p>
 
     <h3><code>sesync-conv</code> (<code>sesync-conv/src/main.rs</code>)</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Form</th><th>What it does</th></tr></thead>
       <tbody>
         <tr><td><code>inspect &lt;journal&gt;</code></td><td>Summarise a journal: roles and block types.</td></tr>
@@ -247,7 +241,7 @@ sesync machine remove &lt;name&gt;</code></pre>
         <tr><td><code>antigravity-retitle --store &lt;dir&gt; --id &lt;id&gt; --title T</code></td><td>Change an Antigravity conversation's title.</td></tr>
         <tr><td><code>ids &lt;seed&gt;</code></td><td>Print the deterministic OpenCode and Claude ids.</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p>The <code>--context-*</code> flags fit the copy to the target's context window. See <a href={`${docs}/ARCHITECTURE.md`}>docs/ARCHITECTURE.md</a>, "Context fit".</p>
 
     <h3><code>sesync bridge</code> and <code>sesync team</code> settings</h3>
@@ -278,7 +272,7 @@ cargo build --release --manifest-path sesync/Cargo.toml</code></pre>
     <p>Run <code>powershell -ExecutionPolicy Bypass -File install.ps1</code>. It needs no administrator rights. It writes only under <code>%LOCALAPPDATA%\Programs\sesync</code>, plus two per-user settings. It adds the <code>bin</code> folder to the user <code>PATH</code> (in <code>HKCU\Environment</code>), and adds a login start entry under <code>HKCU\...\Run</code>. The options are <code>-NoService</code> (skip the login entry) and <code>-Uninstall</code>.</p>
 
     <h3>Hooks per harness</h3>
-    <table>
+    <div class="table-scroll"><table>
       <thead><tr><th>Harness</th><th>Hook</th></tr></thead>
       <tbody>
         <tr><td>omp and Pi</td><td><code>hooks/omp-lock-shim.ts</code>, an omp extension. Claims on <code>turn_start</code>, releases on <code>turn_end</code> and session lifecycle events.</td></tr>
@@ -286,7 +280,7 @@ cargo build --release --manifest-path sesync/Cargo.toml</code></pre>
         <tr><td>OpenCode</td><td>A plugin that claims on <code>chat.message</code> and releases on <code>session.idle</code> and <code>session.deleted</code>.</td></tr>
         <tr><td>Antigravity CLI (<code>agy</code>)</td><td>No hook yet. The daemon still claims the lock for every write, refuses to refresh a copy that agy holds open, and archives any agy turn it would replace.</td></tr>
       </tbody>
-    </table>
+    </table></div>
 
     <h3>herdr popup</h3>
     <p>See <a href="#herdr">The herdr popup</a>. <code>sesync herdr check</code> runs a throwaway herdr session to verify the setup.</p>

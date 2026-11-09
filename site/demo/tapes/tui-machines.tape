@@ -1,4 +1,4 @@
-Output "/var/tmp/sesync-demo/out/tui-machines.gif"
+Output "/var/tmp/sesync-demo/out/tui-machines.mp4"
 Source common.tape
 Hide
 Type "/var/tmp/sesync-demo/reset-herdr.sh; . /var/tmp/sesync-demo/env.sh; rm -f ~/.config/sesync/tui.json; cd ~/projects/webshop; clear" Enter

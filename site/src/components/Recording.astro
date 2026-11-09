@@ -1,0 +1,41 @@
+---
+interface Props {
+  /** File name under media/, without the extension: `x` gives media/x.mp4 and media/x.webp. */
+  name: string;
+  alt: string;
+  width: number;
+  height: number;
+  caption: string;
+  steps?: string[];
+}
+
+const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
+const { name, alt, width, height, caption, steps } = Astro.props;
+---
+
+<figure class="recording">
+  <div class="screen">
+    <video
+      autoplay
+      loop
+      muted
+      playsinline
+      preload="metadata"
+      width={width}
+      height={height}
+      poster={`${base}media/${name}.webp`}
+      aria-label={alt}
+    >
+      <source src={`${base}media/${name}.mp4`} type="video/mp4" />
+      <a href={`${base}media/${name}.mp4`}>{alt} (mp4)</a>
+    </video>
+  </div>
+  <figcaption>
+    {caption}
+    {steps && (
+      <ol class="steps">
+        {steps.map((step) => <li>{step}</li>)}
+      </ol>
+    )}
+  </figcaption>
+</figure>
