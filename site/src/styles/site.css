@@ -62,16 +62,9 @@ body {
   text-decoration: none;
 }
 
-.brand::before {
-  content: "";
-  display: inline-block;
-  width: 0.62em;
-  height: 0.62em;
-  margin-right: 0.5em;
-  border-radius: 2px;
-  background: var(--accent);
-  vertical-align: 0.03em;
-}
+.brand img { height: 1.5rem; width: auto; display: block; }
+.brand { display: inline-flex; align-items: center; gap: 0.5rem; }
+
 
 .top nav {
   display: flex;

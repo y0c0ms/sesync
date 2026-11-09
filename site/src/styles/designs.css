@@ -1,0 +1,404 @@
+/* Three designs for the sesync page, brand-true to the Agent Hub mark: obsidian, silver, a hint of sea-green. */
+
+/* ============================================================
+   A. Obsidian tide: near-black, silver type, sea-green accent
+   ============================================================ */
+
+body.v-a {
+  --bg: #0b0c0e;
+  --bg-elevated: #121417;
+  --ink: #e9ebec;
+  --ink-soft: #b7bec2;
+  --muted: #8b9499;
+  --line: #20252a;
+  --line-strong: #333b42;
+  --accent: #7fd6c4;
+  --accent-ink: #a9f0e1;
+  --accent-wash: #10201e;
+  --warm: #d8b98a;
+  --warm-wash: #241d14;
+  --code-bg: #14171b;
+  --shadow: 0 1px 2px rgb(0 0 0 / 50%), 0 24px 60px rgb(0 0 0 / 45%);
+
+  --tentacle-near: #e6e9ea;
+  --tentacle-mid: #a9b3b7;
+  --tentacle-tip: #7fd6c4;
+
+  background:
+    radial-gradient(90rem 40rem at 70% -10%, rgb(127 214 196 / 9%), transparent 60%),
+    radial-gradient(60rem 34rem at 0% 10%, rgb(233 235 236 / 5%), transparent 55%),
+    var(--bg);
+  color: var(--ink);
+}
+
+.v-a .top {
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  border-bottom-color: var(--line);
+}
+
+.v-a .brand img { filter: none; }
+
+.v-a .hero {
+  position: relative;
+  overflow: hidden;
+  padding: clamp(3.5rem, 9vw, 7rem) 0 clamp(2rem, 5vw, 3.5rem);
+  border-top: 0;
+}
+
+.v-a .hero .tentacles { z-index: 0; }
+
+.v-a .hero-copy,
+.v-a .hero-media { position: relative; z-index: 1; }
+
+.v-a h1 {
+  font-size: clamp(2.7rem, 7vw, 4.6rem);
+  letter-spacing: -0.045em;
+  background: linear-gradient(100deg, #f4f6f6 20%, #a9b3b7 55%, #7fd6c4 95%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.v-a .kicker {
+  background: #101317;
+  border-color: var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.v-a .button {
+  background: #12161a;
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.v-a .button.primary {
+  background: linear-gradient(180deg, #93e3d2, #5fc3b0);
+  border-color: #93e3d2;
+  color: #07110f;
+  box-shadow: 0 10px 30px rgb(127 214 196 / 22%);
+}
+
+.v-a section { border-top-color: var(--line); }
+
+.v-a .recording .screen,
+.v-a .frame {
+  border-color: #242a30;
+  background: #05060700;
+  box-shadow: var(--shadow), 0 0 0 1px rgb(127 214 196 / 6%);
+}
+
+.v-a .flow {
+  background: rgb(18 20 23 / 80%);
+  border-color: var(--line);
+}
+
+.v-a .flow .node { background: #0e1114; border-color: var(--line-strong); }
+
+.v-a .flow .node.source {
+  background: rgb(127 214 196 / 10%);
+  border-color: rgb(127 214 196 / 45%);
+  color: var(--accent-ink);
+}
+
+.v-a tbody tr:hover { background: rgb(127 214 196 / 6%); }
+
+.v-a pre { background: #0f1216; border-color: var(--line); }
+
+.v-a .callout { background: rgb(127 214 196 / 8%); }
+
+.v-a .cheat {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1.6rem;
+  padding: 0;
+  list-style: none;
+}
+
+.v-a .cheat li {
+  margin: 0;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #101317;
+  font: 500 0.8rem/1.4 var(--mono);
+  color: var(--ink-soft);
+}
+
+.v-a .cheat li b { color: var(--accent-ink); font-weight: 600; }
+
+/* ============================================================
+   B. Paper and ink: warm paper, graphite serif, drawn tentacles
+   ============================================================ */
+
+body.v-b {
+  --bg: #f2eee4;
+  --bg-elevated: #fbf8f1;
+  --ink: #15171a;
+  --ink-soft: #40454d;
+  --muted: #666d78;
+  --line: #ded7c7;
+  --line-strong: #c9c0ad;
+  --accent: #0f6d5c;
+  --accent-ink: #0b5347;
+  --accent-wash: #e6efe9;
+  --warm: #9c5a1f;
+  --warm-wash: #f4e9da;
+  --code-bg: #ebe5d8;
+
+  --tentacle-near: #2a2d31;
+  --tentacle-mid: #6f767b;
+  --tentacle-tip: #0f6d5c;
+
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.v-b h1,
+.v-b h2 {
+  font-family: ui-serif, Georgia, "Times New Roman", serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.v-b h1 { font-size: clamp(2.8rem, 6.4vw, 4.2rem); }
+
+body.v-b { counter-reset: section; }
+
+.v-b section { position: relative; padding-top: 4rem; }
+
+.v-b section > h2::before {
+  counter-increment: section;
+  content: counter(section, decimal-leading-zero);
+  display: block;
+  margin-bottom: 0.4rem;
+  font: 500 0.78rem/1 var(--mono);
+  letter-spacing: 0.18em;
+  color: var(--muted);
+}
+
+.v-b .top { background: color-mix(in srgb, var(--bg) 90%, transparent); }
+
+.v-b .hero { position: relative; overflow: hidden; border-top: 0; }
+
+.v-b .hero .tentacles { opacity: 0.55; }
+
+.v-b .hero-copy { position: relative; z-index: 1; }
+
+.v-b .hero-media { position: relative; z-index: 1; }
+
+.v-b .kicker {
+  background: transparent;
+  border-radius: 2px;
+  border-color: var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.v-b .button { border-radius: 2px; background: transparent; }
+
+.v-b .button.primary { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+
+.v-b .recording .screen,
+.v-b .frame {
+  border-radius: 4px;
+  border-color: #24262a;
+  box-shadow: 0 1px 0 #fff inset, 0 16px 34px rgb(21 23 26 / 12%);
+}
+
+.v-b .flow { border-radius: 2px; background: transparent; }
+
+.v-b .flow .node { border-radius: 2px; }
+
+.v-b .flow .node.source { background: var(--accent-wash); border-color: var(--accent); }
+
+.v-b tbody tr:hover { background: rgb(15 109 92 / 5%); }
+
+.v-b pre { border-radius: 2px; background: #efe9dc; }
+
+.v-b .callout { border-radius: 2px; }
+
+.v-b .stamp {
+  position: absolute;
+  top: 1.2rem;
+  right: 0;
+  display: grid;
+  place-items: center;
+  width: 5.5rem;
+  height: 5.5rem;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-elevated);
+  box-shadow: 0 10px 24px rgb(21 23 26 / 10%);
+  transition: transform 240ms ease;
+  z-index: 2;
+}
+
+.v-b .stamp:hover { transform: rotate(-12deg) scale(1.04); }
+
+.v-b .stamp img { width: 62%; height: auto; filter: grayscale(1) contrast(1.1); opacity: 0.9; }
+
+/* ============================================================
+   C. Deep: layered sea gradients, glass cards, sticky rail
+   ============================================================ */
+
+body.v-c {
+  --bg: #06100f;
+  --bg-elevated: rgb(12 26 25 / 72%);
+  --ink: #eaf3f0;
+  --ink-soft: #b9cbc6;
+  --muted: #86a09a;
+  --line: rgb(120 190 176 / 18%);
+  --line-strong: rgb(120 200 184 / 34%);
+  --accent: #35d0b0;
+  --accent-ink: #7cf0d8;
+  --accent-wash: rgb(53 208 176 / 10%);
+  --warm: #e3c08a;
+  --code-bg: rgb(10 22 21 / 80%);
+  --shadow: 0 30px 80px rgb(0 0 0 / 55%);
+
+  --tentacle-near: #dff6ef;
+  --tentacle-mid: #7fbfb2;
+  --tentacle-tip: #35d0b0;
+
+  color: var(--ink);
+  background:
+    radial-gradient(120rem 60rem at 80% -20%, rgb(53 208 176 / 14%), transparent 62%),
+    radial-gradient(90rem 50rem at -10% 30%, rgb(20 90 110 / 22%), transparent 60%),
+    linear-gradient(180deg, #071413 0%, #050d0d 40%, #04090a 100%);
+  background-attachment: fixed;
+}
+
+.v-c .top {
+  background: rgb(6 16 15 / 78%);
+  border-bottom-color: var(--line);
+}
+
+.v-c .hero { position: relative; overflow: hidden; border-top: 0; padding-top: clamp(3rem, 8vw, 6rem); }
+
+.v-c .hero-copy,
+.v-c .hero-media { position: relative; z-index: 1; }
+
+.v-c h1 { font-size: clamp(2.6rem, 6.6vw, 4.4rem); letter-spacing: -0.04em; }
+
+.v-c .kicker { background: var(--bg-elevated); backdrop-filter: blur(8px); }
+
+.v-c .button { background: var(--bg-elevated); backdrop-filter: blur(8px); }
+
+.v-c .button.primary { background: linear-gradient(180deg, #4ee2c1, #24b596); border-color: #4ee2c1; color: #041210; }
+
+.v-c .recording .screen,
+.v-c .frame {
+  border-color: var(--line-strong);
+  box-shadow: var(--shadow);
+  transition: transform 300ms ease, box-shadow 300ms ease;
+}
+
+.v-c .recording:hover .screen,
+.v-c .figure:hover .frame {
+  transform: translateY(-4px);
+  box-shadow: 0 34px 90px rgb(0 0 0 / 60%), 0 0 0 1px rgb(53 208 176 / 28%);
+}
+
+.v-c section { border-top-color: var(--line); }
+
+.v-c .flow { background: var(--bg-elevated); border-color: var(--line-strong); backdrop-filter: blur(10px); }
+
+.v-c .flow .node { background: rgb(6 16 15 / 70%); border-color: var(--line-strong); }
+
+.v-c .flow .node.source { background: var(--accent-wash); border-color: var(--accent); color: var(--accent-ink); }
+
+.v-c pre { background: var(--code-bg); border-color: var(--line); backdrop-filter: blur(6px); }
+
+.v-c .callout { background: var(--accent-wash); backdrop-filter: blur(6px); }
+
+.v-c tbody tr:hover { background: rgb(53 208 176 / 7%); }
+
+.v-c .rail {
+  position: fixed;
+  right: max(1rem, calc((100vw - 1080px) / 2 - 6rem));
+  top: 50%;
+  transform: translateY(-50%);
+  display: none;
+  gap: 0.6rem;
+  z-index: 5;
+}
+
+@media (min-width: 1320px) { .v-c .rail { display: grid; } }
+
+.v-c .rail a {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font: 500 0.72rem/1 var(--mono);
+  text-decoration: none;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  transition: opacity 160ms ease, color 160ms ease;
+}
+
+.v-c .rail a::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  transition: transform 160ms ease;
+}
+
+.v-c .rail a:hover,
+.v-c .rail a.on { opacity: 1; color: var(--accent-ink); }
+
+.v-c .rail a.on::before { transform: scale(1.6); }
+
+/* ============================================================
+   Shared behaviour for the three designs
+   ============================================================ */
+
+.design-body .hero-media .recording { margin: 0; }
+
+.design-body .hero-media figcaption { font-size: 0.85rem; }
+
+.design-body .brand img { height: 1.7rem; width: auto; display: block; }
+
+.design-body .top { gap: 1.1rem; }
+
+.design-body .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font: 600 1.02rem/1 var(--mono);
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.design-body .brand::before { content: none; }
+
+.design-body .brand span { display: inline-block; }
+
+/* Reveal on scroll: a section fades and rises once, when it first comes into view. */
+.js [data-reveal] {
+  opacity: 0;
+  transform: translateY(14px);
+  transition: opacity 560ms ease, transform 560ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.js [data-reveal].in { opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .js [data-reveal] { opacity: 1; transform: none; transition: none; }
+}
+
+/* A thin tide line at the top of the page, tied to scroll depth. */
+.tide {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: 2px;
+  transform-origin: 0 50%;
+  transform: scaleX(0);
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  z-index: 20;
+  pointer-events: none;
+}

@@ -1,0 +1,145 @@
+---
+/**
+ * Tentacles: a field of drawn octopus arms, generated from a fixed seed so every build is the
+ * same, and swayed by the pointer (CSS variables, one rAF loop, no dependencies).
+ */
+interface Props {
+  /** How many arms to draw. */
+  arms?: number;
+  /** Changes the layout of the arms; the same seed always draws the same field. */
+  seed?: number;
+  /** Opacity of the whole field. */
+  opacity?: number;
+  class?: string;
+  /** Sway towards the pointer; off for the still variant. */
+  still?: boolean;
+}
+
+const { arms = 7, seed = 7, opacity = 1, class: cls = "", still = false } = Astro.props;
+
+// A tiny deterministic generator (mulberry32): the same seed always draws the same field.
+function rng(s: number) {
+  let a = s >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const rand = rng(seed);
+const paths: { d: string; width: number; f: number; dot: string }[] = [];
+for (let i = 0; i < arms; i++) {
+  const side = i % 2 === 0 ? -1 : 1;
+  const x0 = 50 + side * (26 + rand() * 34);
+  const y0 = 118 + rand() * 40;
+  const spread = (rand() - 0.5) * 90;
+  const lift = 60 + rand() * 90;
+  // Four control points per arm: two in the base, two near the tip, so the arm curls like a real one.
+  const c1 = [x0 + side * (rand() * 24), y0 - lift * 0.45];
+  const c2 = [x0 + spread * 0.4 + side * rand() * 30, y0 - lift * 0.85];
+  const mid = [x0 + spread * 0.7, y0 - lift];
+  const c3 = [mid[0] + spread * 0.45, mid[1] - 26 * rand()];
+  const c4 = [mid[0] + spread * 0.8, mid[1] - 42 * rand()];
+  const tip = [mid[0] + spread * 0.95 + side * 12, mid[1] - 30 - 40 * rand()];
+  const d = `M ${x0.toFixed(1)} ${y0.toFixed(1)} C ${c1[0].toFixed(1)} ${c1[1].toFixed(1)} ${c2[0].toFixed(1)} ${c2[1].toFixed(1)} ${mid[0].toFixed(1)} ${mid[1].toFixed(1)} S ${c3[0].toFixed(1)} ${c3[1].toFixed(1)} ${tip[0].toFixed(1)} ${tip[1].toFixed(1)}`;
+  // Suckers: short dashes along the outer half of the arm.
+  const dot = `M ${mid[0].toFixed(1)} ${mid[1].toFixed(1)} C ${c3[0].toFixed(1)} ${c3[1].toFixed(1)} ${c4[0].toFixed(1)} ${c4[1].toFixed(1)} ${tip[0].toFixed(1)} ${tip[1].toFixed(1)}`;
+  paths.push({ d, width: 12 + rand() * 16, f: (0.35 + rand() * 0.8) * side, dot });
+}
+---
+
+<svg
+  class:list={["tentacles", cls, { "tentacles-still": still }]}
+  viewBox="0 0 200 160"
+  preserveAspectRatio="xMidYMax slice"
+  aria-hidden="true"
+  style={`opacity:${opacity}`}
+  data-tentacles
+>
+  <defs>
+    <linearGradient id={`tentacle-ink-${seed}`} x1="0" y1="1" x2="0.6" y2="0">
+      <stop offset="0%" stop-color="var(--tentacle-near, #f4f1ea)" stop-opacity="0.06" />
+      <stop offset="45%" stop-color="var(--tentacle-mid, #b9c2c4)" stop-opacity="0.5" />
+      <stop offset="100%" stop-color="var(--tentacle-tip, #7fd6c4)" stop-opacity="0.85" />
+    </linearGradient>
+    <filter id={`tentacle-glow-${seed}`} x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.4" />
+    </filter>
+  </defs>
+
+  <g filter={`url(#tentacle-glow-${seed})`} fill="none" stroke={`url(#tentacle-ink-${seed})`} stroke-linecap="round">
+    {paths.map((p) => (
+      <path class="arm-glow" d={p.d} stroke-width={p.width * 0.55} style={`--f:${p.f.toFixed(2)}`} />
+    ))}
+  </g>
+  <g fill="none" stroke={`url(#tentacle-ink-${seed})`} stroke-linecap="round">
+    {paths.map((p) => (
+      <path class="arm" d={p.d} stroke-width={p.width * 0.34} style={`--f:${p.f.toFixed(2)}`} />
+    ))}
+    {paths.map((p) => (
+      <path
+        class="arm-suckers"
+        d={p.dot}
+        stroke-width={p.width * 0.3}
+        stroke-dasharray="0.8 3.2"
+        style={`--f:${p.f.toFixed(2)}`}
+      />
+    ))}
+  </g>
+</svg>
+
+{!still && (
+  <script>
+    // Pointer sway: one rAF loop writes two variables; the arms read them through `--f`.
+    const fields = document.querySelectorAll<SVGSVGElement>("[data-tentacles]");
+    if (fields.length && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      let tx = 0, ty = 0, x = 0, y = 0, raf = 0;
+      const step = () => {
+        x += (tx - x) * 0.06;
+        y += (ty - y) * 0.06;
+        for (const svg of fields) {
+          svg.style.setProperty("--sway", x.toFixed(3));
+          svg.style.setProperty("--lift", y.toFixed(3));
+        }
+        raf = Math.abs(tx - x) + Math.abs(ty - y) > 0.001 ? requestAnimationFrame(step) : 0;
+      };
+      const kick = () => { if (!raf) raf = requestAnimationFrame(step); };
+      window.addEventListener("pointermove", (e) => {
+        tx = (e.clientX / window.innerWidth - 0.5) * 2;
+        ty = (e.clientY / window.innerHeight - 0.5) * 2;
+        kick();
+      }, { passive: true });
+      window.addEventListener("pointerleave", () => { tx = 0; ty = 0; kick(); });
+    }
+  </script>
+)}
+
+<style>
+  .tentacles {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 0;
+    --sway: 0;
+    --lift: 0;
+  }
+  .tentacles .arm,
+  .tentacles .arm-glow,
+  .tentacles .arm-suckers {
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+    transform: rotate(calc(var(--f) * var(--sway) * 2.2deg)) translateY(calc(var(--lift) * 1.4px));
+    transition: none;
+  }
+  .tentacles .arm-suckers { opacity: 0.5; }
+  @media (prefers-reduced-motion: reduce) {
+    .tentacles .arm,
+    .tentacles .arm-glow,
+    .tentacles .arm-suckers { transform: none; }
+  }
+</style>

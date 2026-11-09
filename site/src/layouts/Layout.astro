@@ -17,11 +17,11 @@ const repo = 'https://github.com/y0c0ms/sesync';
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <title>{title}</title>
-    <link rel="icon" href={`${base}favicon.svg`} type="image/svg+xml" />
+    <link rel="icon" href={`${base}media/brand/mark.png`} type="image/png" />
   </head>
   <body>
     <header class="top">
-      <a class="brand" href={base}>sesync</a>
+      <a class="brand" href={base}><img src={`${base}media/brand/mark.png`} alt="" width="64" height="66" /><span>sesync</span></a>
       <nav aria-label="Page sections">
         <a href="#what">What it is</a>
         <a href="#tui">TUI</a>
@@ -30,6 +30,7 @@ const repo = 'https://github.com/y0c0ms/sesync';
         <a href="#machines">Machines</a>
         <a href="#flags">Commands</a>
         <a href="#install">Install</a>
+        <a href={`${base}designs/`}>Designs</a>
         <a href={repo}>GitHub</a>
       </nav>
     </header>
