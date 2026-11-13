@@ -1,7 +1,7 @@
 ---
 import DesignLayout from '../../layouts/DesignLayout.astro';
 import Story from '../../components/Story.astro';
-import Tentacles from '../../components/Tentacles.astro';
+import TentacleField from '../../components/TentacleField.astro';
 
 const base = import.meta.env.BASE_URL.endsWith('/') ? import.meta.env.BASE_URL : `${import.meta.env.BASE_URL}/`;
 const repo = 'https://github.com/y0c0ms/sesync';
@@ -26,7 +26,7 @@ const sections = [
   </nav>
 
   <section class="hero">
-    <Tentacles seed={5} arms={8} />
+    <TentacleField seed={5} arms={8} palette="silver" />
     <div class="hero-copy">
       <span class="kicker"><b>sesync</b> v0.1.0 · MIT · Linux and Windows builds</span>
       <h1>One conversation, every harness.</h1>
