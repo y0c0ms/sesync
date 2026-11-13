@@ -25,7 +25,7 @@ const sections = [
     {sections.map(([id, label]) => <a href={`#${id}`} data-rail={id}>{label}</a>)}
   </nav>
 
-  <div class="tentacle-bg" aria-hidden="true">
+  <div class="tentacle-bg" aria-hidden="true" style={`--grain:url(${base}media/grain.png)`}>
     <TentacleField seed={5} arms={6} />
   </div>
 

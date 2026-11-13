@@ -1,23 +1,21 @@
 ---
 /**
- * TentacleField: octopus arms drawn as filled ribbons, the way the reference art does it —
- * tapered body, dark outline, light rim, rows of suckers — generated from a seed so the same
- * build always draws the same field. They enter from the right edge and curl into the page.
+ * TentacleField: octopus arms entering from the right wall of the viewport, drawn with the
+ * anatomy the reference art shows — a tapered body with a lit upper edge and a shaded
+ * underside, creases across the flesh, and two staggered rows of suckers that shrink toward
+ * the tip. Generated from a seed, so the same build always draws the same field.
  *
- * Motion is CSS only: the pointer sets two variables, each arm turns a little by its own factor.
+ * Motion: the arms sway continuously (CSS), the pointer turns them a little, and pointing at
+ * the right of the page makes them sway harder. All transforms, so nothing re-renders.
  */
 interface Props {
   arms?: number;
   seed?: number;
-  /** "right" arms enter the right edge (hero); "bottom" arms rise from below. */
-  from?: "right" | "bottom";
   class?: string;
-  /** Palette override element: "silver" (brand) or "coral" (the reference art's warmth). */
-  palette?: "silver" | "coral";
   opacity?: number;
 }
 
-const { arms = 8, seed = 3, from = "right", class: cls = "", palette = "silver", opacity = 1 } = Astro.props;
+const { arms = 6, seed = 5, class: cls = "", opacity = 1 } = Astro.props;
 
 function rng(s: number) {
   let a = s >>> 0;
@@ -30,89 +28,119 @@ function rng(s: number) {
   };
 }
 const rand = rng(seed);
-const STEPS = 64;
+const STEPS = 96;
 
+type Pt = { x: number; y: number; a: number; w: number };
+type Sucker = { cx: number; cy: number; rx: number; ry: number; rot: number };
 type Arm = {
-  out: string;
-  rim: string;
-  suckers: { cx: string; cy: string; rx: string; ry: string; rot: string }[];
-  f: number;
   id: string;
+  body: string;
+  shade: string;
+  rim: string;
+  creases: string[];
+  suckers: Sucker[];
+  f: number;
+  g: [number, number, number, number];
+  base: [number, number];
 };
 
+const poly = (pts: string[]) => `M ${pts.join(" L ")} Z`;
 const field: Arm[] = [];
-for (let i = 0; i < arms; i++) {
-  // Where the arm leaves the edge, and which way it starts off.
-  const t0 = (i + 0.5) / arms;
-  let x: number, y: number, theta: number;
-  if (from === "right") {
-    // Bases start a little past the wall so each arm is cropped flush against it, as in the
-    // reference art: the thick end is never a visible rounded cap.
-    x = 1404 + rand() * 46;
-    y = 10 + t0 * 700 + (rand() - 0.5) * 46;
-    theta = Math.PI + (rand() - 0.5) * 0.7; // heading left
-  } else {
-    x = 60 + t0 * 1300 + (rand() - 0.5) * 60;
-    y = 712 + rand() * 40;
-    theta = -Math.PI / 2 + (rand() - 0.5) * 0.8; // heading up
-  }
-  // Length, wave and curl: the tip hooks harder, which is what makes it read as a tentacle.
-  const length = 520 + rand() * 620;
-  const waveAmp = 0.16 + rand() * 0.22;
-  const waveFreq = 0.7 + rand() * 0.9;
-  const phase = rand() * Math.PI * 2;
-  const curl = 2.2 + rand() * 2.6;
-  const baseWidth = 26 + rand() * 24;
 
-  const centre: { x: number; y: number; w: number; a: number }[] = [];
+for (let i = 0; i < arms; i++) {
+  const t0 = (i + 0.5) / arms;
+  // Bases start past the wall so each arm is cropped flush against it.
+  let x = 1406 + rand() * 40;
+  let y = 6 + t0 * 700 + (rand() - 0.5) * 52;
+  let theta = Math.PI + (rand() - 0.5) * 0.55;
+  const baseX = x;
+  const baseY = y;
+
+  const length = 520 + rand() * 600;
+  const waveAmp = 0.14 + rand() * 0.2;
+  const waveFreq = 0.65 + rand() * 0.9;
+  const phase = rand() * Math.PI * 2;
+  const curl = 2.1 + rand() * 2.8;
+  const baseWidth = 30 + rand() * 26;
+  const plump = 2.6 + rand() * 2.4;
+
+  const spine: Pt[] = [];
   const ds = length / STEPS;
   for (let s = 0; s <= STEPS; s++) {
     const t = s / STEPS;
-    centre.push({ x, y, w: baseWidth * Math.pow(1 - t, 0.78) + 2.6, a: theta });
-    theta += ((Math.sin(t * Math.PI * 2 * waveFreq + phase) * waveAmp + curl * t * t) * ds) / length * 3.1;
+    // Body: a long taper, a gentle bulge mid-arm, and a hooked tip.
+    const w = baseWidth * (Math.pow(1 - t, 0.72) * (1 + 0.14 * Math.sin(t * plump)) + 0.06) + 2.2;
+    spine.push({ x, y, a: theta, w });
+    const bend =
+      Math.sin(t * Math.PI * 2 * waveFreq + phase) * waveAmp +
+      Math.sin(t * Math.PI * 9.5 + phase * 2) * 0.045 + // second octave: less mechanical
+      curl * t * t;
+    theta += (bend * ds) / length * 3.1;
     x += Math.cos(theta) * ds;
     y += Math.sin(theta) * ds;
   }
 
-  const left: string[] = [];
-  const right: string[] = [];
-  const rim: string[] = [];
-  const suckers: Arm["suckers"] = [];
+  const upper: string[] = [];
+  const lower: string[] = [];
+  const shadeOuter: string[] = [];
+  const shadeInner: string[] = [];
+  const rimPts: string[] = [];
+  const creases: string[] = [];
+  const suckers: Sucker[] = [];
+
   for (let s = 0; s <= STEPS; s++) {
-    const p = centre[s];
+    const p = spine[s];
+    const t = s / STEPS;
     const nx = Math.cos(p.a + Math.PI / 2);
     const ny = Math.sin(p.a + Math.PI / 2);
-    left.push(`${(p.x + nx * p.w).toFixed(1)},${(p.y + ny * p.w).toFixed(1)}`);
-    right.push(`${(p.x - nx * p.w * 0.82).toFixed(1)},${(p.y - ny * p.w * 0.82).toFixed(1)}`);
-    // The rim rides the lit side, a little inside the edge.
-    if (s % 4 === 0) {
-      const iw = p.w * 0.5;
-      rim.push(`${(p.x + nx * iw).toFixed(1)},${(p.y + ny * iw).toFixed(1)}`);
+    const up = p.w * 0.94;
+    const down = p.w * 0.86;
+    upper.push(`${(p.x + nx * up).toFixed(1)},${(p.y + ny * up).toFixed(1)}`);
+    lower.push(`${(p.x - nx * down).toFixed(1)},${(p.y - ny * down).toFixed(1)}`);
+    // The underside band catches less light: from just below the spine to the lower edge.
+    shadeOuter.push(`${(p.x - nx * down * 0.98).toFixed(1)},${(p.y - ny * down * 0.98).toFixed(1)}`);
+    shadeInner.push(`${(p.x - nx * down * 0.12).toFixed(1)},${(p.y - ny * down * 0.12).toFixed(1)}`);
+    if (s % 3 === 0) {
+      rimPts.push(`${(p.x + nx * up * 0.82).toFixed(1)},${(p.y + ny * up * 0.82).toFixed(1)}`);
     }
-    if (s > 6 && s < STEPS - 2 && s % 5 === 0) {
-      const t = s / STEPS;
-      const off = p.w * 0.34;
+    // Creases: short arcs across the flesh, denser near the base where the arm is thicker.
+    if (s % 9 === 0 && t > 0.06 && t < 0.9) {
+      const tx = Math.cos(p.a);
+      const ty = Math.sin(p.a);
+      const ax = p.x + nx * up * 0.92;
+      const ay = p.y + ny * up * 0.92;
+      const bx = p.x - nx * down * 0.92;
+      const by = p.y - ny * down * 0.92;
+      const mx = p.x + tx * p.w * 0.1;
+      const my = p.y + ty * p.w * 0.1;
+      creases.push(
+        `M ${ax.toFixed(1)} ${ay.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${bx.toFixed(1)} ${by.toFixed(1)}`
+      );
+    }
+    // Suckers: two staggered rows along the underside, shrinking toward the tip.
+    if (s > 4 && s < STEPS - 3 && s % 6 === 0) {
+      const row = (s / 6) % 2 === 0 ? 0.42 : 0.66;
+      const size = p.w * 0.3 * (1 - 0.35 * t);
       suckers.push({
-        cx: (p.x - nx * off).toFixed(1),
-        cy: (p.y - ny * off).toFixed(1),
-        rx: (p.w * 0.2).toFixed(1),
-        ry: (p.w * 0.13).toFixed(1),
-        rot: ((p.a * 180) / Math.PI).toFixed(1),
-        // nearer the tip the suckers shrink
-      } as Arm["suckers"][number]);
-      const last = suckers[suckers.length - 1];
-      const shrink = 0.45 + 0.55 * (1 - t);
-      last.rx = (Number(last.rx) * shrink).toFixed(1);
-      last.ry = (Number(last.ry) * shrink).toFixed(1);
+        cx: Number((p.x - nx * down * row).toFixed(1)),
+        cy: Number((p.y - ny * down * row).toFixed(1)),
+        rx: Number((size * 1.15).toFixed(1)),
+        ry: Number((size * 0.78).toFixed(1)),
+        rot: Number(((p.a * 180) / Math.PI).toFixed(1))
+      });
     }
   }
 
   field.push({
-    out: `M ${right.join(" L ")} L ${left.reverse().join(" L ")} Z`,
-    rim: `M ${rim.join(" L ")}`,
+    id: `arm-${seed}-${i}`,
+    body: poly([...lower, ...upper.slice().reverse()]),
+    shade: poly([...shadeOuter, ...shadeInner.slice().reverse()]),
+    rim: `M ${rimPts.join(" L ")}`,
+    creases,
     suckers,
     f: ((i % 2 === 0 ? 1 : -1) * (0.4 + rand() * 0.9)).toFixed(2),
-    id: `arm-${seed}-${i}`
+    g: [baseX, baseY, spine[STEPS].x, spine[STEPS].y],
+    base: [baseX, baseY]
   });
 }
 ---
@@ -120,39 +148,46 @@ for (let i = 0; i < arms; i++) {
 <svg
   class:list={["tentacle-field", cls]}
   viewBox="0 0 1400 700"
-  preserveAspectRatio={from === "right" ? "xMaxYMid slice" : "xMidYMax slice"}
+  preserveAspectRatio="xMaxYMid slice"
   aria-hidden="true"
   data-tentacle-field
   style={`opacity:${opacity}`}
 >
   <defs>
-    {field.map((a) => (
-      <linearGradient id={a.id} gradientUnits="userSpaceOnUse" x1="1400" y1="0" x2="360" y2="0">
+    {field.map((arm) => (
+      <linearGradient id={arm.id} gradientUnits="userSpaceOnUse" x1={arm.g[0]} y1={arm.g[1]} x2={arm.g[2]} y2={arm.g[3]}>
         <stop offset="0" stop-color="var(--arm-base)" />
-        <stop offset="0.55" stop-color="var(--arm-mid)" />
+        <stop offset="0.42" stop-color="var(--arm-mid)" />
         <stop offset="1" stop-color="var(--arm-tip)" />
       </linearGradient>
     ))}
+    <linearGradient id={`shade-${seed}`} x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000" stop-opacity="0" />
+      <stop offset="1" stop-color="var(--arm-shadow)" stop-opacity="0.62" />
+    </linearGradient>
+    <radialGradient id={`socket-${seed}`} cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="var(--arm-shadow)" stop-opacity="0.85" />
+      <stop offset="1" stop-color="var(--arm-shadow)" stop-opacity="0" />
+    </radialGradient>
   </defs>
 
-  {field.map((a, i) => (
-    <g class="arm-outer" style={`--f:${a.f};--i:${i};--dur:${(6.2 + (i % 3) * 1.7).toFixed(1)}s`}>
+  {field.map((arm, i) => (
+    <g class="arm-outer" style={`--f:${arm.f};--i:${i};--dur:${(6.2 + (i % 3) * 1.7).toFixed(1)}s`}>
       <g class="arm">
-      <path d={a.out} fill={`url(#${a.id})`} stroke="var(--arm-outline)" stroke-width="2.6" stroke-linejoin="round" />
-      <path d={a.rim} fill="none" stroke="var(--arm-rim)" stroke-width="3.4" stroke-linecap="round" opacity="0.55" />
-      {a.suckers.map((s) => (
-        <ellipse
-          cx={s.cx}
-          cy={s.cy}
-          rx={s.rx}
-          ry={s.ry}
-          transform={`rotate(${s.rot} ${s.cx} ${s.cy})`}
-          fill="var(--arm-sucker)"
-          stroke="var(--arm-outline)"
-          stroke-width="1.1"
-          opacity="0.85"
-        />
-      ))}
+        <path d={arm.body} fill="var(--arm-shadow)" opacity="0.35" transform="translate(9 13)" />
+        <path d={arm.body} fill={`url(#${arm.id})`} stroke="var(--arm-outline)" stroke-width="2.4" stroke-linejoin="round" />
+        <path d={arm.shade} fill={`url(#shade-${seed})`} />
+        <path d={arm.rim} fill="none" stroke="var(--arm-rim)" stroke-width="2.6" stroke-linecap="round" opacity="0.5" />
+        <g stroke="var(--arm-outline)" stroke-width="1.05" opacity="0.22" fill="none">
+          {arm.creases.map((d) => <path d={d} />)}
+        </g>
+        {arm.suckers.map((s) => (
+          <g transform={`rotate(${s.rot} ${s.cx} ${s.cy})`}>
+            <ellipse cx={s.cx} cy={s.cy} rx={s.rx} ry={s.ry} fill="var(--arm-sucker)" stroke="var(--arm-outline)" stroke-width="1.15" />
+            <ellipse cx={s.cx} cy={s.cy} rx={s.rx * 0.52} ry={s.ry * 0.52} fill="var(--arm-shadow)" opacity="0.5" />
+          </g>
+        ))}
+        <ellipse cx={arm.base[0]} cy={arm.base[1]} rx="54" ry="46" fill={`url(#socket-${seed})`} />
       </g>
     </g>
   ))}
@@ -177,7 +212,6 @@ for (let i = 0; i < arms; i++) {
     addEventListener("pointermove", (e) => {
       tx = (e.clientX / innerWidth - 0.5) * 2;
       ty = (e.clientY / innerHeight - 0.5) * 2;
-      // Past 55% of the width the pointer is over the arms: they sway harder.
       document.documentElement.classList.toggle("arms-awake", e.clientX > innerWidth * 0.55);
       kick();
     }, { passive: true });
@@ -190,13 +224,7 @@ for (let i = 0; i < arms; i++) {
 </script>
 
 <style>
-  /* Registered so the amplitude can ease between idle and awake instead of snapping. */
   @property --amp {
-    syntax: "<number>";
-    inherits: true;
-    initial-value: 1;
-  }
-  @property --sway {
     syntax: "<number>";
     inherits: true;
     initial-value: 1;
@@ -212,26 +240,21 @@ for (let i = 0; i < arms; i++) {
     --turn: 0;
     --rise: 0;
     --amp: 1;
-    overflow: visible;
-    filter: drop-shadow(0 -8px 34px rgb(0 0 0 / 32%));
-  }
 
-  .palette-silver,
-  .tentacle-field {
-    --arm-base: #1d2429;
-    --arm-mid: #8b989d;
+    /* The mark's palette: silver flesh, a cold shadow, a sea-green tip. */
+    --arm-base: #131b21;
+    --arm-mid: #869499;
     --arm-tip: #cfeee6;
-    --arm-outline: #05090a;
-    --arm-rim: #e8f6f2;
-    --arm-sucker: #c9d6d4;
+    --arm-outline: #04080a;
+    --arm-rim: #eafaf5;
+    --arm-sucker: #dfe9e6;
+    --arm-shadow: #0a1418;
   }
 
-  /* Outer: the pointer's small turn. Inner: the arm's own slow sway, always running. */
   .tentacle-field .arm-outer {
     transform-box: fill-box;
     transform-origin: 100% 50%;
-    transform: translateY(calc(var(--rise) * 7px))
-      rotate(calc(var(--f) * var(--turn) * 2.2deg));
+    transform: translateY(calc(var(--rise) * 7px)) rotate(calc(var(--f) * var(--turn) * 2.2deg));
   }
 
   .tentacle-field .arm {

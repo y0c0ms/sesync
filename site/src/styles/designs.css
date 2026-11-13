@@ -315,15 +315,17 @@ body.v-c {
 
 .v-c .rail {
   position: fixed;
-  right: max(1rem, calc((100vw - 1080px) / 2 - 6rem));
+  /* Left, not right: the arms own the right wall, and labels over them were hard to read. */
+  left: max(1rem, calc((100vw - 1080px) / 2 - 7.5rem));
   top: 50%;
+  text-align: left;
   transform: translateY(-50%);
   display: none;
   gap: 0.6rem;
   z-index: 5;
 }
 
-@media (min-width: 1320px) { .v-c .rail { display: grid; } }
+@media (min-width: 1340px) { .v-c .rail { display: grid; } }
 
 .v-c .rail a {
   display: flex;
@@ -420,6 +422,18 @@ body.v-c {
 }
 
 .tentacle-bg .tentacle-field { position: absolute; inset: 0; }
+
+/* A grain pass over the arms: skin, not vector fill. Static tile, blended, no cost per frame. */
+.tentacle-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: var(--grain);
+  background-size: 220px 220px;
+  mix-blend-mode: overlay;
+  opacity: 0.22;
+  pointer-events: none;
+}
 
 body.v-c main,
 body.v-c .foot { position: relative; z-index: 1; }
