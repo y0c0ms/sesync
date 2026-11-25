@@ -25,6 +25,7 @@ pub mod journal;
 pub mod omp;
 pub mod opencode;
 pub mod pi;
+pub mod spidair;
 mod retired;
 pub mod window;
 
@@ -289,7 +290,7 @@ pub trait Harness: Send + Sync {
 }
 
 /// Every harness sesync syncs between. The order is the order lists and pickers show them in.
-pub static ALL: &[&dyn Harness] = &[&omp::Omp, &pi::Pi, &claude::Claude, &opencode::OpenCode, &antigravity::Antigravity];
+pub static ALL: &[&dyn Harness] = &[&omp::Omp, &pi::Pi, &spidair::Spidair, &claude::Claude, &opencode::OpenCode, &antigravity::Antigravity];
 
 /// The harness with this id.
 pub fn get(id: &str) -> Option<&'static dyn Harness> {

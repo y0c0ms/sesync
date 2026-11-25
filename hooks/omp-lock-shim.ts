@@ -2,6 +2,8 @@
 import { spawnSync } from "node:child_process";
 export default function (pi: any): void {
   const hs = process.env.SESYNC_LOCK ?? "sesync-lock";
+  // The harness name in the lock: omp by default; Pi-based harnesses (spidair) set SESYNC_HARNESS.
+  const harness = process.env.SESYNC_HARNESS ?? "omp";
   const id = (ctx: any): string => {
     const file: string = ctx?.sessionManager?.getSessionFile?.() ?? "";
     return file.match(/_([0-9a-f-]{36})\.jsonl$/i)?.[1] ?? "";
@@ -9,7 +11,7 @@ export default function (pi: any): void {
   const call = (ev: string, ctx: any, body = "{}") => {
     const sid = id(ctx);
     if (!sid) return;
-    spawnSync(hs, ["hook", ev, "omp", "--pid", String(process.pid), "--session", sid], { input: body });
+    spawnSync(hs, ["hook", ev, harness, "--pid", String(process.pid), "--session", sid], { input: body });
   };
   pi.on("turn_start", (_e: any, ctx: any) => call("turn_start", ctx));
   pi.on("turn_end", (_e: any, ctx: any) => call("turn_end", ctx));
