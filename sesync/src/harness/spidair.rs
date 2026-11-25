@@ -61,9 +61,9 @@ impl Harness for Spidair {
         journal::install(tools.sesync_conv, journal, "to-pi", "sessions", &loc.root, &[], mirror_id, title)
             .map(|p| p.display().to_string())
     }
+    /// spidair's rename is Pi's: a `session_info` record with the name is appended; history is kept.
     fn rename(&self, _loc: &Location, _tools: &Tools, key: &str, title: &str) -> Result<Option<String>, String> {
-        let rec = serde_json::json!({"type": "session_info", "name": title});
-        journal::rewrite(Path::new(key), title, |text| journal::append_record(text, rec)).map(|()| None)
+        journal::rewrite(Path::new(key), title, |text| journal::append_session_info(text, title)).map(|()| None)
     }
 }
 
@@ -80,5 +80,31 @@ mod tests {
         }
         assert_eq!(Spidair.resume_argv(&loc, "/s/a.jsonl").unwrap(), vec!["spidair", "--session", "/s/a.jsonl"]);
         assert!(Spidair.native_journal());
+    }
+
+    /// spidair's rename is Pi's: the name record must hang off the leaf, or Pi resumes with no context.
+    #[test]
+    fn a_rename_keeps_spidair_resuming_with_its_context() {
+        let dir = std::env::temp_dir().join(format!("spidair-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("2026-11-22T10-00-00-000Z_01a20546-5d97-73e2-a862-187a4d9eb592.jsonl");
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"01a20546-5d97-73e2-a862-187a4d9eb592","timestamp":"2026-11-22T10:00:00.000Z","cwd":"/home/u/proj"}"#, "\n",
+            r#"{"type":"model_change","id":"mc1","parentId":null,"provider":"llama-swap","modelId":"qwen3-coder"}"#, "\n",
+            r#"{"type":"message","id":"u1","parentId":"mc1","message":{"role":"user","content":"q1"}}"#, "\n",
+            r#"{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}"#, "\n",
+        );
+        std::fs::write(&file, text).unwrap();
+        let loc = Location { root: dir.clone(), cli: None };
+        let tools = Tools { home: &dir, sesync_conv: &dir };
+        Spidair.rename(&loc, &tools, file.to_str().unwrap(), "Renamed spidair").unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        let last: serde_json::Value = serde_json::from_str(after.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "session_info");
+        assert_eq!(last["name"], "Renamed spidair");
+        assert_eq!(last["parentId"], "a1", "the name hangs off the leaf");
+        assert_eq!(journal::pi_resume_leaf(&after).as_deref(), last["id"].as_str(), "Pi resumes from the name record");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

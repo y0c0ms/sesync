@@ -53,7 +53,7 @@ fn pi_rename_appends_a_session_info_name_and_keeps_history() {
     let dir = r.locations.sessions_dir("pi").join("-tmp-proj");
     fs::create_dir_all(&dir).unwrap();
     let p = dir.join(format!("2026-10-01T10-00-00-000Z_{CID}.jsonl"));
-    let original = "{\"type\":\"session\",\"id\":\"x\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"keep\"}}\n";
+    let original = "{\"type\":\"session\",\"id\":\"x\"}\n{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"keep\"}}\n";
     fs::write(&p, original).unwrap();
 
     let g = Group::file("pi", p.display().to_string(), "x");
@@ -64,6 +64,10 @@ fn pi_rename_appends_a_session_info_name_and_keeps_history() {
     let last: serde_json::Value = serde_json::from_str(after.lines().last().unwrap()).unwrap();
     assert_eq!(last["type"], "session_info");
     assert_eq!(last["name"], "Renamed pi");
+    // Pi resumes from the last record: the name carries its own id and hangs off the leaf (m1),
+    // so the conversation stays reachable from it.
+    assert!(last["id"].as_str().is_some_and(|id| !id.is_empty() && id != "m1"), "the name has its own id: {last}");
+    assert_eq!(last["parentId"], "m1", "the name's parent is the active leaf");
 }
 
 #[test]
