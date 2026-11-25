@@ -295,11 +295,16 @@ fn main() {
                     // Pi has no title slot: the picker shows the last `session_info.name`.
                     // Append one so the mirror is labelled (and tagged as a mirror).
                     j.title = None;
-                    let last_id = j.records.iter().rev().find_map(|r| r.get("id").and_then(Value::as_str)).map(str::to_string);
+                    // Pi's `appendSessionInfo`: a new id, and the parent is the active leaf, so the
+                    // leaf moves onto this record and the conversation stays reachable.
+                    let leaf = j.leaf_id().map(str::to_string);
+                    let taken: std::collections::HashSet<&str> = j.records.iter().filter_map(|r| r.get("id").and_then(Value::as_str)).collect();
+                    let seed = j.records.len() as u32 ^ 0x5151_a5a5;
+                    let id = (0u32..).map(|n| format!("{:08x}", seed.wrapping_add(n))).find(|c| !taken.contains(c.as_str())).unwrap_or_default();
                     let mut info = Map::new();
                     info.insert("type".into(), "session_info".into());
-                    info.insert("id".into(), Value::String(format!("{:08x}", j.records.len() as u32 ^ 0x5151_a5a5)));
-                    info.insert("parentId".into(), last_id.map(Value::String).unwrap_or(Value::Null));
+                    info.insert("id".into(), Value::String(id));
+                    info.insert("parentId".into(), leaf.map(Value::String).unwrap_or(Value::Null));
                     info.insert("timestamp".into(), Value::String(ts.clone()));
                     info.insert("name".into(), Value::String(title.clone()));
                     j.records.push(info);
