@@ -122,6 +122,20 @@ fn ids_timestamps_usage_and_thinking_do_not_change_a_turn() {
 }
 
 #[test]
+fn an_image_note_in_a_reply_or_a_prompt_is_not_a_change() {
+    // A Claude copy writes an image it does not carry as a note line: in a reply (after its text)
+    // and in a prompt (where the prompt is the note alone). The original holds the image instead.
+    let note = r#"[attachment not carried: image (image/png, 8 B) \u2014 kept in the source session]"#;
+    let image = r#"[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]"#;
+    let original = omp_journal("Listing.").replace("\"content\":\"thanks\"", &format!("\"content\":{image}"));
+    let copy = omp_journal("Listing.")
+        .replace("\"text\":\"Listing.\"", &format!("\"text\":\"Listing.\\n{note}\""))
+        .replace("\"content\":\"thanks\"", &format!("\"content\":\"{note}\""));
+    assert_ne!(original, copy, "the fixture carries the notes");
+    assert_eq!(turns(&original), turns(&copy));
+}
+
+#[test]
 fn a_changed_answer_is_a_different_turn() {
     let a = turns(&omp_journal("Listing."));
     let b = turns(&omp_journal("Listing them now."));

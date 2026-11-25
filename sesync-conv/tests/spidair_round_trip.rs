@@ -481,9 +481,9 @@ fn to_pi_chains_its_session_info_to_the_active_leaf() {
 }
 
 #[test]
-#[ignore = "image placeholder gap: needs a decision"]
-fn an_image_in_a_tool_result_is_a_wrapper_line_in_the_claude_copy() {
-    // The placeholder starts with `<`, the form every converter already treats as a wrapper.
+fn an_image_in_a_tool_result_is_a_note_line_in_the_claude_copy() {
+    // The note is the attachment note for an image the copy does not carry. sesync's turn hashing
+    // drops that line (`turns::without_image_placeholders`), so the copy hashes like the original.
     let sb = sandbox("placeholder-form");
     let src = write(&sb.join("s.jsonl"), &spidair_journal());
     let out = printed(&conv(&["to-claude", src.to_str().unwrap(), "--out-dir", sb.join("claude").to_str().unwrap()]));
@@ -492,5 +492,5 @@ fn an_image_in_a_tool_result_is_a_wrapper_line_in_the_claude_copy() {
         .find(|r| r["message"]["content"].to_string().contains("Read image file"))
         .expect("the Read result");
     let body = result["message"]["content"][0]["content"].as_str().unwrap();
-    assert!(body.starts_with("Read image file\n<image omitted: /home/u/proj/shot.png>"), "{body}");
+    assert!(body.starts_with("Read image file\n[attachment not carried: image (image/png, 8 B) \u{2014} an image in a tool result, which this copy does not carry; kept in the source session]"), "{body}");
 }

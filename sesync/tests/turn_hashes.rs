@@ -55,7 +55,6 @@ fn pi_journal(result: &str) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "image placeholder gap: needs a decision"]
 fn an_image_in_a_tool_result_hashes_the_same_in_the_claude_copy() {
     let sb = sandbox("image-result");
     let text = r#"[{"type":"text","text":"Read image file"},{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]"#;
@@ -67,7 +66,6 @@ fn an_image_in_a_tool_result_hashes_the_same_in_the_claude_copy() {
 }
 
 #[test]
-#[ignore = "image placeholder gap: needs a decision"]
 fn an_image_only_tool_result_hashes_the_same_in_the_claude_copy() {
     let sb = sandbox("image-only");
     let text = r#"[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]"#;
@@ -77,7 +75,6 @@ fn an_image_only_tool_result_hashes_the_same_in_the_claude_copy() {
 }
 
 #[test]
-#[ignore = "image placeholder gap: needs a decision"]
 fn an_omp_journal_with_an_image_result_hashes_the_same_in_the_claude_copy() {
     let sb = sandbox("omp-image");
     let lines = [
