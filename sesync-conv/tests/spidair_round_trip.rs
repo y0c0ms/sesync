@@ -188,7 +188,6 @@ fn opencode_export() -> String {
 // ----- (a) Claude Code -> spidair -> Claude ---------------------------------------------------
 
 #[test]
-#[ignore = "claude custom-title is not read by from-claude (the Claude title port is not in this change): needs a decision"]
 fn claude_to_spidair_and_back_keeps_turns_pairs_and_titles() {
     let sb = sandbox("claude");
     let transcript = write(&sb.join("claude-src.jsonl"), &claude_transcript());
