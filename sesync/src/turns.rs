@@ -110,18 +110,16 @@ pub fn compare(local: &[Turn], team: &[Turn]) -> Relation {
     }
 }
 
-/// The active branch: the chain from the last message record in the file, followed by `parentId`
-/// through any record, oldest first. The same walk `sesync-conv` uses, without its compaction cut.
+/// The active branch: the chain from the active leaf (`harness::journal::active_leaf`, the same rule
+/// `sesync-conv` uses), followed by `parentId` through any record, oldest first. Without the
+/// compaction cut that `sesync-conv` applies.
 fn active_chain(records: &[Map<String, Value>]) -> Vec<&Map<String, Value>> {
     let by_id: std::collections::HashMap<&str, &Map<String, Value>> = records.iter()
         .filter_map(|r| r.get("id").and_then(Value::as_str).map(|id| (id, r)))
         .collect();
-    let leaf = records.iter().rev()
-        .find(|r| r.get("type").and_then(Value::as_str) == Some("message"))
-        .and_then(|r| r.get("id").and_then(Value::as_str));
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut cur = leaf;
+    let mut cur = crate::harness::journal::active_leaf(records);
     while let Some(id) = cur {
         if !seen.insert(id) {
             break;

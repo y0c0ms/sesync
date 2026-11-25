@@ -546,6 +546,44 @@ pub fn rewrite(path: &Path, title: &str, edit: impl FnOnce(&str) -> String) -> R
     Ok(())
 }
 
+/// The active leaf of a Pi-shaped journal: the record the engine resumes from. Mirrors omp's
+/// resolution (`session-entries.ts`: `vX` and `P0`) and Pi's (`SessionManager._buildIndex`, the
+/// last entry). The leaf is `activeLeafId` when the last entry carries one, else its own `id`. If
+/// that id names no entry, the last entry whose own leaf is itself is used. A journal whose last
+/// entry has no `parentId` key falls back to the last message record. The same rule lives in
+/// `sesync-conv/src/journal.rs` (`active_leaf`): change both together.
+pub fn active_leaf(records: &[serde_json::Map<String, Value>]) -> Option<&str> {
+    let entries: Vec<&serde_json::Map<String, Value>> = records
+        .iter()
+        .filter(|r| r.get("type").and_then(Value::as_str) != Some("session") && r.contains_key("id"))
+        .collect();
+    let Some(last) = entries.last().copied() else { return last_message_id(records) };
+    if !last.contains_key("parentId") {
+        return last_message_id(records);
+    }
+    let u = own_leaf(last)?;
+    if Some(u) == id_of(last) || entries.iter().any(|e| id_of(e) == Some(u)) {
+        return Some(u);
+    }
+    entries.iter().rev().find(|e| own_leaf(e) == id_of(e)).copied().and_then(id_of)
+}
+
+fn id_of(r: &serde_json::Map<String, Value>) -> Option<&str> {
+    r.get("id").and_then(Value::as_str)
+}
+
+/// `activeLeafId` when the record has one (a null or non-string value gives no leaf), else its id.
+fn own_leaf(r: &serde_json::Map<String, Value>) -> Option<&str> {
+    match r.get("activeLeafId") {
+        Some(v) => v.as_str(),
+        None => id_of(r),
+    }
+}
+
+fn last_message_id(records: &[serde_json::Map<String, Value>]) -> Option<&str> {
+    records.iter().rev().find(|r| r.get("type").and_then(Value::as_str) == Some("message")).and_then(id_of)
+}
+
 /// A journal's text with one record appended on a line of its own.
 pub fn append_record(text: &str, rec: serde_json::Value) -> String {
     let mut out = text.to_string();
@@ -625,5 +663,70 @@ mod tests {
         for p in [omp, claude, none] {
             let _ = fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod leaf_rules {
+    use super::*;
+
+    fn records(text: &str) -> Vec<serde_json::Map<String, Value>> {
+        text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        }).collect()
+    }
+
+    const PLAIN: &str = concat!(
+        r#"{"type":"session","version":3,"id":"s","timestamp":"2026-11-22T10:00:00.000Z","cwd":"/home/u/proj"}"#, "\n",
+        r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+        r#"{"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}"#, "\n",
+        r#"{"type":"message","id":"m2","parentId":"a1","message":{"role":"user","content":"q2"}}"#, "\n",
+        r#"{"type":"message","id":"a2","parentId":"m2","message":{"role":"assistant","content":[{"type":"text","text":"a2"}]}}"#, "\n",
+    );
+
+    /// omp's model_usage: written with parentId m2 after the leaf moved to m4.
+    const MODEL_USAGE: &str = concat!(
+        r#"{"type":"session","version":3,"id":"s","timestamp":"2026-11-22T10:00:00.000Z","cwd":"/home/u/proj"}"#, "\n",
+        r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+        r#"{"type":"message","id":"m2","parentId":"m1","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}"#, "\n",
+        r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"user","content":"q2"}}"#, "\n",
+        r#"{"type":"message","id":"m4","parentId":"m3","message":{"role":"assistant","content":[{"type":"text","text":"a2"}]}}"#, "\n",
+        r#"{"type":"model_usage","id":"mu","parentId":"m2","activeLeafId":"m4"}"#, "\n",
+    );
+
+    #[test]
+    fn the_last_entry_is_the_leaf_unless_it_names_an_active_leaf() {
+        assert_eq!(active_leaf(&records(PLAIN)), Some("a2"));
+        assert_eq!(active_leaf(&records(MODEL_USAGE)), Some("m4"), "activeLeafId wins, as omp resumes");
+    }
+
+    #[test]
+    fn an_active_leaf_that_names_no_entry_falls_back_to_the_last_entry_with_its_own_leaf() {
+        let text = concat!(
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+            r#"{"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":[]}}"#, "\n",
+            r#"{"type":"model_usage","id":"mu","parentId":"a1","activeLeafId":"gone"}"#, "\n",
+        );
+        assert_eq!(active_leaf(&records(text)), Some("a1"), "DTe: the last entry whose leaf is its own id");
+    }
+
+    #[test]
+    fn a_null_active_leaf_means_no_leaf() {
+        let text = concat!(
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+            r#"{"type":"model_usage","id":"mu","parentId":"m1","activeLeafId":null}"#, "\n",
+        );
+        assert_eq!(active_leaf(&records(text)), None);
+    }
+
+    #[test]
+    fn a_last_entry_without_a_parent_key_falls_back_to_the_last_message() {
+        let text = concat!(
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+            r#"{"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":[]}}"#, "\n",
+            r#"{"type":"title","id":"t1"}"#, "\n",
+        );
+        assert_eq!(active_leaf(&records(text)), Some("a1"));
     }
 }

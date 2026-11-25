@@ -168,6 +168,20 @@ fn a_compaction_does_not_cut_the_turns_the_file_still_holds() {
 }
 
 #[test]
+fn a_model_usage_record_moves_the_read_to_its_active_leaf() {
+    // omp's model_usage names activeLeafId a2, the leaf it resumes from, although the file goes on
+    // to a3. The live branch ends at a2: one turn, the one answered before the leaf moved on.
+    let base = omp_journal("Listing.");
+    let moved = with_appended(&base, &[
+        r#"{"type":"model_usage","id":"mu","parentId":"a1","activeLeafId":"a2","timestamp":"2026-10-01T10:00:07.000Z","usage":{"input":1}}"#,
+    ]);
+    let t = turns(&moved);
+    assert_eq!(t.len(), 1, "only the turn on the active branch: {t:?}");
+    assert_eq!(t[0].user, "list the files");
+    assert_eq!(t[0].reply, turns(&base)[0].reply);
+}
+
+#[test]
 fn a_line_that_is_not_json_is_an_error_naming_the_line() {
     let err = turns_of(b"{\"type\":\"session\"}\nnot json\n").unwrap_err();
     assert!(err.contains("line 2"), "{err}");
