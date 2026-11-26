@@ -705,7 +705,7 @@ mod tests {
         let (started, bytes) = fetch(&ctx, dir.to_str().unwrap());
         assert_eq!(started["name"], "proj.zip");
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        let mut names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
+        let mut names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().unwrap().to_string()).collect();
         names.sort();
         assert_eq!(names, ["proj/a.txt", "proj/sub/", "proj/sub/b.txt", "proj/sub/deeper/", "proj/sub/deeper/c.txt"]);
         let mut text = String::new();
