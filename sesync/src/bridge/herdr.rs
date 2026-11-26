@@ -269,7 +269,14 @@ impl Conn {
     #[cfg(unix)]
     fn read_some(&mut self, buf: &mut [u8], wait: Duration) -> std::io::Result<Option<usize>> {
         use std::io::Read;
-        self.stream.set_read_timeout(Some(wait))?;
+        // macOS (BSD) refuses SO_RCVTIMEO with EINVAL once the peer has shut the connection down, even while its
+        // last reply is still buffered. The read then returns that data or 0 (closed) at once, so the timeout is
+        // not needed: go on and read.
+        if let Err(e) = self.stream.set_read_timeout(Some(wait)) {
+            if e.raw_os_error() != Some(libc_einval()) {
+                return Err(e);
+            }
+        }
         match self.stream.read(buf) {
             Ok(n) => Ok(Some(n)),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
@@ -1125,4 +1132,10 @@ mod tests {
         assert!(memo.argvs(&pane, || Err("herdr refused".into())).is_err());
         assert_eq!(memo.argvs(&pane, || Ok(Vec::new())).unwrap(), Vec::<Vec<String>>::new());
     }
+}
+
+/// EINVAL: 22 on Linux, macOS and the BSDs.
+#[cfg(unix)]
+const fn libc_einval() -> i32 {
+    22
 }

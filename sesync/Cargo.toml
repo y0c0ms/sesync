@@ -16,7 +16,7 @@ ratatui = "0.30"
 # The width table ratatui itself places glyphs with (already in the lock file through ratatui),
 # so the list's columns are cut and padded by the same widths the terminal frame uses.
 unicode-width = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 crossterm = "0.29"
 sha2 = "0.10"
 zstd = "0.14"
@@ -37,7 +37,7 @@ ml-kem = { version = "0.3", features = ["getrandom", "zeroize"] }
 curve25519-dalek = "4"
 # File transfer over the bridge (`bridge::transfer`): a directory is sent as a zip. Deflate only, no encryption,
 # bzip2 or lzma, so the crate pulls in as little as it can.
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(windows)'.dependencies]
 # The process list "Open in herdr" reads (`proc_tree`): herdr on Windows reports only a pane's
