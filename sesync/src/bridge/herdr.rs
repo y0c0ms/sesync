@@ -686,7 +686,60 @@ pub fn live_process_argvs(result: &Value) -> Result<Vec<Vec<String>>, String> {
 /// The session each agent pane reported to herdr through its integration, by pane id: the `value` of
 /// `agent.list`'s `agent_session` (a session file path for omp and Pi, a session id for Claude and OpenCode).
 pub fn agent_sessions(h: &dyn Herdr) -> Result<HashMap<String, String>, String> {
-    Ok(parse_agent_sessions(&h.call("agent.list", json!({}))?))
+    let mut sessions = parse_agent_sessions(&h.call("agent.list", json!({}))?);
+    for (pane, session) in spidair_pane_sessions(&spidair_pane_dir(&|k| std::env::var_os(k)), live_spidair_in_pane) {
+        sessions.entry(pane).or_insert(session);
+    }
+    Ok(sessions)
+}
+
+/// Where spidair writes its pane files: `$XDG_STATE_HOME/spidair/herdr-panes`, else `~/.local/state/spidair/herdr-panes`.
+/// herdr keeps a reported session only for its built-in agents, so a spidair pane started without `--session` (a
+/// bare start, then `/resume` inside) names its session to nobody but this file.
+pub fn spidair_pane_dir(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    match var("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        Some(state) => PathBuf::from(state).join("spidair").join("herdr-panes"),
+        None => crate::home::home_dir().join(".local").join("state").join("spidair").join("herdr-panes"),
+    }
+}
+
+/// The session of each spidair pane file in `dir` (`{"pane", "pid", "sessionId", "sessionFile"?}`), by pane id: the
+/// session file when the record has one, else the id. A record counts only while `alive(pid, pane)` holds, so a file
+/// left by a crashed spidair, or a pane id reused after a herdr restart, places nothing. Unreadable files are skipped.
+pub fn spidair_pane_sessions(dir: &Path, alive: impl Fn(u64, &str) -> bool) -> HashMap<String, String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return HashMap::new() };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            let pane = v["pane"].as_str().filter(|p| !p.is_empty())?;
+            let pid = v["pid"].as_u64()?;
+            let session = v["sessionFile"]
+                .as_str()
+                .filter(|f| f.ends_with(".jsonl"))
+                .or_else(|| v["sessionId"].as_str())
+                .filter(|s| !s.is_empty())?;
+            alive(pid, pane).then(|| (pane.to_string(), session.to_string()))
+        })
+        .collect()
+}
+
+/// Local process `pid` is a spidair (its `comm`) running in herdr pane `pane` (its `HERDR_PANE_ID`).
+#[cfg(target_os = "linux")]
+fn live_spidair_in_pane(pid: u64, pane: &str) -> bool {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let is_spidair = std::fs::read_to_string(proc.join("comm")).is_ok_and(|c| c.trim_end() == "spidair");
+    is_spidair
+        && std::fs::read(proc.join("environ")).is_ok_and(|env| {
+            let want = format!("HERDR_PANE_ID={pane}");
+            env.split(|b| *b == 0).any(|var| var == want.as_bytes())
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_spidair_in_pane(_pid: u64, _pane: &str) -> bool {
+    false
 }
 
 /// The pane-to-session map of an `agent_list` result. Agents without a reported session are skipped.
@@ -841,6 +894,44 @@ mod tests {
         let none = |_: u64, _: &[String]| None;
         assert_eq!(parse_process_argvs_with(&result, none).unwrap(), vec![vec!["claude", "--resume", "abc"]]);
         assert!(parse_process_argvs_with(&json!({"process_info": {}}), none).is_err());
+    }
+
+    #[test]
+    fn spidair_pane_files_name_the_session_of_each_live_spidair_pane() {
+        let root = std::env::temp_dir().join(format!("sesync-spidair-panes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Dir(PathBuf);
+        impl Dir {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Dir(root);
+        let write = |name: &str, body: &str| std::fs::write(dir.path().join(name), body).unwrap();
+        write("w5_p1M.json", r#"{"pane":"w5:p1M","pid":10,"sessionId":"3cd1","sessionFile":"/s/2026_3cd1.jsonl"}"#);
+        write("w5_pJ.json", r#"{"pane":"w5:pJ","pid":11,"sessionId":"01a2"}"#);
+        write("w1_p1.json", r#"{"pane":"w1:p1","pid":12,"sessionId":"gone"}"#);
+        write("broken.json", "{not json");
+        write("w9_p9.json.10.tmp", r#"{"pane":"w9:p9","pid":10,"sessionId":"tmp"}"#);
+        // pid 12 ended, and pid 10 runs in w5:p1M only.
+        let alive = |pid: u64, pane: &str| matches!((pid, pane), (10, "w5:p1M") | (11, "w5:pJ"));
+        let sessions = spidair_pane_sessions(dir.path(), alive);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions["w5:p1M"], "/s/2026_3cd1.jsonl");
+        assert_eq!(sessions["w5:pJ"], "01a2");
+        assert!(spidair_pane_sessions(&dir.path().join("missing"), |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn spidair_pane_dir_follows_xdg_state_home() {
+        let xdg = |k: &str| (k == "XDG_STATE_HOME").then(|| std::ffi::OsString::from("/x"));
+        assert_eq!(spidair_pane_dir(&xdg), PathBuf::from("/x/spidair/herdr-panes"));
+        assert!(spidair_pane_dir(&|_| None).ends_with(".local/state/spidair/herdr-panes"));
     }
 
     #[test]
