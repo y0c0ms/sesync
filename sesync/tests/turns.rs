@@ -122,6 +122,20 @@ fn ids_timestamps_usage_and_thinking_do_not_change_a_turn() {
 }
 
 #[test]
+fn an_image_note_in_a_reply_or_a_prompt_is_not_a_change() {
+    // A Claude copy writes an image it does not carry as a note line: in a reply (after its text)
+    // and in a prompt (where the prompt is the note alone). The original holds the image instead.
+    let note = r#"[attachment not carried: image (image/png, 8 B) \u2014 kept in the source session]"#;
+    let image = r#"[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}]"#;
+    let original = omp_journal("Listing.").replace("\"content\":\"thanks\"", &format!("\"content\":{image}"));
+    let copy = omp_journal("Listing.")
+        .replace("\"text\":\"Listing.\"", &format!("\"text\":\"Listing.\\n{note}\""))
+        .replace("\"content\":\"thanks\"", &format!("\"content\":\"{note}\""));
+    assert_ne!(original, copy, "the fixture carries the notes");
+    assert_eq!(turns(&original), turns(&copy));
+}
+
+#[test]
 fn a_changed_answer_is_a_different_turn() {
     let a = turns(&omp_journal("Listing."));
     let b = turns(&omp_journal("Listing them now."));
@@ -165,6 +179,20 @@ fn a_compaction_does_not_cut_the_turns_the_file_still_holds() {
     ]);
     assert_eq!(compare(&turns(&base), &turns(&compacted)), Relation::Identical);
     assert_eq!(turns(&compacted).len(), 2);
+}
+
+#[test]
+fn a_model_usage_record_moves_the_read_to_its_active_leaf() {
+    // omp's model_usage names activeLeafId a2, the leaf it resumes from, although the file goes on
+    // to a3. The live branch ends at a2: one turn, the one answered before the leaf moved on.
+    let base = omp_journal("Listing.");
+    let moved = with_appended(&base, &[
+        r#"{"type":"model_usage","id":"mu","parentId":"a1","activeLeafId":"a2","timestamp":"2026-10-01T10:00:07.000Z","usage":{"input":1}}"#,
+    ]);
+    let t = turns(&moved);
+    assert_eq!(t.len(), 1, "only the turn on the active branch: {t:?}");
+    assert_eq!(t[0].user, "list the files");
+    assert_eq!(t[0].reply, turns(&base)[0].reply);
 }
 
 #[test]

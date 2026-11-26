@@ -76,6 +76,9 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
     let mut answered: std::collections::HashSet<String> = Default::default();
     // Results split off a source record, as (id, message) pairs placed after it.
     let mut result_msgs: Vec<(String, Map<String, Value>)>;
+    // The last name Claude wrote: a custom title (a rename) over the automatic one.
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
 
     for line in raw.lines() {
         let t = line.trim();
@@ -106,6 +109,19 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
             parent_of.insert(uuid_here, parent_here);
         }
         let kind = r.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "custom-title" => {
+                if let Some(t) = r.get("customTitle").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+                    custom_title = Some(t.to_string());
+                }
+            }
+            "ai-title" => {
+                if let Some(t) = r.get("aiTitle").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+                    ai_title = Some(t.to_string());
+                }
+            }
+            _ => {}
+        }
         if kind != "user" && kind != "assistant" {
             stats.skipped_records += 1;
             continue;
@@ -359,6 +375,25 @@ pub fn to_journal_lines(raw: &str) -> Result<(Vec<String>, Stats), String> {
     }
     if session_id.is_empty() {
         return Err("transcript has no sessionId".into());
+    }
+    // The conversation's name: Claude's `custom-title` (a /rename or `-n`) wins over its `ai-title`.
+    // Pi shows the last `session_info` name. It hangs off the active leaf, so the leaf stays the
+    // record the engine resumes from, and its id is one no record holds (as `to-pi` writes it).
+    if let Some(name) = custom_title.or(ai_title) {
+        let leaf = crate::journal::active_leaf(&out).map(str::to_string);
+        let id = {
+            let taken: std::collections::HashSet<&str> = out.iter().filter_map(|r| r.get("id").and_then(Value::as_str)).collect();
+            let seed = out.len() as u32 ^ 0x5c1a_0e11;
+            (0u32..).map(|n| format!("{:08x}", seed.wrapping_add(n))).find(|c| !taken.contains(c.as_str())).unwrap_or_default()
+        };
+        let ts = if first_ts.is_empty() { "1970-01-01T00:00:00.000Z".to_string() } else { first_ts.clone() };
+        let mut info = Map::new();
+        info.insert("type".into(), "session_info".into());
+        info.insert("id".into(), id.into());
+        info.insert("parentId".into(), leaf.map(Value::from).unwrap_or(Value::Null));
+        info.insert("timestamp".into(), ts.into());
+        info.insert("name".into(), name.into());
+        out.push(info);
     }
 
     let mut header = Map::new();
@@ -645,6 +680,26 @@ mod tests {
         assert_eq!(stats.messages, 2);
         assert_eq!(stats.skipped_bad_lines, 3, "truncated line, non-object, truncated tail");
         assert_eq!(stats.skipped_records, 0);
+    }
+
+    #[test]
+    fn a_custom_title_names_the_session_over_an_ai_title_and_hangs_off_the_leaf() {
+        let name_of = |raw: &str| {
+            let (lines, _) = to_journal_lines(raw).unwrap();
+            let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            let name = last["name"].as_str().map(str::to_string);
+            (last, name)
+        };
+        let ai = r#"{"type":"ai-title","aiTitle":"Auto name","sessionId":"s"}"#;
+        let custom = r#"{"type":"custom-title","customTitle":"Mine","sessionId":"s"}"#;
+        let blank = r#"{"type":"custom-title","customTitle":"  ","sessionId":"s"}"#;
+
+        let (info, name) = name_of(&format!("{ai}\n{custom}\n{TOOLS}"));
+        assert_eq!(name.as_deref(), Some("Mine"), "a rename wins whichever record comes first");
+        assert_eq!(info["type"], "session_info");
+        assert_eq!(info["parentId"], "a2", "the name hangs off the active leaf, the last message");
+        assert_eq!(name_of(&format!("{TOOLS}\n{ai}\n{blank}")).1.as_deref(), Some("Auto name"), "a blank rename is no name");
+        assert!(name_of(TOOLS).1.is_none(), "no title, no name record");
     }
 
     #[test]

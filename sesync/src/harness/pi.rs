@@ -67,8 +67,7 @@ impl Harness for Pi {
     }
     /// Pi's own rename: a `session_info` record with the name is appended; history is kept.
     fn rename(&self, _loc: &Location, _tools: &Tools, key: &str, title: &str) -> Result<Option<String>, String> {
-        let rec = serde_json::json!({"type": "session_info", "name": title});
-        journal::rewrite(Path::new(key), title, |text| journal::append_record(text, rec)).map(|()| None)
+        journal::rewrite(Path::new(key), title, |text| journal::append_session_info(text, title)).map(|()| None)
     }
 }
 
@@ -84,5 +83,33 @@ mod tests {
             "a copy in the folder an older rule named is not where Pi lists it");
         assert!(Pi.misplaced("/store/sessions/--/x.jsonl", cwd, "/home/u"));
         assert!(!Pi.misplaced("/store/sessions/--/x.jsonl", None, "/home/u"), "without a cwd nothing is called misplaced");
+    }
+
+    /// A rename appends a name record that Pi resumes from: it must hang off the leaf, or Pi
+    /// resumes with no context (`pi_resume_leaf` is Pi's rule: the last record's id).
+    #[test]
+    fn a_rename_keeps_pi_resuming_with_its_context() {
+        let dir = std::env::temp_dir().join(format!("pi-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("2026-11-22T10-00-00-000Z_01a20546-5d97-73e2-a862-187a4d9eb592.jsonl");
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"01a20546-5d97-73e2-a862-187a4d9eb592","timestamp":"2026-11-22T10:00:00.000Z","cwd":"/home/u/proj"}"#, "\n",
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"q1"}}"#, "\n",
+            r#"{"type":"message","id":"a1","parentId":"m1","message":{"role":"assistant","content":[{"type":"text","text":"a1"}]}}"#, "\n",
+            r#"{"type":"message","id":"m2","parentId":"a1","message":{"role":"user","content":"q2"}}"#, "\n",
+            r#"{"type":"message","id":"a2","parentId":"m2","message":{"role":"assistant","content":[{"type":"text","text":"a2"}]}}"#, "\n",
+        );
+        std::fs::write(&file, text).unwrap();
+        let loc = Location { root: dir.clone(), cli: None };
+        let tools = Tools { home: &dir, sesync_conv: &dir };
+        Pi.rename(&loc, &tools, file.to_str().unwrap(), "Renamed Pi").unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        let last: serde_json::Value = serde_json::from_str(after.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "session_info");
+        assert_eq!(last["name"], "Renamed Pi");
+        assert_eq!(last["parentId"], "a2", "the name hangs off the leaf");
+        assert_eq!(journal::pi_resume_leaf(&after).as_deref(), last["id"].as_str(), "Pi resumes from the name record");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -94,6 +94,47 @@ fn read_with_blobs(path: &Path) -> Result<(Journal, usize), String> {
     Ok((j, n))
 }
 
+/// Pi and omp read `usage` (with `cost`) and `stopReason` on every assistant message: the footer sums
+/// them on resume and crashes on a message without one. Records that came from other harnesses (an
+/// OpenCode import kept in omp, say) may lack them, so fill zeros and a plain stop.
+fn fill_pi_assistant_fields(j: &mut Journal) {
+    const KEYS: [&str; 4] = ["input", "output", "cacheRead", "cacheWrite"];
+    for r in j.records.iter_mut() {
+        if r.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(msg) = r.get_mut("message").and_then(Value::as_object_mut) else { continue };
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if !msg.get("stopReason").is_some_and(Value::is_string) {
+            msg.insert("stopReason".into(), "stop".into());
+        }
+        if !msg.get("usage").is_some_and(Value::is_object) {
+            msg.insert("usage".into(), Value::Object(Map::new()));
+        }
+        let usage = msg.get_mut("usage").and_then(Value::as_object_mut).expect("usage is an object");
+        for k in KEYS {
+            if !usage.get(k).is_some_and(Value::is_number) {
+                usage.insert(k.into(), 0.into());
+            }
+        }
+        if !usage.get("totalTokens").is_some_and(Value::is_number) {
+            let sum: f64 = KEYS.iter().filter_map(|k| usage.get(*k).and_then(Value::as_f64)).sum();
+            usage.insert("totalTokens".into(), serde_json::json!(sum as u64));
+        }
+        if !usage.get("cost").is_some_and(Value::is_object) {
+            usage.insert("cost".into(), Value::Object(Map::new()));
+        }
+        let cost = usage.get_mut("cost").and_then(Value::as_object_mut).expect("cost is an object");
+        for k in KEYS.iter().copied().chain(["total"]) {
+            if !cost.get(k).is_some_and(Value::is_number) {
+                cost.insert(k.into(), 0.into());
+            }
+        }
+    }
+}
+
 fn rewrite_ids(j: &mut Journal, new_id: &str) {
     for r in j.records.iter_mut() {
         if r.get("type").and_then(Value::as_str) == Some("session") {
@@ -242,6 +283,7 @@ fn main() {
                     None => file_mtime_iso(&p),
                 };
                 rewrite_ids(&mut j, &new_id);
+                fill_pi_assistant_fields(&mut j);
                 let title = arg(&args, "--title").unwrap_or_else(|| j.title_text());
                 let (bucket, head): (String, Option<String>) = if cmd == "to-pi" {
                     (journal::pi_bucket(&cwd), None)
@@ -253,11 +295,16 @@ fn main() {
                     // Pi has no title slot: the picker shows the last `session_info.name`.
                     // Append one so the mirror is labelled (and tagged as a mirror).
                     j.title = None;
-                    let last_id = j.records.iter().rev().find_map(|r| r.get("id").and_then(Value::as_str)).map(str::to_string);
+                    // Pi's `appendSessionInfo`: a new id, and the parent is the active leaf, so the
+                    // leaf moves onto this record and the conversation stays reachable.
+                    let leaf = j.leaf_id().map(str::to_string);
+                    let taken: std::collections::HashSet<&str> = j.records.iter().filter_map(|r| r.get("id").and_then(Value::as_str)).collect();
+                    let seed = j.records.len() as u32 ^ 0x5151_a5a5;
+                    let id = (0u32..).map(|n| format!("{:08x}", seed.wrapping_add(n))).find(|c| !taken.contains(c.as_str())).unwrap_or_default();
                     let mut info = Map::new();
                     info.insert("type".into(), "session_info".into());
-                    info.insert("id".into(), Value::String(format!("{:08x}", j.records.len() as u32 ^ 0x5151_a5a5)));
-                    info.insert("parentId".into(), last_id.map(Value::String).unwrap_or(Value::Null));
+                    info.insert("id".into(), Value::String(id));
+                    info.insert("parentId".into(), leaf.map(Value::String).unwrap_or(Value::Null));
                     info.insert("timestamp".into(), Value::String(ts.clone()));
                     info.insert("name".into(), Value::String(title.clone()));
                     j.records.push(info);
@@ -330,6 +377,32 @@ mod tests {
     /// format is theirs, and the receiving harness applies its own compaction. So the archive and
     /// the compaction record must survive the copy, unlike the message-based targets (OpenCode,
     /// Claude, Gemini) which export the window and carry the summary instead.
+    #[test]
+    fn assistant_messages_without_usage_get_zero_usage_and_a_stop_reason() {
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"s","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/w"}"#, "
+",
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"provider":"p","model":"m"}}"#, "
+",
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[],"stopReason":"toolUse","usage":{"input":7,"output":3}}}"#, "
+",
+            r#"{"type":"message","id":"c","parentId":"b","message":{"role":"user","content":"x"}}"#, "
+",
+        );
+        let records = text.lines().map(|l| serde_json::from_str::<Map<String, Value>>(l).unwrap()).collect();
+        let mut j = Journal { title: None, records };
+        fill_pi_assistant_fields(&mut j);
+        let msg = |i: usize| j.records[i].get("message").unwrap().clone();
+        assert_eq!(msg(1)["stopReason"], "stop");
+        assert_eq!(msg(1)["usage"]["input"], 0);
+        assert_eq!(msg(1)["usage"]["cost"]["total"], 0);
+        assert_eq!(msg(2)["stopReason"], "toolUse", "an existing stop reason is kept");
+        assert_eq!(msg(2)["usage"]["input"], 7, "existing counts are kept");
+        assert_eq!(msg(2)["usage"]["totalTokens"], 10);
+        assert_eq!(msg(2)["usage"]["cost"]["output"], 0);
+        assert!(msg(3).get("usage").is_none(), "user messages are untouched");
+    }
+
     #[test]
     fn a_journal_copy_keeps_the_compaction_record_and_the_archive() {
         let mut j = compacted_journal("journal-copy");

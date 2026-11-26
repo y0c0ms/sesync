@@ -13,10 +13,11 @@
 //!   arguments (a non-object argument is compared as `{"input": v}`, as `sesync-conv` writes it);
 //!   tool results by their text (parts joined by a newline).
 //! * dropped: ids, parent ids, timestamps, usage, model, stop reasons, thinking blocks and their
-//!   signatures, images, and any text that is empty after trimming or starts with `<`. A `<`
-//!   prefix is how a Claude transcript marks wrappers and reasoning that `sesync-conv from-claude`
-//!   drops or rewrites (`prior_reasoning`), so dropping it here on both sides keeps a copy that
-//!   went through Claude equal to the original.
+//!   signatures, images, the image placeholder lines a Claude copy writes for them (see
+//!   `without_image_placeholders`), and any text that is empty after trimming or starts with `<`.
+//!   A `<` prefix is how a Claude transcript marks wrappers and reasoning that `sesync-conv
+//!   from-claude` drops or rewrites (`prior_reasoning`), so dropping it here on both sides keeps a
+//!   copy that went through Claude equal to the original.
 //! * a tool result is kept only when it answers a call seen earlier and not answered yet, which is
 //!   the pairing `sesync-conv from-claude` applies.
 //! * only the active branch counts: the chain from the last message record in the file, followed
@@ -110,18 +111,16 @@ pub fn compare(local: &[Turn], team: &[Turn]) -> Relation {
     }
 }
 
-/// The active branch: the chain from the last message record in the file, followed by `parentId`
-/// through any record, oldest first. The same walk `sesync-conv` uses, without its compaction cut.
+/// The active branch: the chain from the active leaf (`harness::journal::active_leaf`, the same rule
+/// `sesync-conv` uses), followed by `parentId` through any record, oldest first. Without the
+/// compaction cut that `sesync-conv` applies.
 fn active_chain(records: &[Map<String, Value>]) -> Vec<&Map<String, Value>> {
     let by_id: std::collections::HashMap<&str, &Map<String, Value>> = records.iter()
         .filter_map(|r| r.get("id").and_then(Value::as_str).map(|id| (id, r)))
         .collect();
-    let leaf = records.iter().rev()
-        .find(|r| r.get("type").and_then(Value::as_str) == Some("message"))
-        .and_then(|r| r.get("id").and_then(Value::as_str));
     let mut chain = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut cur = leaf;
+    let mut cur = crate::harness::journal::active_leaf(records);
     while let Some(id) = cur {
         if !seen.insert(id) {
             break;
@@ -183,7 +182,7 @@ fn normalize(r: &Map<String, Value>, seen_calls: &mut std::collections::HashSet<
                 return None;
             }
             let text = blocks.iter().filter_map(|b| part_text(b)).collect::<Vec<_>>().join("\n");
-            items.push(Item::Result(text));
+            items.push(Item::Result(without_image_placeholders(&text)));
         }
         Role::User | Role::Assistant => {
             for b in blocks {
@@ -221,10 +220,26 @@ fn normalize(r: &Map<String, Value>, seen_calls: &mut std::collections::HashSet<
 
 /// A text part counts when it is not blank and not a wrapper (`<`). See the module note.
 fn push_text(items: &mut Vec<Item>, s: &str) {
+    let s = without_image_placeholders(s);
     let t = s.trim();
     if !t.is_empty() && !t.starts_with('<') {
-        items.push(Item::Text(s.to_string()));
+        items.push(Item::Text(s));
     }
+}
+
+/// The lines an image leaves in a Claude copy: the old `<image omitted: …>` line, and the note
+/// `sesync-conv to-claude` writes for an image it does not carry (`[attachment not carried: image …]`).
+/// They are not the words of the turn, so a copy that carries them hashes like the original, which
+/// does not. Other lines are kept as they are.
+fn without_image_placeholders(text: &str) -> String {
+    if !text.lines().any(is_image_placeholder) {
+        return text.to_string();
+    }
+    text.split('\n').filter(|l| !is_image_placeholder(l)).collect::<Vec<_>>().join("\n")
+}
+
+fn is_image_placeholder(line: &str) -> bool {
+    line.starts_with("<image omitted: ") || line.starts_with("[attachment not carried: image ")
 }
 
 /// The text of a tool-result part, as `sesync-conv to-claude` reads it: a string, or an object with
